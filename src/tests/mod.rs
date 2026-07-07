@@ -63,9 +63,9 @@ pub use github::{BranchPushBehaviour, BranchPushError, MergeBehavior};
 pub use github::{WorkflowEvent, WorkflowJob};
 pub use github::{default_branch_name, default_repo_name};
 pub use mock::ExternalHttpMock;
-pub use utils::io::load_test_file;
+pub use utils::io::{load_recorded_webhook, load_test_file};
 pub use utils::sync::TestSyncMarker;
-pub use utils::webhook::{TEST_WEBHOOK_SECRET, create_webhook_request};
+pub use utils::webhook::{TEST_WEBHOOK_SECRET, create_raw_webhook_request, create_webhook_request};
 
 /// How long should we wait before we timeout a test.
 /// You can increase this if you want to do interactive debugging.
@@ -1171,6 +1171,24 @@ impl BorsTester {
         Ok(())
     }
 
+    pub async fn send_raw_webhook(
+        &mut self,
+        event: &str,
+        body: &[u8],
+    ) -> anyhow::Result<http::Response<axum::body::Body>> {
+        wait_for_marker(
+            async || {
+                let webhook = create_raw_webhook_request(event, body);
+                self.app
+                    .call(webhook)
+                    .await
+                    .context("Cannot send raw webhook request")
+            },
+            &WAIT_FOR_WEBHOOK_COMPLETED,
+        )
+        .await
+    }
+
     async fn try_get_pr_from_db<Id: Into<PrIdentifier>>(
         &self,
         id: Id,
@@ -1274,6 +1292,30 @@ impl ApiResponse {
     pub fn into_body(self) -> String {
         self.body
     }
+}
+
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn replay_henosis_push_fixture(pool: PgPool) {
+    let mut github = GitHub::default();
+    let org = User::new(301049804, "henosis-playground");
+    github.add_user(org.clone());
+    github.add_repo(Repo::new(org, "deploy"));
+
+    run_test((pool, github), async |ctx: &mut BorsTester| {
+        let (event, body) = load_recorded_webhook(
+            "webhook/henosis/2026-07-07T21-04-04.172Z-push-62140142-7a47-11f1-838b-80ebf54c7122.json",
+        )?;
+        assert_eq!(event, "push");
+
+        let response = ctx.send_raw_webhook(&event, &body).await?;
+        let status = response.status();
+        assert!(
+            status.is_success(),
+            "expected replayed push fixture to return success, got {status}"
+        );
+        Ok(())
+    })
+    .await;
 }
 
 /// Try to produce a nicer error message from a failed tokio Task
