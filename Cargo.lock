@@ -386,6 +386,7 @@ dependencies = [
  "hmac 0.13.0",
  "http",
  "hyper",
+ "indexmap",
  "insta",
  "itertools",
  "jsonwebtoken",

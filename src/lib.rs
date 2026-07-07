@@ -5,6 +5,7 @@ mod bors;
 mod config;
 mod database;
 mod github;
+pub mod henosis;
 mod permissions;
 pub mod server;
 mod templates;
