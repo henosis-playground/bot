@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::Context;
 use tokio::process::Command;
 
+use crate::henosis::environment::DevLockfileReader;
 use crate::henosis::gate_report::GateReport;
 use crate::henosis::lockfile::{self, EnvironmentSection, Lockfile};
 use crate::henosis::queue::{GateRun, candidate_world_components};
@@ -13,22 +13,24 @@ pub trait GateExecutor {
     async fn execute(&self, gate_run: &GateRun) -> anyhow::Result<GateReport>;
 }
 
-#[derive(Debug, Clone)]
-pub struct CliGateExecutor {
+pub struct CliGateExecutor<D> {
     gate_command: String,
-    dev_lockfile_path: String,
+    dev_lockfiles: D,
 }
 
-impl CliGateExecutor {
-    pub fn new(gate_command: impl Into<String>, dev_lockfile_path: impl Into<String>) -> Self {
+impl<D> CliGateExecutor<D> {
+    pub fn new(gate_command: impl Into<String>, dev_lockfiles: D) -> Self {
         Self {
             gate_command: gate_command.into(),
-            dev_lockfile_path: dev_lockfile_path.into(),
+            dev_lockfiles,
         }
     }
 }
 
-impl GateExecutor for CliGateExecutor {
+impl<D> GateExecutor for CliGateExecutor<D>
+where
+    D: DevLockfileReader + Send + Sync,
+{
     async fn execute(&self, gate_run: &GateRun) -> anyhow::Result<GateReport> {
         let tempdir = tempfile::Builder::new()
             .prefix("henosis-gate-")
@@ -61,6 +63,18 @@ impl GateExecutor for CliGateExecutor {
                 )
             })?;
 
+        let dev_lockfile_path = tempdir.path().join("dev.toml");
+        let dev_lockfile = self.dev_lockfiles.read_dev_lockfile().await?;
+        let dev_toml = lockfile::to_toml(&dev_lockfile).context("Cannot serialize dev lockfile")?;
+        tokio::fs::write(&dev_lockfile_path, dev_toml)
+            .await
+            .with_context(|| {
+                format!(
+                    "Cannot write dev lockfile to {}",
+                    dev_lockfile_path.display()
+                )
+            })?;
+
         let output = Command::new(&self.gate_command)
             .arg(&lockfile_path)
             .arg("--scratch")
@@ -68,7 +82,7 @@ impl GateExecutor for CliGateExecutor {
             .arg("--output")
             .arg(&output_dir)
             .arg("--dev-lockfile")
-            .arg(PathBuf::from(&self.dev_lockfile_path))
+            .arg(&dev_lockfile_path)
             .output()
             .await
             .with_context(|| format!("Cannot execute gate command `{}`", self.gate_command))?;
@@ -127,10 +141,20 @@ mod tests {
     use indexmap::IndexMap;
 
     use super::*;
+    use crate::henosis::environment::DevLockfileReader;
     use crate::henosis::gate_report::GateFailure;
     use crate::henosis::queue::{
         CandidateComponent, CandidateWorld, PENDING_STATUS, QueuePullRequest, RecordedGateRun,
     };
+
+    #[derive(Clone)]
+    struct StaticDevLockfile(Lockfile);
+
+    impl DevLockfileReader for StaticDevLockfile {
+        async fn read_dev_lockfile(&self) -> anyhow::Result<Lockfile> {
+            Ok(self.0.clone())
+        }
+    }
 
     fn gate_run(external_id: &str) -> RecordedGateRun {
         RecordedGateRun {
@@ -199,5 +223,82 @@ mod tests {
                 lockfile::pinned("henosis-playground/service-a", "a-pr", "sha256:a")
             )])
         );
+    }
+
+    #[tokio::test]
+    async fn cli_gate_executor_writes_dev_lockfile_into_gate_tempdir() {
+        let script_dir = tempfile::tempdir().unwrap();
+        let script_path = script_dir.path().join("gate.sh");
+        tokio::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+set -eu
+output=""
+dev=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output)
+      output="$2"
+      shift 2
+      ;;
+    --dev-lockfile)
+      dev="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+test -n "$output"
+test -n "$dev"
+test -f "$dev"
+case "$dev" in
+  /tmp/henosis-gate-*/dev.toml) ;;
+  *) exit 12 ;;
+esac
+grep -q 'b-main' "$dev"
+printf '{"ok":true,"failures":[]}\n' > "$output/report.json"
+"#,
+        )
+        .await
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = tokio::fs::metadata(&script_path)
+                .await
+                .unwrap()
+                .permissions();
+            permissions.set_mode(0o755);
+            tokio::fs::set_permissions(&script_path, permissions)
+                .await
+                .unwrap();
+        }
+
+        let dev_lockfile = Lockfile {
+            environment: EnvironmentSection {
+                id: "dev".to_string(),
+            },
+            components: IndexMap::from([
+                (
+                    "service-a".to_string(),
+                    lockfile::pinned("henosis-playground/service-a", "a-main", "sha256:a"),
+                ),
+                (
+                    "service-b".to_string(),
+                    lockfile::pinned("henosis-playground/service-b", "b-main", "sha256:b"),
+                ),
+            ]),
+        };
+        let executor = CliGateExecutor::new(
+            script_path.to_string_lossy().to_string(),
+            StaticDevLockfile(dev_lockfile),
+        );
+
+        let report = executor.execute(&gate_run("gate-1")).await.unwrap();
+
+        assert!(report.ok);
     }
 }

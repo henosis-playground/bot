@@ -218,7 +218,12 @@ pub async fn tick_queue(ctx: &BorsContext) -> anyhow::Result<Option<RecordedGate
         &config.dev_lockfile_path,
     );
     let reporter = GithubGateCheckReporter::new(&ctx.repositories, &config.gate_check_run_name);
-    let gate_executor = CliGateExecutor::new(&config.gate_command, &config.dev_lockfile_path);
+    let gate_dev = GithubDevLockfileReader::new(
+        &deploy_repo.client,
+        &config.lockfile_branch,
+        &config.dev_lockfile_path,
+    );
+    let gate_executor = CliGateExecutor::new(&config.gate_command, gate_dev);
     let merge_executor = GitHubMergeExecutor::new(
         ctx.db.pool().clone(),
         ctx.repositories.as_ref(),

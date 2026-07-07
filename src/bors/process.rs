@@ -15,6 +15,8 @@ use octocrab::Octocrab;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+#[cfg(not(test))]
+use tokio::time::MissedTickBehavior;
 use tracing::{Instrument, Span};
 
 pub struct BorsProcess {
@@ -98,6 +100,9 @@ pub fn create_bors_process(
                 }
                 _ = consume_gitops_queue_events(gitops_queue_rx) => {
                     tracing::error!("Gitops queue handling process has ended")
+                }
+                _ = consume_henosis_queue_ticks(ctx.clone()) => {
+                    tracing::error!("Henosis queue scheduler has ended")
                 }
                 _ = merge_queue_fut => {
                     tracing::error!("Merge queue handling process has ended");
@@ -236,6 +241,46 @@ async fn consume_gitops_queue_events(mut gitops_queue_rx: GitOpsQueueReceiver) {
             .await
         {
             handle_root_error(span, error);
+        }
+    }
+}
+
+#[cfg(not(test))]
+async fn consume_henosis_queue_ticks(ctx: Arc<BorsContext>) {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        tracing::debug!("Henosis queue scheduler disabled");
+        std::future::pending::<()>().await;
+        return;
+    };
+
+    let tick_interval = config.queue_tick_interval();
+    tracing::info!(
+        interval_seconds = tick_interval.as_secs(),
+        "Starting Henosis queue scheduler"
+    );
+
+    let mut interval = tokio::time::interval(tick_interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        interval.tick().await;
+
+        let span = tracing::info_span!("HenosisQueueTick");
+        match crate::henosis::service::tick_queue(&ctx)
+            .instrument(span.clone())
+            .await
+        {
+            Ok(Some(gate_run)) => {
+                tracing::info!(
+                    external_id = %gate_run.external_id,
+                    status = %gate_run.status,
+                    "Henosis queue tick processed gate run"
+                );
+            }
+            Ok(None) => {
+                tracing::debug!("Henosis queue tick found no work");
+            }
+            Err(error) => handle_root_error(span, error),
         }
     }
 }

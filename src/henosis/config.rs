@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -16,6 +17,8 @@ pub struct HenosisConfig {
     pub gate_command: String,
     #[serde(default = "default_gate_check_run_name")]
     pub gate_check_run_name: String,
+    #[serde(default = "default_queue_tick_interval_secs")]
+    pub queue_tick_interval_secs: u64,
     #[serde(default = "default_cmd_prefix")]
     pub cmd_prefix: String,
     #[serde(default)]
@@ -100,6 +103,10 @@ impl HenosisConfig {
             .find(|component| component.repo == repo)
     }
 
+    pub fn queue_tick_interval(&self) -> Duration {
+        Duration::from_secs(self.queue_tick_interval_secs.max(1))
+    }
+
     pub fn environment_lockfile_path(&self, environment_id: &str) -> String {
         self.environments
             .iter()
@@ -119,6 +126,10 @@ fn default_gate_command() -> String {
 
 fn default_gate_check_run_name() -> String {
     "Henosis gate".to_string()
+}
+
+fn default_queue_tick_interval_secs() -> u64 {
+    15
 }
 
 fn default_cmd_prefix() -> String {
@@ -162,6 +173,8 @@ lockfile_path = "dev.toml"
         assert_eq!(config.lockfile_branch, "main");
         assert_eq!(config.gate_command, "henosis-gate");
         assert_eq!(config.gate_check_run_name, "Henosis gate");
+        assert_eq!(config.queue_tick_interval_secs, 15);
+        assert_eq!(config.queue_tick_interval(), Duration::from_secs(15));
         assert_eq!(config.cmd_prefix, "@henosis-bot");
         assert_eq!(config.environments[0].id, "dev");
         assert_eq!(
@@ -189,6 +202,7 @@ deploy_repo = "henosis-playground/deploy"
 lockfile_branch = "lockfiles"
 gate_command = "custom-gate"
 gate_check_run_name = "Custom gate"
+queue_tick_interval_secs = 3
 cmd_prefix = "@custom-bot"
 source_repos = ["henosis-playground/service-a"]
 
@@ -202,6 +216,7 @@ lockfile_path = "staging.toml"
         assert_eq!(config.lockfile_branch, "lockfiles");
         assert_eq!(config.gate_command, "custom-gate");
         assert_eq!(config.gate_check_run_name, "Custom gate");
+        assert_eq!(config.queue_tick_interval(), Duration::from_secs(3));
         assert_eq!(config.cmd_prefix, "@custom-bot");
     }
 
