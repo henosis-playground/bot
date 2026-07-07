@@ -1758,6 +1758,7 @@ mod tests {
                 Arc::new(RepositoryStore::default()),
                 None,
                 "",
+                None,
             )),
         )));
         GitHubWebhook::from_request(request, &server_ref).await

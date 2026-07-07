@@ -2,12 +2,14 @@ use std::sync::Arc;
 
 use super::{RepositoryState, RepositoryStore};
 use crate::bors::gitops::Git;
+use crate::henosis::config::HenosisConfig;
 use crate::{PgDbClient, bors::command::CommandParser, github::GithubRepoName};
 
 pub struct BorsContext {
     pub parser: CommandParser,
     pub db: Arc<PgDbClient>,
     pub repositories: Arc<RepositoryStore>,
+    pub henosis_config: Option<HenosisConfig>,
     git: Option<Git>,
     web_url: String,
 }
@@ -19,11 +21,13 @@ impl BorsContext {
         repositories: Arc<RepositoryStore>,
         git: Option<Git>,
         web_url: &str,
+        henosis_config: Option<HenosisConfig>,
     ) -> Self {
         Self {
             parser,
             db,
             repositories,
+            henosis_config,
             git,
             web_url: web_url.trim_end_matches('/').to_string(),
         }

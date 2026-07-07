@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use bors::henosis::config::{HENOSIS_CONFIG_ENV, HenosisConfig};
 use bors::server::{ServerState, create_app};
 use bors::{
     BorsContext, BorsGlobalEvent, BorsProcess, CommandParser, Git, OAuthClient, OAuthConfig,
@@ -123,6 +124,15 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
         .build()
         .context("Cannot build tokio runtime")?;
 
+    let henosis_config = if std::env::var_os(HENOSIS_CONFIG_ENV).is_some() {
+        let config = HenosisConfig::load_from_env()?;
+        tracing::info!(?config, "Loaded Henosis config");
+        Some(config)
+    } else {
+        tracing::warn!("{HENOSIS_CONFIG_ENV} is not set; Henosis config is disabled");
+        None
+    };
+
     let db = runtime
         .block_on(initialize_db(&opts.db))
         .context("Cannot initialize database")?;
@@ -177,6 +187,7 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
         repos.clone(),
         git,
         &opts.web_url,
+        henosis_config,
     ));
     let BorsProcess {
         repository_tx,

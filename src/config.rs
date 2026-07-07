@@ -44,6 +44,19 @@ pub struct RepositoryConfig {
     pub report_merge_conflicts: bool,
 }
 
+impl RepositoryConfig {
+    pub fn henosis_permissive_default() -> Self {
+        Self {
+            timeout: default_timeout(),
+            labels: HashMap::new(),
+            labels_blocking_approval: Vec::new(),
+            min_ci_time: None,
+            merge_queue_enabled: false,
+            report_merge_conflicts: false,
+        }
+    }
+}
+
 /// Load a repository config from TOML.
 pub fn deserialize_config(text: &str) -> Result<RepositoryConfig, toml::de::Error> {
     toml::from_str(text)

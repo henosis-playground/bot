@@ -170,8 +170,13 @@ async fn load_config(client: &GithubRepositoryClient) -> anyhow::Result<Reposito
             tracing::info!("Loaded repository config for {name}: {config:?}");
             Ok(config)
         }
-        Err(error) => Err(anyhow::anyhow!(
-            "Could not load repository config for {name}: {error:?}"
-        )),
+        Err(error) => {
+            // D5: startup must tolerate a missing config only if genuinely cheap.
+            // A permissive local default keeps source repos loadable while Henosis owns gating.
+            tracing::warn!(
+                "Could not load repository config for {name}; using Henosis permissive default: {error:?}"
+            );
+            Ok(RepositoryConfig::henosis_permissive_default())
+        }
     }
 }

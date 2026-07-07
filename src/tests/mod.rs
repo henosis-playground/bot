@@ -226,6 +226,7 @@ impl BorsTester {
             // local git ops, but we do not currently mock git in tests.
             Some(Git::from_path(PathBuf::from("/tmp/git"))),
             "https://bors-test.com",
+            None,
         ));
 
         let BorsProcess {
