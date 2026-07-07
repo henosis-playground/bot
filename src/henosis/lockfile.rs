@@ -36,8 +36,46 @@ pub struct FollowerEntry {
     pub follow: String,
 }
 
-// TODO: validation should reject `Follower` entries in dev/staging/prod lockfiles.
-// Serde accepts the shape; environment-specific rules belong in domain validation.
+pub fn parse_toml(content: &str) -> Result<Lockfile, toml::de::Error> {
+    toml::from_str(content)
+}
+
+pub fn to_toml(lockfile: &Lockfile) -> Result<String, toml::ser::Error> {
+    toml::to_string(lockfile)
+}
+
+pub fn pinned(
+    repo: impl Into<String>,
+    r#ref: impl Into<String>,
+    digest: impl Into<String>,
+) -> ComponentEntry {
+    ComponentEntry::Pinned(PinnedEntry {
+        repo: repo.into(),
+        r#ref: r#ref.into(),
+        digest: digest.into(),
+    })
+}
+
+pub fn follower_dev() -> ComponentEntry {
+    ComponentEntry::Follower(FollowerEntry {
+        follow: "dev".to_string(),
+    })
+}
+
+pub fn validate(lockfile: &Lockfile) -> anyhow::Result<()> {
+    let stable = matches!(lockfile.environment.id.as_str(), "dev" | "staging" | "prod");
+    if stable {
+        for (name, entry) in &lockfile.components {
+            if matches!(entry, ComponentEntry::Follower(_)) {
+                anyhow::bail!(
+                    "follower entry for component `{name}` is invalid in {}",
+                    lockfile.environment.id
+                );
+            }
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -96,18 +134,18 @@ digest = "sha256:bbbb"
 
     #[test]
     fn round_trips_schema_example() {
-        let lockfile: Lockfile = toml::from_str(SCHEMA_EXAMPLE).unwrap();
-        let serialized = toml::to_string(&lockfile).unwrap();
-        let reparsed: Lockfile = toml::from_str(&serialized).unwrap();
+        let lockfile: Lockfile = parse_toml(SCHEMA_EXAMPLE).unwrap();
+        let serialized = to_toml(&lockfile).unwrap();
+        let reparsed: Lockfile = parse_toml(&serialized).unwrap();
 
         assert_eq!(lockfile, reparsed);
     }
 
     #[test]
     fn round_trips_pinned_entries() {
-        let lockfile: Lockfile = toml::from_str(PINNED_ONLY_EXAMPLE).unwrap();
-        let serialized = toml::to_string(&lockfile).unwrap();
-        let reparsed: Lockfile = toml::from_str(&serialized).unwrap();
+        let lockfile: Lockfile = parse_toml(PINNED_ONLY_EXAMPLE).unwrap();
+        let serialized = to_toml(&lockfile).unwrap();
+        let reparsed: Lockfile = parse_toml(&serialized).unwrap();
 
         assert_eq!(lockfile, reparsed);
     }
@@ -126,5 +164,17 @@ unexpected = true
 "#;
 
         assert!(toml::from_str::<Lockfile>(content).is_err());
+    }
+
+    #[test]
+    fn rejects_followers_in_stable_lockfiles() {
+        let lockfile = Lockfile {
+            environment: EnvironmentSection {
+                id: "dev".to_string(),
+            },
+            components: IndexMap::from([("service-a".to_string(), follower_dev())]),
+        };
+
+        assert!(validate(&lockfile).is_err());
     }
 }

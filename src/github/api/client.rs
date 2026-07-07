@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use octocrab::Octocrab;
 use octocrab::models::checks::CheckRun;
 use octocrab::models::pulls::MergeableState;
+use octocrab::models::repos::Content;
 use octocrab::models::{CheckRunId, Repository, RunId, UserId};
 use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,12 @@ use futures::TryStreamExt;
 use octocrab::models::workflows::{Job, Run};
 use serde::de::DeserializeOwned;
 use url::Url;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryFile {
+    pub sha: String,
+    pub content: String,
+}
 
 /// Provides access to a single app installation (repository) using the GitHub API.
 pub struct GithubRepositoryClient {
@@ -194,6 +201,122 @@ impl GithubRepositoryClient {
         )
         .await?;
         Ok(config)
+    }
+
+    pub async fn read_file_at_ref(
+        &self,
+        path: &str,
+        r#ref: &str,
+    ) -> anyhow::Result<RepositoryFile> {
+        let file = perform_retryable("read_file_at_ref", RetryMethod::default(), || async {
+            let file = self
+                .get_content_item(path, r#ref)
+                .await?
+                .with_context(|| format!("File `{path}` not found in {}", self.repository()))?;
+            let content = file.decoded_content().with_context(|| {
+                format!("File `{path}` in {} had no content", self.repository())
+            })?;
+            anyhow::Ok(RepositoryFile {
+                sha: file.sha,
+                content,
+            })
+        })
+        .await?;
+        Ok(file)
+    }
+
+    pub async fn write_file_to_branch(
+        &self,
+        path: &str,
+        branch: &str,
+        message: &str,
+        contents: &str,
+    ) -> anyhow::Result<CommitSha> {
+        let commit_sha = perform_retryable("write_file_to_branch", RetryMethod::default(), || async {
+            let repo = self.client.repos(self.repository().owner(), self.repository().name());
+            let existing = self.get_content_item(path, branch).await?;
+            let update = match existing {
+                Some(existing) => repo
+                    .update_file(path, message, contents, existing.sha)
+                    .branch(branch)
+                    .send()
+                    .await,
+                None => repo
+                    .create_file(path, message, contents)
+                    .branch(branch)
+                    .send()
+                    .await,
+            }
+            .with_context(|| {
+                format!(
+                    "Cannot write `{path}` to branch `{branch}` in {}",
+                    self.repository()
+                )
+            })?;
+            let commit_sha = update.commit.sha.with_context(|| {
+                format!(
+                    "GitHub did not return a commit sha after writing `{path}` to branch `{branch}` in {}",
+                    self.repository()
+                )
+            })?;
+            anyhow::Ok(CommitSha(commit_sha))
+        })
+        .await?;
+        Ok(commit_sha)
+    }
+
+    pub async fn delete_file_from_branch(
+        &self,
+        path: &str,
+        branch: &str,
+        message: &str,
+    ) -> anyhow::Result<Option<CommitSha>> {
+        let commit_sha = perform_retryable("delete_file_from_branch", RetryMethod::default(), || async {
+            let Some(existing) = self.get_content_item(path, branch).await? else {
+                return anyhow::Ok(None);
+            };
+            let deletion = self
+                .client
+                .repos(self.repository().owner(), self.repository().name())
+                .delete_file(path, message, existing.sha)
+                .branch(branch)
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "Cannot delete `{path}` from branch `{branch}` in {}",
+                        self.repository()
+                    )
+                })?;
+            let commit_sha = deletion.commit.sha.with_context(|| {
+                format!(
+                    "GitHub did not return a commit sha after deleting `{path}` from branch `{branch}` in {}",
+                    self.repository()
+                )
+            })?;
+            anyhow::Ok(Some(CommitSha(commit_sha)))
+        })
+        .await?;
+        Ok(commit_sha)
+    }
+
+    pub async fn delete_branch(&self, branch: &str) -> anyhow::Result<()> {
+        perform_retryable("delete_branch", RetryMethod::default(), || async {
+            let route = format!("/repos/{}/git/refs/heads/{branch}", self.repository());
+            match self.client._delete(route, None::<&()>).await {
+                Ok(_) => anyhow::Ok(()),
+                Err(octocrab::Error::GitHub { source, .. })
+                    if source.status_code == http::StatusCode::NOT_FOUND =>
+                {
+                    anyhow::Ok(())
+                }
+                Err(error) => Err(anyhow::anyhow!(
+                    "Cannot delete branch `{branch}`: {error:?}"
+                )),
+            }
+        })
+        .await?;
+        Ok(())
     }
 
     /// Return the current SHA of the given branch.
@@ -649,6 +772,27 @@ impl GithubRepositoryClient {
         let response: T = self.client.get(url.as_str(), None::<&()>).await?;
         tracing::debug!("Received response: {response:?}");
         Ok(response)
+    }
+
+    async fn get_content_item(&self, path: &str, r#ref: &str) -> anyhow::Result<Option<Content>> {
+        let response = self
+            .client
+            .repos(self.repository().owner(), self.repository().name())
+            .get_content()
+            .path(path)
+            .r#ref(r#ref)
+            .send()
+            .await;
+        let mut response = match response {
+            Ok(response) => response,
+            Err(octocrab::Error::GitHub { source, .. })
+                if source.status_code == http::StatusCode::NOT_FOUND =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(response.take_items().into_iter().next())
     }
 
     fn format_pr(&self, pr: PullRequestNumber) -> String {

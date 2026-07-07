@@ -92,9 +92,24 @@ pub async fn merge_queue_tick(
     ctx: Arc<BorsContext>,
     mergeability_sender: &MergeabilityQueueSender,
 ) -> anyhow::Result<()> {
+    if ctx.henosis_config.is_some() {
+        crate::henosis::service::tick_queue(&ctx).await?;
+    }
+
     let repos: Vec<Arc<RepositoryState>> = ctx.repositories.repositories();
 
     for repo in repos {
+        if let Some(config) = ctx.henosis_config.as_ref()
+            && (config.is_component_repo(&repo.repository().to_string())
+                || config.deploy_repo == repo.repository().to_string())
+        {
+            tracing::debug!(
+                "Skipping bors repo-local merge queue for Henosis-managed repo {}",
+                repo.repository()
+            );
+            continue;
+        }
+
         let repo_name = repo.repository().to_string();
         // We need to hold the lock over the whole merge queue operation, otherwise we would
         // protect only the merge operations, but two concurrent bors instances could still start

@@ -31,6 +31,9 @@ use crate::database::{DelegatedPermission, DelegationStatus, PullRequestModel};
 use crate::github::{
     CommitSha, GithubUser, LabelTrigger, PullRequest, PullRequestInfo, PullRequestNumber,
 };
+use crate::henosis::service::{
+    environment_change_comment, environment_status_comment, gate_status_comment,
+};
 use crate::permissions::PermissionType;
 use crate::{PgDbClient, TeamApiClient, load_repositories};
 use anyhow::Context;
@@ -157,7 +160,7 @@ pub async fn handle_bors_repository_event(
             let span =
                 tracing::info_span!("Pull request closed", repo = payload.repository.to_string());
 
-            handle_pull_request_closed(repo, db, payload)
+            handle_pull_request_closed(repo, db, ctx, payload)
                 .instrument(span.clone())
                 .await?;
         }
@@ -165,7 +168,7 @@ pub async fn handle_bors_repository_event(
             let span =
                 tracing::info_span!("Pull request merged", repo = payload.repository.to_string());
 
-            handle_pull_request_merged(repo, db, payload)
+            handle_pull_request_merged(repo, db, ctx, payload)
                 .instrument(span.clone())
                 .await?;
         }
@@ -175,7 +178,7 @@ pub async fn handle_bors_repository_event(
                 repo = payload.repository.to_string()
             );
 
-            handle_pull_request_reopened(repo, db, senders.mergeability_queue(), payload)
+            handle_pull_request_reopened(repo, db, ctx, senders.mergeability_queue(), payload)
                 .instrument(span.clone())
                 .await?;
         }
@@ -516,25 +519,32 @@ async fn handle_comment(
                     }
                     BorsCommand::Env => {
                         let span = tracing::info_span!("HenosisEnv");
-                        command_henosis_stub(repo, database, pr, &comment.author, "env")
+                        command_henosis_env(ctx.clone(), repo, database, pr, &comment.author)
                             .instrument(span)
                             .await
                     }
-                    BorsCommand::EnvJoin { name: _ } => {
+                    BorsCommand::EnvJoin { name } => {
                         let span = tracing::info_span!("HenosisEnvJoin");
-                        command_henosis_stub(repo, database, pr, &comment.author, "env")
-                            .instrument(span)
-                            .await
+                        command_henosis_env_join(
+                            ctx.clone(),
+                            repo,
+                            database,
+                            pr,
+                            &comment.author,
+                            &name,
+                        )
+                        .instrument(span)
+                        .await
                     }
                     BorsCommand::EnvLeave => {
                         let span = tracing::info_span!("HenosisEnvLeave");
-                        command_henosis_stub(repo, database, pr, &comment.author, "env")
+                        command_henosis_env_leave(ctx.clone(), repo, database, pr, &comment.author)
                             .instrument(span)
                             .await
                     }
                     BorsCommand::GateStatus => {
                         let span = tracing::info_span!("HenosisGateStatus");
-                        command_henosis_stub(repo, database, pr, &comment.author, "gate")
+                        command_henosis_gate(ctx.clone(), repo, database, pr, &comment.author)
                             .instrument(span)
                             .await
                     }
@@ -645,26 +655,140 @@ async fn handle_comment(
     Ok(())
 }
 
-async fn command_henosis_stub(
+async fn command_henosis_env(
+    ctx: Arc<BorsContext>,
     repo: Arc<RepositoryState>,
     db: Arc<PgDbClient>,
     pr: PullRequestData<'_>,
     author: &GithubUser,
-    command_group: &str,
 ) -> anyhow::Result<()> {
     if !has_permission(&repo, author, pr, PermissionType::Review).await? {
         deny_request(&repo, &db, pr.number(), author, PermissionType::Review).await?;
         return Ok(());
     }
 
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return post_henosis_not_configured(&repo, &db, pr.number()).await;
+    };
+    let status =
+        crate::henosis::service::environment_status(&ctx, repo.repository(), pr.number()).await?;
     repo.client
         .post_comment(
             pr.number(),
-            Comment::new(format!(
-                "@{}: Henosis {command_group} commands are not yet wired. (stub)",
-                author.username,
-            )),
+            Comment::new(environment_status_comment(config, status)),
             &db,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn command_henosis_env_join(
+    ctx: Arc<BorsContext>,
+    repo: Arc<RepositoryState>,
+    db: Arc<PgDbClient>,
+    pr: PullRequestData<'_>,
+    author: &GithubUser,
+    name: &str,
+) -> anyhow::Result<()> {
+    if !has_permission(&repo, author, pr, PermissionType::Review).await? {
+        deny_request(&repo, &db, pr.number(), author, PermissionType::Review).await?;
+        return Ok(());
+    }
+
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return post_henosis_not_configured(&repo, &db, pr.number()).await;
+    };
+    let Some(change) =
+        crate::henosis::service::join_environment(&ctx, repo.repository(), pr.github, name).await?
+    else {
+        return post_henosis_not_managed(&repo, &db, pr.number()).await;
+    };
+
+    if let Some(comment) = environment_change_comment(config, &change) {
+        repo.client
+            .post_comment(pr.number(), Comment::new(comment), &db)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn command_henosis_env_leave(
+    ctx: Arc<BorsContext>,
+    repo: Arc<RepositoryState>,
+    db: Arc<PgDbClient>,
+    pr: PullRequestData<'_>,
+    author: &GithubUser,
+) -> anyhow::Result<()> {
+    if !has_permission(&repo, author, pr, PermissionType::Review).await? {
+        deny_request(&repo, &db, pr.number(), author, PermissionType::Review).await?;
+        return Ok(());
+    }
+
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return post_henosis_not_configured(&repo, &db, pr.number()).await;
+    };
+    let Some(change) =
+        crate::henosis::service::leave_environment(&ctx, repo.repository(), pr.github).await?
+    else {
+        return post_henosis_not_managed(&repo, &db, pr.number()).await;
+    };
+
+    if let Some(comment) = environment_change_comment(config, &change) {
+        repo.client
+            .post_comment(pr.number(), Comment::new(comment), &db)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn command_henosis_gate(
+    ctx: Arc<BorsContext>,
+    repo: Arc<RepositoryState>,
+    db: Arc<PgDbClient>,
+    pr: PullRequestData<'_>,
+    author: &GithubUser,
+) -> anyhow::Result<()> {
+    if !has_permission(&repo, author, pr, PermissionType::Review).await? {
+        deny_request(&repo, &db, pr.number(), author, PermissionType::Review).await?;
+        return Ok(());
+    }
+
+    if ctx.henosis_config.is_none() {
+        return post_henosis_not_configured(&repo, &db, pr.number()).await;
+    }
+    let status =
+        crate::henosis::service::latest_gate_status(&ctx, repo.repository(), pr.number()).await?;
+    repo.client
+        .post_comment(pr.number(), Comment::new(gate_status_comment(status)), &db)
+        .await?;
+    Ok(())
+}
+
+async fn post_henosis_not_configured(
+    repo: &RepositoryState,
+    db: &PgDbClient,
+    pr_number: PullRequestNumber,
+) -> anyhow::Result<()> {
+    repo.client
+        .post_comment(
+            pr_number,
+            Comment::new("Henosis is not configured for this bot instance.".to_string()),
+            db,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn post_henosis_not_managed(
+    repo: &RepositoryState,
+    db: &PgDbClient,
+    pr_number: PullRequestNumber,
+) -> anyhow::Result<()> {
+    repo.client
+        .post_comment(
+            pr_number,
+            Comment::new("This repository is not managed by Henosis.".to_string()),
+            db,
         )
         .await?;
     Ok(())
@@ -1187,10 +1311,10 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn henosis_env_command_stub_reply(pool: sqlx::PgPool) {
+    async fn henosis_env_command_without_config(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
             ctx.post_comment(Comment::from("@bors env")).await?;
-            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"@default-user: Henosis env commands are not yet wired. (stub)"#);
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"Henosis is not configured for this bot instance.");
             Ok(())
         })
         .await;

@@ -45,6 +45,10 @@ impl PgDbClient {
         Self { pool }
     }
 
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Tries to perform the given asynchronous operation if there is no other concurrent operation
     /// operation on the same `lock_name` at the same time.
     ///

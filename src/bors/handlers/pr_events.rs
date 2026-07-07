@@ -16,6 +16,7 @@ use crate::bors::{AUTO_BRANCH_NAME, BorsContext, hide_tagged_comments};
 use crate::bors::{PullRequestStatus, RepositoryState};
 use crate::database::{PullRequestModel, UpsertPullRequestParams};
 use crate::github::CommitSha;
+use crate::henosis::service::environment_change_comment;
 use std::sync::Arc;
 
 pub(super) async fn handle_pull_request_edited(
@@ -115,7 +116,16 @@ pub(super) async fn handle_pull_request_opened(
         )
         .await?;
 
-    process_pr_description_commands(&payload, repo_state.clone(), db, ctx, senders).await?;
+    process_pr_description_commands(
+        &payload,
+        repo_state.clone(),
+        db.clone(),
+        ctx.clone(),
+        senders,
+    )
+    .await?;
+
+    create_henosis_preview_for_pr(&repo_state, &db, &ctx, &payload.pull_request).await?;
 
     senders.mergeability_queue().enqueue_pr(&pr_model, None);
 
@@ -125,6 +135,7 @@ pub(super) async fn handle_pull_request_opened(
 pub(super) async fn handle_pull_request_closed(
     repo_state: Arc<RepositoryState>,
     db: Arc<PgDbClient>,
+    ctx: Arc<BorsContext>,
     payload: PullRequestClosed,
 ) -> anyhow::Result<()> {
     // The status is already closed on GitHub, so we can just upsert it
@@ -140,12 +151,14 @@ pub(super) async fn handle_pull_request_closed(
         None,
     )
     .await?;
+    retire_henosis_preview_for_pr(&repo_state, &db, &ctx, payload.pull_request.number).await?;
     Ok(())
 }
 
 pub(super) async fn handle_pull_request_merged(
     repo_state: Arc<RepositoryState>,
     db: Arc<PgDbClient>,
+    ctx: Arc<BorsContext>,
     payload: PullRequestMerged,
 ) -> anyhow::Result<()> {
     db.set_pr_status(
@@ -153,12 +166,14 @@ pub(super) async fn handle_pull_request_merged(
         payload.pull_request.number,
         PullRequestStatus::Merged,
     )
-    .await
+    .await?;
+    retire_henosis_preview_for_pr(&repo_state, &db, &ctx, payload.pull_request.number).await
 }
 
 pub(super) async fn handle_pull_request_reopened(
     repo_state: Arc<RepositoryState>,
     db: Arc<PgDbClient>,
+    ctx: Arc<BorsContext>,
     mergeability_queue: &MergeabilityQueueSender,
     payload: PullRequestReopened,
 ) -> anyhow::Result<()> {
@@ -168,6 +183,8 @@ pub(super) async fn handle_pull_request_reopened(
         .await?;
 
     set_pr_mergeability_based_on_user_action(&db, pr, &pr_model, mergeability_queue).await?;
+
+    recreate_henosis_preview_for_pr(&repo_state, &db, &ctx, pr).await?;
 
     Ok(())
 }
@@ -310,6 +327,80 @@ fn create_pr_description_comment(payload: &PullRequestOpened) -> PullRequestComm
             payload.repository, payload.pull_request.number
         ),
     }
+}
+
+async fn create_henosis_preview_for_pr(
+    repo_state: &RepositoryState,
+    db: &PgDbClient,
+    ctx: &BorsContext,
+    pr: &crate::github::PullRequest,
+) -> anyhow::Result<()> {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return Ok(());
+    };
+    let Some(change) =
+        crate::henosis::service::open_preview_environment(ctx, repo_state.repository(), pr).await?
+    else {
+        return Ok(());
+    };
+    if let Some(comment) = environment_change_comment(config, &change) {
+        repo_state
+            .client
+            .post_comment(pr.number, crate::bors::Comment::new(comment), db)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn recreate_henosis_preview_for_pr(
+    repo_state: &RepositoryState,
+    db: &PgDbClient,
+    ctx: &BorsContext,
+    pr: &crate::github::PullRequest,
+) -> anyhow::Result<()> {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return Ok(());
+    };
+    let Some(change) =
+        crate::henosis::service::reopen_preview_environment(ctx, repo_state.repository(), pr)
+            .await?
+    else {
+        return Ok(());
+    };
+    if let Some(comment) = environment_change_comment(config, &change) {
+        repo_state
+            .client
+            .post_comment(pr.number, crate::bors::Comment::new(comment), db)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn retire_henosis_preview_for_pr(
+    repo_state: &RepositoryState,
+    db: &PgDbClient,
+    ctx: &BorsContext,
+    pr_number: crate::github::PullRequestNumber,
+) -> anyhow::Result<()> {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return Ok(());
+    };
+    let Some(change) = crate::henosis::service::retire_preview_environment(
+        ctx,
+        repo_state.repository(),
+        pr_number,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    if let Some(comment) = environment_change_comment(config, &change) {
+        repo_state
+            .client
+            .post_comment(pr_number, crate::bors::Comment::new(comment), db)
+            .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

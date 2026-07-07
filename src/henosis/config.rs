@@ -16,8 +16,29 @@ pub struct HenosisConfig {
     pub gate_check_run_name: String,
     #[serde(default = "default_cmd_prefix")]
     pub cmd_prefix: String,
+    #[serde(default)]
+    pub components: Vec<ComponentConfig>,
+    #[serde(default)]
     pub source_repos: Vec<String>,
+    #[serde(default = "default_dev_lockfile_path")]
+    pub dev_lockfile_path: String,
     pub environments: Vec<EnvironmentConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentConfig {
+    pub name: String,
+    pub repo: String,
+    #[serde(default = "default_main_branch")]
+    pub main_branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredComponent {
+    pub name: String,
+    pub repo: String,
+    pub main_branch: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -41,6 +62,49 @@ impl HenosisConfig {
         toml::from_str(&content)
             .with_context(|| format!("Cannot parse Henosis config from {}", path.display()))
     }
+
+    pub fn registered_components(&self) -> Vec<RegisteredComponent> {
+        if !self.components.is_empty() {
+            return self
+                .components
+                .iter()
+                .map(|component| RegisteredComponent {
+                    name: component.name.clone(),
+                    repo: component.repo.clone(),
+                    main_branch: component.main_branch.clone(),
+                })
+                .collect();
+        }
+
+        self.source_repos
+            .iter()
+            .map(|repo| RegisteredComponent {
+                name: component_name_from_repo(repo),
+                repo: repo.clone(),
+                main_branch: default_main_branch(),
+            })
+            .collect()
+    }
+
+    pub fn is_component_repo(&self, repo: &str) -> bool {
+        self.registered_components()
+            .iter()
+            .any(|component| component.repo == repo)
+    }
+
+    pub fn component_for_repo(&self, repo: &str) -> Option<RegisteredComponent> {
+        self.registered_components()
+            .into_iter()
+            .find(|component| component.repo == repo)
+    }
+
+    pub fn environment_lockfile_path(&self, environment_id: &str) -> String {
+        self.environments
+            .iter()
+            .find(|env| env.id == environment_id)
+            .map(|env| env.lockfile_path.clone())
+            .unwrap_or_else(|| format!("{environment_id}.toml"))
+    }
 }
 
 fn default_lockfile_branch() -> String {
@@ -53,6 +117,18 @@ fn default_gate_check_run_name() -> String {
 
 fn default_cmd_prefix() -> String {
     "@henosis-bot".to_string()
+}
+
+fn default_dev_lockfile_path() -> String {
+    "dev.toml".to_string()
+}
+
+fn default_main_branch() -> String {
+    "main".to_string()
+}
+
+fn component_name_from_repo(repo: &str) -> String {
+    repo.rsplit('/').next().unwrap_or(repo).to_string()
 }
 
 #[cfg(test)]
@@ -81,6 +157,21 @@ lockfile_path = "dev.toml"
         assert_eq!(config.gate_check_run_name, "Henosis gate");
         assert_eq!(config.cmd_prefix, "@henosis-bot");
         assert_eq!(config.environments[0].id, "dev");
+        assert_eq!(
+            config.registered_components(),
+            vec![
+                RegisteredComponent {
+                    name: "service-a".to_string(),
+                    repo: "henosis-playground/service-a".to_string(),
+                    main_branch: "main".to_string(),
+                },
+                RegisteredComponent {
+                    name: "service-b".to_string(),
+                    repo: "henosis-playground/service-b".to_string(),
+                    main_branch: "main".to_string(),
+                }
+            ]
+        );
     }
 
     #[test]
@@ -103,6 +194,36 @@ lockfile_path = "staging.toml"
         assert_eq!(config.lockfile_branch, "lockfiles");
         assert_eq!(config.gate_check_run_name, "Custom gate");
         assert_eq!(config.cmd_prefix, "@custom-bot");
+    }
+
+    #[test]
+    fn parses_component_registry() {
+        let config = parse_config(
+            r#"
+deploy_repo = "henosis-playground/deploy"
+
+[[components]]
+name = "api"
+repo = "henosis-playground/service-a"
+main_branch = "trunk"
+
+[[environments]]
+id = "dev"
+lockfile_path = "dev.toml"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.registered_components(),
+            vec![RegisteredComponent {
+                name: "api".to_string(),
+                repo: "henosis-playground/service-a".to_string(),
+                main_branch: "trunk".to_string(),
+            }]
+        );
+        assert!(config.is_component_repo("henosis-playground/service-a"));
+        assert!(!config.is_component_repo("henosis-playground/service-b"));
     }
 
     #[test]

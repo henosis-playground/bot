@@ -1,0 +1,1 @@
+-- Empty to satisfy migration tests. Existing active rows keep NULL retired markers.
