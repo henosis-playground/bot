@@ -12,6 +12,8 @@ pub struct HenosisConfig {
     pub deploy_repo: String,
     #[serde(default = "default_lockfile_branch")]
     pub lockfile_branch: String,
+    #[serde(default = "default_gate_command")]
+    pub gate_command: String,
     #[serde(default = "default_gate_check_run_name")]
     pub gate_check_run_name: String,
     #[serde(default = "default_cmd_prefix")]
@@ -111,6 +113,10 @@ fn default_lockfile_branch() -> String {
     "main".to_string()
 }
 
+fn default_gate_command() -> String {
+    "henosis-gate".to_string()
+}
+
 fn default_gate_check_run_name() -> String {
     "Henosis gate".to_string()
 }
@@ -154,6 +160,7 @@ lockfile_path = "dev.toml"
         .unwrap();
 
         assert_eq!(config.lockfile_branch, "main");
+        assert_eq!(config.gate_command, "henosis-gate");
         assert_eq!(config.gate_check_run_name, "Henosis gate");
         assert_eq!(config.cmd_prefix, "@henosis-bot");
         assert_eq!(config.environments[0].id, "dev");
@@ -180,6 +187,7 @@ lockfile_path = "dev.toml"
             r#"
 deploy_repo = "henosis-playground/deploy"
 lockfile_branch = "lockfiles"
+gate_command = "custom-gate"
 gate_check_run_name = "Custom gate"
 cmd_prefix = "@custom-bot"
 source_repos = ["henosis-playground/service-a"]
@@ -192,6 +200,7 @@ lockfile_path = "staging.toml"
         .unwrap();
 
         assert_eq!(config.lockfile_branch, "lockfiles");
+        assert_eq!(config.gate_command, "custom-gate");
         assert_eq!(config.gate_check_run_name, "Custom gate");
         assert_eq!(config.cmd_prefix, "@custom-bot");
     }

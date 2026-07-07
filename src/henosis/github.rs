@@ -1,16 +1,28 @@
 use anyhow::Context;
-use octocrab::params::checks::CheckRunStatus;
-use serde::Deserialize;
+use octocrab::models::CheckRunId;
+use octocrab::params::checks::{
+    CheckRunConclusion, CheckRunOutput as OctoCheckRunOutput, CheckRunStatus,
+};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 
+use crate::PgDbClient;
+use crate::bors::Comment;
 use crate::bors::RepositoryStore;
 use crate::github::api::client::{CheckRunOutput, GithubRepositoryClient};
-use crate::github::{CommitSha, GithubRepoName};
+use crate::github::{CommitSha, GithubRepoName, PullRequestNumber};
+use crate::henosis::config::HenosisConfig;
 use crate::henosis::environment::{
     DeployRepoWriter, DeployWriteResult, DevLockfileReader, ImageDigestResolver,
 };
 use crate::henosis::graph::{ComponentPackageReader, PackageJson};
-use crate::henosis::lockfile::{self, Lockfile};
-use crate::henosis::queue::{GateCheckReporter, QueuePullRequest};
+use crate::henosis::lockfile::{self, ComponentEntry, Lockfile, PinnedEntry};
+use crate::henosis::merge::{
+    DevBump, DevLockfileBumper, MergeExecutor, PullRequestMerger, StateMachineMergeExecutor,
+};
+use crate::henosis::queue::{
+    CheckConclusion, GateCheckReporter, GateRun, PrCommenter, QueuePullRequest,
+};
 
 pub struct GithubDeployRepoWriter<'a> {
     client: &'a GithubRepositoryClient,
@@ -226,6 +238,308 @@ impl GateCheckReporter for GithubGateCheckReporter<'_> {
             )
             .await?;
         Ok(())
+    }
+
+    async fn resolve_check_run(
+        &self,
+        external_id: &str,
+        conclusion: CheckConclusion,
+        summary: &str,
+    ) -> anyhow::Result<()> {
+        let Some(head_sha) = external_id.rsplit_once('-').map(|(_, sha)| sha) else {
+            anyhow::bail!("Cannot extract head SHA from gate external id `{external_id}`");
+        };
+
+        let mut resolved = false;
+        for repo in self.repositories.repositories() {
+            let check_runs = list_check_runs_for_ref(&repo.client, head_sha).await?;
+            for check_run in check_runs
+                .into_iter()
+                .filter(|check_run| check_run.name == self.check_name)
+                .filter(|check_run| check_run.external_id.as_deref() == Some(external_id))
+            {
+                update_check_run_output(
+                    &repo.client,
+                    check_run.id,
+                    conclusion,
+                    &self.check_name,
+                    summary,
+                )
+                .await?;
+                resolved = true;
+            }
+        }
+
+        if !resolved {
+            tracing::warn!("No Henosis check run found for external id `{external_id}`");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRunList {
+    check_runs: Vec<CheckRunForResolution>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRunForResolution {
+    id: CheckRunId,
+    name: String,
+    external_id: Option<String>,
+}
+
+async fn list_check_runs_for_ref(
+    client: &GithubRepositoryClient,
+    r#ref: &str,
+) -> anyhow::Result<Vec<CheckRunForResolution>> {
+    let route = format!(
+        "/repos/{}/commits/{}/check-runs?per_page=100",
+        client.repository(),
+        r#ref
+    );
+    let runs = client
+        .client()
+        .get::<CheckRunList, _, ()>(&route, None)
+        .await
+        .with_context(|| {
+            format!(
+                "Cannot list check runs for `{}` at `{ref}`",
+                client.repository()
+            )
+        })?;
+    Ok(runs.check_runs)
+}
+
+async fn update_check_run_output(
+    client: &GithubRepositoryClient,
+    check_run_id: CheckRunId,
+    conclusion: CheckConclusion,
+    title: &str,
+    summary: &str,
+) -> anyhow::Result<()> {
+    client
+        .client()
+        .checks(client.repository().owner(), client.repository().name())
+        .update_check_run(check_run_id)
+        .status(CheckRunStatus::Completed)
+        .conclusion(match conclusion {
+            CheckConclusion::Success => CheckRunConclusion::Success,
+            CheckConclusion::Failure => CheckRunConclusion::Failure,
+            CheckConclusion::Neutral => CheckRunConclusion::Neutral,
+        })
+        .output(OctoCheckRunOutput {
+            title: title.to_string(),
+            summary: summary.to_string(),
+            text: None,
+            annotations: vec![],
+            images: vec![],
+        })
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "Cannot update check run `{}` in {}",
+                check_run_id.0,
+                client.repository()
+            )
+        })?;
+    Ok(())
+}
+
+pub struct GithubPrCommenter<'a> {
+    repositories: &'a RepositoryStore,
+    db: &'a PgDbClient,
+}
+
+impl<'a> GithubPrCommenter<'a> {
+    pub fn new(repositories: &'a RepositoryStore, db: &'a PgDbClient) -> Self {
+        Self { repositories, db }
+    }
+}
+
+impl PrCommenter for GithubPrCommenter<'_> {
+    async fn post_comment(&self, pr: &QueuePullRequest, body: &str) -> anyhow::Result<()> {
+        let repo_name: GithubRepoName =
+            pr.key.repo.parse().map_err(|error| {
+                anyhow::anyhow!("Invalid GitHub repo `{}`: {error}", pr.key.repo)
+            })?;
+        let repo = self
+            .repositories
+            .get(&repo_name)
+            .with_context(|| format!("Repository `{repo_name}` is not loaded"))?;
+        repo.client
+            .post_comment(
+                PullRequestNumber(pr.key.number),
+                Comment::new(body.to_string()),
+                self.db,
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+pub struct GitHubMergeExecutor<'a> {
+    pool: PgPool,
+    repositories: &'a RepositoryStore,
+    db: &'a PgDbClient,
+    config: &'a HenosisConfig,
+}
+
+impl<'a> GitHubMergeExecutor<'a> {
+    pub fn new(
+        pool: PgPool,
+        repositories: &'a RepositoryStore,
+        db: &'a PgDbClient,
+        config: &'a HenosisConfig,
+    ) -> Self {
+        Self {
+            pool,
+            repositories,
+            db,
+            config,
+        }
+    }
+}
+
+impl MergeExecutor for GitHubMergeExecutor<'_> {
+    async fn execute(&self, gate_run: &GateRun) -> anyhow::Result<()> {
+        let store = crate::henosis::db::PgQueueStore::new(self.pool.clone());
+        let merger = GithubPullRequestMerger::new(self.repositories);
+        let bumper = GithubDevLockfileBumper::new(self.repositories, self.config);
+        let commenter = GithubPrCommenter::new(self.repositories, self.db);
+        StateMachineMergeExecutor::new(store, merger, bumper, commenter)
+            .execute(gate_run)
+            .await
+    }
+}
+
+pub struct GithubPullRequestMerger<'a> {
+    repositories: &'a RepositoryStore,
+}
+
+impl<'a> GithubPullRequestMerger<'a> {
+    pub fn new(repositories: &'a RepositoryStore) -> Self {
+        Self { repositories }
+    }
+}
+
+impl PullRequestMerger for GithubPullRequestMerger<'_> {
+    async fn squash_merge(&self, pr: &QueuePullRequest) -> anyhow::Result<String> {
+        let repo_name: GithubRepoName =
+            pr.key.repo.parse().map_err(|error| {
+                anyhow::anyhow!("Invalid GitHub repo `{}`: {error}", pr.key.repo)
+            })?;
+        let repo = self
+            .repositories
+            .get(&repo_name)
+            .with_context(|| format!("Repository `{repo_name}` is not loaded"))?;
+        let sha = squash_merge_pull_request(&repo.client, PullRequestNumber(pr.key.number)).await?;
+        Ok(sha.to_string())
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PullRequestMergeRequest<'a> {
+    merge_method: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestMergeResponse {
+    sha: String,
+}
+
+async fn squash_merge_pull_request(
+    client: &GithubRepositoryClient,
+    pr: PullRequestNumber,
+) -> anyhow::Result<CommitSha> {
+    let route = format!("/repos/{}/pulls/{}/merge", client.repository(), pr.0);
+    let request = PullRequestMergeRequest {
+        merge_method: "squash",
+    };
+    let response: PullRequestMergeResponse = client
+        .client()
+        .post(route, Some(&request))
+        .await
+        .with_context(|| format!("Cannot squash-merge PR {}#{}", client.repository(), pr.0))?;
+    Ok(CommitSha(response.sha))
+}
+
+pub struct GithubDevLockfileBumper<'a> {
+    repositories: &'a RepositoryStore,
+    config: &'a HenosisConfig,
+}
+
+impl<'a> GithubDevLockfileBumper<'a> {
+    pub fn new(repositories: &'a RepositoryStore, config: &'a HenosisConfig) -> Self {
+        Self {
+            repositories,
+            config,
+        }
+    }
+}
+
+impl DevLockfileBumper for GithubDevLockfileBumper<'_> {
+    async fn bump_dev_lockfile(
+        &self,
+        gate_run: &GateRun,
+        merge_commit_sha: &str,
+    ) -> anyhow::Result<DevBump> {
+        let deploy_repo: GithubRepoName = self.config.deploy_repo.parse().map_err(|error| {
+            anyhow::anyhow!("Invalid deploy repo `{}`: {error}", self.config.deploy_repo)
+        })?;
+        let deploy_repo = self
+            .repositories
+            .get(&deploy_repo)
+            .with_context(|| format!("Repository `{}` is not loaded", self.config.deploy_repo))?;
+
+        let current = deploy_repo
+            .client
+            .read_file_at_ref(&self.config.dev_lockfile_path, &self.config.lockfile_branch)
+            .await?;
+        let mut lockfile =
+            lockfile::parse_toml(&current.content).context("Cannot parse dev lockfile")?;
+        let digest = GithubImageDigestResolver::new(self.repositories);
+
+        for component in gate_run
+            .world
+            .components
+            .iter()
+            .filter(|component| component.candidate)
+        {
+            let resolved_digest = digest
+                .image_digest(&component.repo, merge_commit_sha)
+                .await?
+                .unwrap_or_else(|| component.digest.clone());
+            lockfile.components.insert(
+                component.name.clone(),
+                ComponentEntry::Pinned(PinnedEntry {
+                    repo: component.repo.clone(),
+                    r#ref: merge_commit_sha.to_string(),
+                    digest: resolved_digest,
+                }),
+            );
+        }
+
+        let serialized = lockfile::to_toml(&lockfile).context("Cannot serialize dev lockfile")?;
+        let commit_sha = deploy_repo
+            .client
+            .write_file_to_branch(
+                &self.config.dev_lockfile_path,
+                &self.config.lockfile_branch,
+                "Bump Henosis dev lockfile",
+                &serialized,
+            )
+            .await?;
+        let commit_sha = commit_sha.to_string();
+
+        Ok(DevBump {
+            commit_url: format!(
+                "https://github.com/{}/commit/{commit_sha}",
+                self.config.deploy_repo
+            ),
+            commit_sha,
+        })
     }
 }
 

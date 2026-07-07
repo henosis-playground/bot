@@ -6,12 +6,14 @@ use crate::henosis::environment::{
     EnvironmentChange, EnvironmentManager, EnvironmentStatus, PreviewPullRequest, PullRequestKey,
     environment_branch,
 };
+use crate::henosis::gate::CliGateExecutor;
 use crate::henosis::github::{
-    GithubComponentPackageReader, GithubDeployRepoWriter, GithubDevLockfileReader,
-    GithubGateCheckReporter, GithubImageDigestResolver, deploy_branch_url, deploy_lockfile_url,
+    GitHubMergeExecutor, GithubComponentPackageReader, GithubDeployRepoWriter,
+    GithubDevLockfileReader, GithubGateCheckReporter, GithubImageDigestResolver, GithubPrCommenter,
+    deploy_branch_url, deploy_lockfile_url,
 };
 use crate::henosis::queue::{
-    GateStatus, PendingGateExecutor, QueueManager, QueueStore, RecordedGateRun,
+    GateStatus, QueueManager, QueuePullRequest, QueueStore, RecordedGateRun,
 };
 
 pub fn is_henosis_component_repo(ctx: &BorsContext, repo: &GithubRepoName) -> bool {
@@ -216,8 +218,52 @@ pub async fn tick_queue(ctx: &BorsContext) -> anyhow::Result<Option<RecordedGate
         &config.dev_lockfile_path,
     );
     let reporter = GithubGateCheckReporter::new(&ctx.repositories, &config.gate_check_run_name);
-    let executor = PendingGateExecutor;
-    manager.tick(&mut store, &dev, &reporter, &executor).await
+    let gate_executor = CliGateExecutor::new(&config.gate_command, &config.dev_lockfile_path);
+    let merge_executor = GitHubMergeExecutor::new(
+        ctx.db.pool().clone(),
+        ctx.repositories.as_ref(),
+        ctx.db.as_ref(),
+        config,
+    );
+    let commenter = GithubPrCommenter::new(ctx.repositories.as_ref(), ctx.db.as_ref());
+    manager
+        .tick(
+            &mut store,
+            &dev,
+            &reporter,
+            &gate_executor,
+            &merge_executor,
+            &commenter,
+        )
+        .await
+}
+
+pub async fn on_pr_push(
+    ctx: &BorsContext,
+    repo: &GithubRepoName,
+    pr: &PullRequest,
+) -> anyhow::Result<bool> {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return Ok(false);
+    };
+    let Some(component) = config.component_for_repo(&repo.to_string()) else {
+        return Ok(false);
+    };
+
+    let pushed = QueuePullRequest::new(
+        repo.to_string(),
+        pr.number.0,
+        component.name,
+        pr.head.sha.to_string(),
+        pr.head.name.clone(),
+        pr.head.sha.to_string(),
+    );
+    let manager = QueueManager::new(config.registered_components());
+    let mut store = PgQueueStore::new(ctx.db.pool().clone());
+    let reporter = GithubGateCheckReporter::new(&ctx.repositories, &config.gate_check_run_name);
+    manager
+        .invalidate_pr_push(&mut store, &reporter, &pushed)
+        .await
 }
 
 pub fn environment_change_comment(

@@ -16,7 +16,7 @@ use crate::bors::{AUTO_BRANCH_NAME, BorsContext, hide_tagged_comments};
 use crate::bors::{PullRequestStatus, RepositoryState};
 use crate::database::{PullRequestModel, UpsertPullRequestParams};
 use crate::github::CommitSha;
-use crate::henosis::service::environment_change_comment;
+use crate::henosis::service::{environment_change_comment, on_pr_push};
 use std::sync::Arc;
 
 pub(super) async fn handle_pull_request_edited(
@@ -55,6 +55,7 @@ pub(super) async fn handle_pull_request_edited(
 pub(super) async fn handle_push_to_pull_request(
     repo_state: Arc<RepositoryState>,
     db: Arc<PgDbClient>,
+    ctx: Arc<BorsContext>,
     mergeability_queue: &MergeabilityQueueSender,
     payload: PullRequestPushed,
 ) -> anyhow::Result<()> {
@@ -66,6 +67,10 @@ pub(super) async fn handle_push_to_pull_request(
     set_pr_mergeability_based_on_user_action(&db, pr, &pr_model, mergeability_queue).await?;
 
     hide_tagged_comments(&repo_state, &db, &pr_model, CommentTag::MergeConflict).await?;
+
+    if on_pr_push(&ctx, repo_state.repository(), pr).await? {
+        return Ok(());
+    }
 
     invalidate_pr(
         &repo_state,

@@ -2,15 +2,26 @@ use std::collections::BTreeMap;
 
 use anyhow::Context;
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 
 use crate::henosis::config::RegisteredComponent;
 use crate::henosis::environment::{DevLockfileReader, PullRequestKey};
+use crate::henosis::gate::GateExecutor;
 use crate::henosis::lockfile::{ComponentEntry, PinnedEntry};
+use crate::henosis::merge::MergeExecutor;
 
 pub const GLOBAL_QUEUE_LOCK_KEY: i64 = 0x4845_4e4f_5155_4555;
+pub const PENDING_STATUS: &str = "pending";
 pub const PENDING_EXECUTOR_STATUS: &str = "pending-executor";
+pub const RUNNING_STATUS: &str = "running";
+pub const GATE_FAILED_STATUS: &str = "gate-failed";
+pub const GATE_PASSED_STATUS: &str = "gate-passed";
+pub const MERGING_PR_STATUS: &str = "merging-pr";
+pub const BUMPING_DEV_STATUS: &str = "bumping-dev";
+pub const MERGED_STATUS: &str = "merged";
+pub const INVALIDATED_STATUS: &str = "invalidated";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuePullRequest {
     pub key: PullRequestKey,
     pub component: String,
@@ -38,7 +49,7 @@ impl QueuePullRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateComponent {
     pub name: String,
     pub repo: String,
@@ -47,7 +58,7 @@ pub struct CandidateComponent {
     pub candidate: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateWorld {
     pub members: Vec<QueuePullRequest>,
     pub components: Vec<CandidateComponent>,
@@ -57,13 +68,25 @@ pub struct CandidateWorld {
 pub struct RecordedGateRun {
     pub id: i64,
     pub external_id: String,
+    pub status: String,
     pub world: CandidateWorld,
+    pub merge_commit_sha: Option<String>,
+    pub dev_bump_commit_sha: Option<String>,
 }
+
+pub type GateRun = RecordedGateRun;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateStatus {
     pub external_id: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckConclusion {
+    Success,
+    Failure,
+    Neutral,
 }
 
 pub trait QueueStore {
@@ -73,10 +96,16 @@ pub trait QueueStore {
         &mut self,
         components: &[RegisteredComponent],
     ) -> anyhow::Result<Option<QueuePullRequest>>;
+    async fn oldest_resumable_merge(&mut self) -> anyhow::Result<Option<RecordedGateRun>>;
     async fn record_gate_run(&mut self, world: &CandidateWorld) -> anyhow::Result<RecordedGateRun>;
     async fn mark_gate_run_status(&mut self, external_id: &str, status: &str)
     -> anyhow::Result<()>;
     async fn latest_gate_status(&self, key: &PullRequestKey) -> anyhow::Result<Option<GateStatus>>;
+    async fn invalidate_active_gate_runs(
+        &mut self,
+        key: &PullRequestKey,
+    ) -> anyhow::Result<Vec<GateStatus>>;
+    async fn reenqueue_pr(&mut self, pr: &QueuePullRequest) -> anyhow::Result<()>;
 }
 
 pub trait GateCheckReporter {
@@ -85,30 +114,16 @@ pub trait GateCheckReporter {
         pr: &QueuePullRequest,
         external_id: &str,
     ) -> anyhow::Result<()>;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GateExecutionRequest {
-    PendingExecutor,
-}
-
-pub trait GateExecutor {
-    async fn request_execution(
+    async fn resolve_check_run(
         &self,
-        gate_run: &RecordedGateRun,
-    ) -> anyhow::Result<GateExecutionRequest>;
+        external_id: &str,
+        conclusion: CheckConclusion,
+        summary: &str,
+    ) -> anyhow::Result<()>;
 }
 
-#[derive(Debug, Default)]
-pub struct PendingGateExecutor;
-
-impl GateExecutor for PendingGateExecutor {
-    async fn request_execution(
-        &self,
-        _gate_run: &RecordedGateRun,
-    ) -> anyhow::Result<GateExecutionRequest> {
-        Ok(GateExecutionRequest::PendingExecutor)
-    }
+pub trait PrCommenter {
+    async fn post_comment(&self, pr: &QueuePullRequest, body: &str) -> anyhow::Result<()>;
 }
 
 pub struct QueueManager {
@@ -120,25 +135,36 @@ impl QueueManager {
         Self { components }
     }
 
-    pub async fn tick<S, D, R, E>(
+    pub async fn tick<S, D, R, E, M, C>(
         &self,
         store: &mut S,
         dev_lockfiles: &D,
         check_reporter: &R,
-        executor: &E,
+        gate_executor: &E,
+        merge_executor: &M,
+        commenter: &C,
     ) -> anyhow::Result<Option<RecordedGateRun>>
     where
         S: QueueStore,
         D: DevLockfileReader,
         R: GateCheckReporter,
         E: GateExecutor,
+        M: MergeExecutor,
+        C: PrCommenter,
     {
         if !store.try_acquire_global_lock().await? {
             return Ok(None);
         }
 
         let result = self
-            .tick_with_lock(store, dev_lockfiles, check_reporter, executor)
+            .tick_with_lock(
+                store,
+                dev_lockfiles,
+                check_reporter,
+                gate_executor,
+                merge_executor,
+                commenter,
+            )
             .await;
         let release = store.release_global_lock().await;
         match (result, release) {
@@ -149,19 +175,28 @@ impl QueueManager {
         }
     }
 
-    async fn tick_with_lock<S, D, R, E>(
+    async fn tick_with_lock<S, D, R, E, M, C>(
         &self,
         store: &mut S,
         dev_lockfiles: &D,
         check_reporter: &R,
-        executor: &E,
+        gate_executor: &E,
+        merge_executor: &M,
+        commenter: &C,
     ) -> anyhow::Result<Option<RecordedGateRun>>
     where
         S: QueueStore,
         D: DevLockfileReader,
         R: GateCheckReporter,
         E: GateExecutor,
+        M: MergeExecutor,
+        C: PrCommenter,
     {
+        if let Some(gate_run) = store.oldest_resumable_merge().await? {
+            merge_executor.execute(&gate_run).await?;
+            return Ok(Some(gate_run));
+        }
+
         let Some(candidate) = store.oldest_ready_candidate(&self.components).await? else {
             return Ok(None);
         };
@@ -169,20 +204,85 @@ impl QueueManager {
         let world = self
             .candidate_world(dev_lockfiles, vec![candidate.clone()])
             .await?;
-        let gate_run = store.record_gate_run(&world).await?;
-        check_reporter
-            .create_in_progress_check(&candidate, &gate_run.external_id)
-            .await?;
+        let mut gate_run = store.record_gate_run(&world).await?;
+        for member in &world.members {
+            check_reporter
+                .create_in_progress_check(member, &gate_run.external_id)
+                .await?;
+        }
 
-        match executor.request_execution(&gate_run).await? {
-            GateExecutionRequest::PendingExecutor => {
-                store
-                    .mark_gate_run_status(&gate_run.external_id, PENDING_EXECUTOR_STATUS)
-                    .await?;
+        store
+            .mark_gate_run_status(&gate_run.external_id, PENDING_EXECUTOR_STATUS)
+            .await?;
+        gate_run.status = PENDING_EXECUTOR_STATUS.to_string();
+
+        store
+            .mark_gate_run_status(&gate_run.external_id, RUNNING_STATUS)
+            .await?;
+        gate_run.status = RUNNING_STATUS.to_string();
+
+        let report = gate_executor.execute(&gate_run).await?;
+        if report.ok {
+            store
+                .mark_gate_run_status(&gate_run.external_id, GATE_PASSED_STATUS)
+                .await?;
+            gate_run.status = GATE_PASSED_STATUS.to_string();
+            check_reporter
+                .resolve_check_run(
+                    &gate_run.external_id,
+                    CheckConclusion::Success,
+                    &report.check_run_summary(),
+                )
+                .await?;
+            merge_executor.execute(&gate_run).await?;
+        } else {
+            store
+                .mark_gate_run_status(&gate_run.external_id, GATE_FAILED_STATUS)
+                .await?;
+            gate_run.status = GATE_FAILED_STATUS.to_string();
+            check_reporter
+                .resolve_check_run(
+                    &gate_run.external_id,
+                    CheckConclusion::Failure,
+                    &report.check_run_summary(),
+                )
+                .await?;
+            let comment = report.pr_comment();
+            for member in &gate_run.world.members {
+                commenter.post_comment(member, &comment).await?;
             }
         }
 
         Ok(Some(gate_run))
+    }
+
+    pub async fn invalidate_pr_push<S, R>(
+        &self,
+        store: &mut S,
+        check_reporter: &R,
+        pr: &QueuePullRequest,
+    ) -> anyhow::Result<bool>
+    where
+        S: QueueStore,
+        R: GateCheckReporter,
+    {
+        let invalidated = store.invalidate_active_gate_runs(&pr.key).await?;
+        if invalidated.is_empty() {
+            return Ok(false);
+        }
+
+        store.reenqueue_pr(pr).await?;
+        for gate in invalidated {
+            check_reporter
+                .resolve_check_run(
+                    &gate.external_id,
+                    CheckConclusion::Neutral,
+                    "Henosis gate cancelled because a new commit was pushed.",
+                )
+                .await?;
+        }
+
+        Ok(true)
     }
 
     async fn candidate_world<D>(
@@ -274,8 +374,11 @@ pub fn gate_external_id(world: &CandidateWorld) -> anyhow::Result<String> {
 mod tests {
     use super::*;
     use crate::henosis::environment::DevLockfileReader;
+    use crate::henosis::gate::FakeGateExecutor;
+    use crate::henosis::gate_report::{GateFailure, GateReport};
     use crate::henosis::lockfile::{EnvironmentSection, Lockfile, pinned};
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::Mutex;
 
     #[derive(Clone)]
     struct StaticDevLockfile(Lockfile);
@@ -292,6 +395,7 @@ mod tests {
         ready: VecDeque<QueuePullRequest>,
         recorded: Vec<RecordedGateRun>,
         statuses: BTreeMap<String, String>,
+        reenqueued: Vec<QueuePullRequest>,
     }
 
     impl QueueStore for MemoryQueueStore {
@@ -324,6 +428,19 @@ mod tests {
                 .and_then(|index| self.ready.remove(index)))
         }
 
+        async fn oldest_resumable_merge(&mut self) -> anyhow::Result<Option<RecordedGateRun>> {
+            Ok(self
+                .recorded
+                .iter()
+                .find(|run| {
+                    matches!(
+                        run.status.as_str(),
+                        GATE_PASSED_STATUS | MERGING_PR_STATUS | BUMPING_DEV_STATUS
+                    )
+                })
+                .cloned())
+        }
+
         async fn record_gate_run(
             &mut self,
             world: &CandidateWorld,
@@ -332,7 +449,10 @@ mod tests {
             let gate_run = RecordedGateRun {
                 id,
                 external_id: gate_external_id(world)?,
+                status: PENDING_STATUS.to_string(),
                 world: world.clone(),
+                merge_commit_sha: None,
+                dev_bump_commit_sha: None,
             };
             self.recorded.push(gate_run.clone());
             Ok(gate_run)
@@ -345,6 +465,13 @@ mod tests {
         ) -> anyhow::Result<()> {
             self.statuses
                 .insert(external_id.to_string(), status.to_string());
+            if let Some(gate_run) = self
+                .recorded
+                .iter_mut()
+                .find(|gate_run| gate_run.external_id == external_id)
+            {
+                gate_run.status = status.to_string();
+            }
             Ok(())
         }
 
@@ -369,11 +496,51 @@ mod tests {
                     .unwrap_or_else(|| "pending".to_string()),
             }))
         }
+
+        async fn invalidate_active_gate_runs(
+            &mut self,
+            key: &PullRequestKey,
+        ) -> anyhow::Result<Vec<GateStatus>> {
+            let mut invalidated = Vec::new();
+            let active = [PENDING_STATUS, PENDING_EXECUTOR_STATUS, RUNNING_STATUS];
+            let external_ids = self
+                .recorded
+                .iter()
+                .filter(|run| run.world.members.iter().any(|member| member.key == *key))
+                .map(|run| run.external_id.clone())
+                .collect::<Vec<_>>();
+
+            for external_id in external_ids {
+                let status = self
+                    .statuses
+                    .get(&external_id)
+                    .cloned()
+                    .unwrap_or_else(|| PENDING_STATUS.to_string());
+                if active.contains(&status.as_str()) {
+                    self.mark_gate_run_status(&external_id, INVALIDATED_STATUS)
+                        .await?;
+                    invalidated.push(GateStatus {
+                        external_id,
+                        status: INVALIDATED_STATUS.to_string(),
+                    });
+                }
+            }
+            Ok(invalidated)
+        }
+
+        async fn reenqueue_pr(&mut self, pr: &QueuePullRequest) -> anyhow::Result<()> {
+            self.reenqueued.push(pr.clone());
+            if !self.ready.iter().any(|ready| ready.key == pr.key) {
+                self.ready.push_back(pr.clone());
+            }
+            Ok(())
+        }
     }
 
     #[derive(Default)]
     struct MemoryCheckReporter {
-        checks: std::sync::Mutex<Vec<(PullRequestKey, String)>>,
+        checks: Mutex<Vec<(PullRequestKey, String)>>,
+        resolved: Mutex<Vec<(String, CheckConclusion, String)>>,
     }
 
     impl GateCheckReporter for MemoryCheckReporter {
@@ -386,6 +553,50 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((pr.key.clone(), external_id.to_string()));
+            Ok(())
+        }
+
+        async fn resolve_check_run(
+            &self,
+            external_id: &str,
+            conclusion: CheckConclusion,
+            summary: &str,
+        ) -> anyhow::Result<()> {
+            self.resolved.lock().unwrap().push((
+                external_id.to_string(),
+                conclusion,
+                summary.to_string(),
+            ));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MemoryMergeExecutor {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl MergeExecutor for MemoryMergeExecutor {
+        async fn execute(&self, gate_run: &GateRun) -> anyhow::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(gate_run.external_id.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MemoryCommenter {
+        comments: Mutex<Vec<(QueuePullRequest, String)>>,
+    }
+
+    impl PrCommenter for MemoryCommenter {
+        async fn post_comment(&self, pr: &QueuePullRequest, body: &str) -> anyhow::Result<()> {
+            self.comments
+                .lock()
+                .unwrap()
+                .push((pr.clone(), body.to_string()));
             Ok(())
         }
     }
@@ -423,8 +634,62 @@ mod tests {
         }
     }
 
+    fn ready_pr(head_sha: &str) -> QueuePullRequest {
+        QueuePullRequest::new(
+            "henosis-playground/service-a",
+            3,
+            "service-a",
+            head_sha,
+            "pr/3",
+            head_sha,
+        )
+    }
+
+    fn failure_report() -> GateReport {
+        GateReport {
+            ok: false,
+            failures: vec![GateFailure {
+                component: "service-b".to_string(),
+                consumer_of: "service-a".to_string(),
+                kind: "compile".to_string(),
+                message: "service-b consumes service-a.databaseUrl which no longer exists"
+                    .to_string(),
+                excerpt: "Property 'databaseUrl' does not exist on type".to_string(),
+            }],
+        }
+    }
+
+    fn recorded_run(status: &str) -> RecordedGateRun {
+        RecordedGateRun {
+            id: 1,
+            external_id: "gate-henosis-playground-service-a-3-a-pr".to_string(),
+            status: status.to_string(),
+            world: CandidateWorld {
+                members: vec![ready_pr("a-pr")],
+                components: vec![
+                    CandidateComponent {
+                        name: "service-a".to_string(),
+                        repo: "henosis-playground/service-a".to_string(),
+                        r#ref: "a-pr".to_string(),
+                        digest: "sha256:a".to_string(),
+                        candidate: true,
+                    },
+                    CandidateComponent {
+                        name: "service-b".to_string(),
+                        repo: "henosis-playground/service-b".to_string(),
+                        r#ref: "b-main".to_string(),
+                        digest: "sha256:b".to_string(),
+                        candidate: false,
+                    },
+                ],
+            },
+            merge_commit_sha: None,
+            dev_bump_commit_sha: None,
+        }
+    }
+
     #[tokio::test]
-    async fn tick_records_gate_run_check_run_and_pending_executor_status() {
+    async fn tick_records_gate_run_check_run_and_passes_gate() {
         let manager = QueueManager::new(components());
         let dev = StaticDevLockfile(dev_lockfile());
         let mut store = MemoryQueueStore::default();
@@ -437,10 +702,26 @@ mod tests {
             "a-pr",
         ));
         let reporter = MemoryCheckReporter::default();
-        let executor = PendingGateExecutor;
+        let external_id = "gate-henosis-playground-service-a-3-a-pr".to_string();
+        let executor = FakeGateExecutor::new(BTreeMap::from([(
+            external_id.clone(),
+            GateReport {
+                ok: true,
+                failures: vec![],
+            },
+        )]));
+        let merge_executor = MemoryMergeExecutor::default();
+        let commenter = MemoryCommenter::default();
 
         let gate_run = manager
-            .tick(&mut store, &dev, &reporter, &executor)
+            .tick(
+                &mut store,
+                &dev,
+                &reporter,
+                &executor,
+                &merge_executor,
+                &commenter,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -470,7 +751,99 @@ mod tests {
                 .statuses
                 .get(&gate_run.external_id)
                 .map(String::as_str),
-            Some(PENDING_EXECUTOR_STATUS)
+            Some(GATE_PASSED_STATUS)
         );
+        assert_eq!(
+            reporter.resolved.lock().unwrap().as_slice(),
+            [(
+                external_id.clone(),
+                CheckConclusion::Success,
+                "Henosis gate passed. The candidate world compiled and rendered.".to_string()
+            )]
+        );
+        assert_eq!(
+            merge_executor.calls.lock().unwrap().as_slice(),
+            [external_id]
+        );
+        assert!(commenter.comments.lock().unwrap().is_empty());
+        assert_eq!(gate_run.status, GATE_PASSED_STATUS);
+    }
+
+    #[tokio::test]
+    async fn fake_gate_executor_fail_updates_status_resolves_check_and_posts_comment() {
+        let manager = QueueManager::new(components());
+        let dev = StaticDevLockfile(dev_lockfile());
+        let mut store = MemoryQueueStore::default();
+        store.ready.push_back(ready_pr("a-pr"));
+        let reporter = MemoryCheckReporter::default();
+        let external_id = "gate-henosis-playground-service-a-3-a-pr".to_string();
+        let executor =
+            FakeGateExecutor::new(BTreeMap::from([(external_id.clone(), failure_report())]));
+        let merge_executor = MemoryMergeExecutor::default();
+        let commenter = MemoryCommenter::default();
+
+        let gate_run = manager
+            .tick(
+                &mut store,
+                &dev,
+                &reporter,
+                &executor,
+                &merge_executor,
+                &commenter,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(gate_run.status, GATE_FAILED_STATUS);
+        assert_eq!(
+            store
+                .statuses
+                .get(&gate_run.external_id)
+                .map(String::as_str),
+            Some(GATE_FAILED_STATUS)
+        );
+        let resolved = reporter.resolved.lock().unwrap();
+        assert_eq!(resolved[0].0, external_id);
+        assert_eq!(resolved[0].1, CheckConclusion::Failure);
+        assert!(resolved[0].2.contains("service-b"));
+        assert!(resolved[0].2.contains("service-a.databaseUrl"));
+        assert!(merge_executor.calls.lock().unwrap().is_empty());
+        let comments = commenter.comments.lock().unwrap();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].1.contains("Henosis gate failed"));
+        assert!(comments[0].1.contains("service-b"));
+        assert!(comments[0].1.contains("service-a"));
+    }
+
+    #[tokio::test]
+    async fn push_invalidation_marks_running_gate_invalidated_and_reenqueues() {
+        let manager = QueueManager::new(components());
+        let mut store = MemoryQueueStore::default();
+        let run = recorded_run(RUNNING_STATUS);
+        store
+            .statuses
+            .insert(run.external_id.clone(), RUNNING_STATUS.to_string());
+        store.recorded.push(run);
+        let reporter = MemoryCheckReporter::default();
+        let pushed = ready_pr("a-new");
+
+        let invalidated = manager
+            .invalidate_pr_push(&mut store, &reporter, &pushed)
+            .await
+            .unwrap();
+
+        assert!(invalidated);
+        assert_eq!(
+            store
+                .statuses
+                .get("gate-henosis-playground-service-a-3-a-pr")
+                .map(String::as_str),
+            Some(INVALIDATED_STATUS)
+        );
+        assert_eq!(store.reenqueued, vec![pushed.clone()]);
+        let resolved = reporter.resolved.lock().unwrap();
+        assert_eq!(resolved[0].1, CheckConclusion::Neutral);
+        assert!(resolved[0].2.contains("cancelled"));
     }
 }

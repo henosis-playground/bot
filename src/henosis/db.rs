@@ -6,9 +6,11 @@ use crate::henosis::config::RegisteredComponent;
 use crate::henosis::environment::{
     EnvironmentState, EnvironmentStore, PreviewPullRequest, PullRequestKey,
 };
+use crate::henosis::merge::MergeStore;
 use crate::henosis::queue::{
-    CandidateWorld, GLOBAL_QUEUE_LOCK_KEY, GateStatus, QueuePullRequest, QueueStore,
-    RecordedGateRun, gate_external_id,
+    BUMPING_DEV_STATUS, CandidateWorld, GATE_PASSED_STATUS, GLOBAL_QUEUE_LOCK_KEY, GateStatus,
+    INVALIDATED_STATUS, MERGING_PR_STATUS, PENDING_EXECUTOR_STATUS, PENDING_STATUS,
+    QueuePullRequest, QueueStore, RUNNING_STATUS, RecordedGateRun, gate_external_id,
 };
 
 pub struct PgEnvironmentStore {
@@ -272,7 +274,14 @@ WHERE repository = ANY($1)
       WHERE cwm.repo = pr.repository
         AND cwm.pr_number = pr.number
         AND cwm.head_sha = pr.approved_sha
-        AND gr.status IN ('pending', 'pending-executor', 'running')
+        AND gr.status IN (
+            'pending',
+            'pending-executor',
+            'running',
+            'gate-passed',
+            'merging-pr',
+            'bumping-dev'
+        )
   )
 ORDER BY pr.created_at ASC, pr.id ASC
 LIMIT 1
@@ -306,17 +315,50 @@ LIMIT 1
         )))
     }
 
+    async fn oldest_resumable_merge(&mut self) -> anyhow::Result<Option<RecordedGateRun>> {
+        let resumable_statuses = [GATE_PASSED_STATUS, MERGING_PR_STATUS, BUMPING_DEV_STATUS];
+        let row = sqlx::query(
+            r#"
+SELECT id, external_id, status, world::text AS world, merge_commit_sha, dev_bump_commit_sha
+FROM gate_run
+WHERE status = ANY($1)
+  AND world IS NOT NULL
+ORDER BY updated_at ASC, id ASC
+LIMIT 1
+"#,
+        )
+        .bind(resumable_statuses.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| {
+            let world: String = row.try_get("world")?;
+            Ok(RecordedGateRun {
+                id: row.try_get("id")?,
+                external_id: row.try_get("external_id")?,
+                status: row.try_get("status")?,
+                world: serde_json::from_str(&world).context("Cannot parse stored gate world")?,
+                merge_commit_sha: row.try_get("merge_commit_sha")?,
+                dev_bump_commit_sha: row.try_get("dev_bump_commit_sha")?,
+            })
+        })
+        .transpose()
+    }
+
     async fn record_gate_run(&mut self, world: &CandidateWorld) -> anyhow::Result<RecordedGateRun> {
         let external_id = gate_external_id(world)?;
+        let world_json = serde_json::to_string(world).context("Cannot serialize gate world")?;
         let mut tx = self.pool.begin().await?;
         let gate_run_id: i64 = sqlx::query_scalar(
             r#"
-INSERT INTO gate_run (external_id, status)
-VALUES ($1, 'pending')
+INSERT INTO gate_run (external_id, status, world)
+VALUES ($1, $2, $3::jsonb)
 RETURNING id
 "#,
         )
         .bind(&external_id)
+        .bind(PENDING_STATUS)
+        .bind(&world_json)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -355,7 +397,10 @@ VALUES ($1, $2, $3, $4)
         Ok(RecordedGateRun {
             id: gate_run_id,
             external_id,
+            status: PENDING_STATUS.to_string(),
             world: world.clone(),
+            merge_commit_sha: None,
+            dev_bump_commit_sha: None,
         })
     }
 
@@ -403,5 +448,115 @@ LIMIT 1
             })
         })
         .transpose()
+    }
+
+    async fn invalidate_active_gate_runs(
+        &mut self,
+        key: &PullRequestKey,
+    ) -> anyhow::Result<Vec<GateStatus>> {
+        let active_statuses = [PENDING_STATUS, PENDING_EXECUTOR_STATUS, RUNNING_STATUS];
+        let rows = sqlx::query(
+            r#"
+UPDATE gate_run AS gr
+SET status = $3, updated_at = NOW()
+FROM candidate_world AS cw
+JOIN candidate_world_member AS cwm ON cwm.candidate_world_id = cw.id
+WHERE cw.gate_run_id = gr.id
+  AND cwm.repo = $1
+  AND cwm.pr_number = $2
+  AND gr.status = ANY($4)
+RETURNING gr.external_id, gr.status
+"#,
+        )
+        .bind(&key.repo)
+        .bind(key.number as i64)
+        .bind(INVALIDATED_STATUS)
+        .bind(active_statuses.as_slice())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(GateStatus {
+                    external_id: row.try_get("external_id")?,
+                    status: row.try_get("status")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn reenqueue_pr(&mut self, pr: &QueuePullRequest) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+UPDATE pull_request
+SET approved_sha = $3,
+    head_branch = $4
+WHERE repository = $1
+  AND number = $2
+  AND approved_by IS NOT NULL
+"#,
+        )
+        .bind(&pr.key.repo)
+        .bind(pr.key.number as i64)
+        .bind(&pr.head_sha)
+        .bind(&pr.head_branch)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+impl MergeStore for PgQueueStore {
+    async fn mark_gate_run_status(&self, external_id: &str, status: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+UPDATE gate_run
+SET status = $2, updated_at = NOW()
+WHERE external_id = $1
+"#,
+        )
+        .bind(external_id)
+        .bind(status)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn record_merge_commit_sha(
+        &self,
+        external_id: &str,
+        merge_commit_sha: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+UPDATE gate_run
+SET merge_commit_sha = $2, updated_at = NOW()
+WHERE external_id = $1
+"#,
+        )
+        .bind(external_id)
+        .bind(merge_commit_sha)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn record_dev_bump_commit_sha(
+        &self,
+        external_id: &str,
+        dev_bump_commit_sha: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+UPDATE gate_run
+SET dev_bump_commit_sha = $2, updated_at = NOW()
+WHERE external_id = $1
+"#,
+        )
+        .bind(external_id)
+        .bind(dev_bump_commit_sha)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }

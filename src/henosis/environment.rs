@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Context;
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 
 use crate::henosis::config::RegisteredComponent;
 use crate::henosis::graph::{ComponentGraph, ComponentPackageReader, ComponentRef};
@@ -9,7 +10,7 @@ use crate::henosis::lockfile::{
     self, ComponentEntry, EnvironmentSection, Lockfile, PinnedEntry, follower_dev, pinned,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PullRequestKey {
     pub repo: String,
     pub number: u64,
