@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nSELECT EXISTS(\n    SELECT 1 FROM lockfile_revision WHERE commit_sha = $1\n) AS \"exists!\"\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "a88e23aa759677e37ceb41e2104f1e870ffb979dfb898feec3b38fcf08f9c847"
+}

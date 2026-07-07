@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nINSERT INTO candidate_world_member (candidate_world_id, repo, pr_number, head_sha)\nVALUES ($1, $2, $3, $4)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ba85ac1f93621436d8a1e19775c2cba1c7c6e422d551a7d98d353f8d820c8e1c"
+}

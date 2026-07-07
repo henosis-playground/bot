@@ -1,0 +1,6 @@
+DROP TABLE IF EXISTS lockfile_revision CASCADE;
+DROP TABLE IF EXISTS environment_member CASCADE;
+DROP TABLE IF EXISTS candidate_world_member CASCADE;
+DROP TABLE IF EXISTS environment CASCADE;
+DROP TABLE IF EXISTS candidate_world CASCADE;
+DROP TABLE IF EXISTS gate_run CASCADE;
