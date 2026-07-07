@@ -44,6 +44,7 @@ RUN apt-get update \
         ca-certificates \
         curl \
         git \
+        jq \
         openssl \
     && rm -rf /var/lib/apt/lists/*
 
