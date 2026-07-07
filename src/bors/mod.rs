@@ -75,6 +75,10 @@ pub fn format_help() -> &'static str {
         BorsCommand::TryCancel => {}
         BorsCommand::SetPriority(_) => {}
         BorsCommand::Info => {}
+        BorsCommand::Env => {}
+        BorsCommand::EnvJoin { name: _ } => {}
+        BorsCommand::EnvLeave => {}
+        BorsCommand::GateStatus => {}
         BorsCommand::Delegate(_) => {}
         BorsCommand::Undelegate => {}
         BorsCommand::SetRollupMode(_) => {}
@@ -119,6 +123,12 @@ You can use the following commands:
 - `squash [msg|message=<commit-message>]`: Squash the commits of a PR into a single commit.
     - Optionally, you can specify a `<commit-message>` for the created commit. If not specified, the commit messages of all squashed commits will be combined.
 - `info`: Get information about the current PR
+
+## Henosis commands
+- `env`: Show this PR's environment assignment
+- `env join <name>`: Join a named preview environment
+- `env leave`: Leave the current environment
+- `gate`: Show gate status for this PR
 
 ## Repository management
 - `treeclosed=<priority> [reason]`: Close the tree for PRs with priority less than `<priority>`. Optionally, you can specify a `<reason>`.

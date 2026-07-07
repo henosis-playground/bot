@@ -143,6 +143,7 @@ const DEFAULT_PARSERS: &[ParserFn] = &[
     parser_delegate,
     parser_undelegate,
     parser_info,
+    parser_henosis,
     parser_help,
     parser_ping,
     parser_retry,
@@ -321,6 +322,49 @@ fn parser_ping(command: &CommandPart<'_>, _parts: &[CommandPart<'_>]) -> ParseRe
         Some(Ok(BorsCommand::Ping))
     } else {
         None
+    }
+}
+
+/// Parses Henosis commands:
+/// - `@bors env`
+/// - `@bors env join <name>`
+/// - `@bors env leave`
+/// - `@bors gate`
+fn parser_henosis(command: &CommandPart<'_>, parts: &[CommandPart<'_>]) -> ParseResult {
+    match (command, parts) {
+        (CommandPart::Bare("env"), []) => Some(Ok(BorsCommand::Env)),
+        (CommandPart::Bare("env"), [CommandPart::Bare("join"), CommandPart::Bare(name)]) => {
+            Some(Ok(BorsCommand::EnvJoin {
+                name: name.to_string(),
+            }))
+        }
+        (CommandPart::Bare("env"), [CommandPart::Bare("join")]) => Some(Err(
+            CommandParseError::ValidationError("Environment name must be specified".to_string()),
+        )),
+        (
+            CommandPart::Bare("env"),
+            [CommandPart::Bare("join"), CommandPart::Bare(_), extra, ..],
+        ) => Some(Err(CommandParseError::UnknownArg {
+            arg: extra.as_key().to_string(),
+            did_you_mean: "env join <name>".to_string(),
+        })),
+        (CommandPart::Bare("env"), [CommandPart::Bare("leave")]) => Some(Ok(BorsCommand::EnvLeave)),
+        (CommandPart::Bare("env"), [CommandPart::Bare("leave"), extra, ..]) => {
+            Some(Err(CommandParseError::UnknownArg {
+                arg: extra.as_key().to_string(),
+                did_you_mean: "env leave".to_string(),
+            }))
+        }
+        (CommandPart::Bare("env"), [extra, ..]) => Some(Err(CommandParseError::UnknownArg {
+            arg: extra.as_key().to_string(),
+            did_you_mean: "env | env join <name> | env leave".to_string(),
+        })),
+        (CommandPart::Bare("gate"), []) => Some(Ok(BorsCommand::GateStatus)),
+        (CommandPart::Bare("gate"), [extra, ..]) => Some(Err(CommandParseError::UnknownArg {
+            arg: extra.as_key().to_string(),
+            did_you_mean: "gate".to_string(),
+        })),
+        _ => None,
     }
 }
 
@@ -1953,7 +1997,53 @@ I am markdown HTML comment
         );
     }
 
+    #[test]
+    fn parse_henosis_env() {
+        let cmds = parse_commands_with_prefix("@henosis-bot", "@henosis-bot env");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0], Ok(BorsCommand::Env));
+    }
+
+    #[test]
+    fn parse_henosis_env_join() {
+        let cmds = parse_commands_with_prefix("@henosis-bot", "@henosis-bot env join staging");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(
+            cmds[0],
+            Ok(BorsCommand::EnvJoin {
+                name: "staging".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_henosis_env_leave() {
+        let cmds = parse_commands_with_prefix("@henosis-bot", "@henosis-bot env leave");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0], Ok(BorsCommand::EnvLeave));
+    }
+
+    #[test]
+    fn parse_henosis_gate() {
+        let cmds = parse_commands_with_prefix("@henosis-bot", "@henosis-bot gate");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0], Ok(BorsCommand::GateStatus));
+    }
+
+    #[test]
+    fn ignores_bors_env_for_henosis_prefix() {
+        let cmds = parse_commands_with_prefix("@henosis-bot", "@bors env join staging");
+        assert!(cmds.is_empty());
+    }
+
     fn parse_commands(text: &str) -> Vec<Result<BorsCommand, CommandParseError>> {
         CommandParser::new("@bors".to_string().into()).parse_commands(text)
+    }
+
+    fn parse_commands_with_prefix(
+        prefix: &str,
+        text: &str,
+    ) -> Vec<Result<BorsCommand, CommandParseError>> {
+        CommandParser::new(prefix.to_string().into()).parse_commands(text)
     }
 }

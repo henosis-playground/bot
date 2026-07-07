@@ -514,6 +514,30 @@ async fn handle_comment(
                         let span = tracing::info_span!("Info");
                         command_info(repo, pr, database).instrument(span).await
                     }
+                    BorsCommand::Env => {
+                        let span = tracing::info_span!("HenosisEnv");
+                        command_henosis_stub(repo, database, pr, &comment.author, "env")
+                            .instrument(span)
+                            .await
+                    }
+                    BorsCommand::EnvJoin { name: _ } => {
+                        let span = tracing::info_span!("HenosisEnvJoin");
+                        command_henosis_stub(repo, database, pr, &comment.author, "env")
+                            .instrument(span)
+                            .await
+                    }
+                    BorsCommand::EnvLeave => {
+                        let span = tracing::info_span!("HenosisEnvLeave");
+                        command_henosis_stub(repo, database, pr, &comment.author, "env")
+                            .instrument(span)
+                            .await
+                    }
+                    BorsCommand::GateStatus => {
+                        let span = tracing::info_span!("HenosisGateStatus");
+                        command_henosis_stub(repo, database, pr, &comment.author, "gate")
+                            .instrument(span)
+                            .await
+                    }
                     BorsCommand::SetRollupMode(rollup) => {
                         let span = tracing::info_span!("Rollup");
                         command_set_rollup(repo, database, pr, &comment.author, rollup)
@@ -618,6 +642,31 @@ async fn handle_comment(
             }
         }
     }
+    Ok(())
+}
+
+async fn command_henosis_stub(
+    repo: Arc<RepositoryState>,
+    db: Arc<PgDbClient>,
+    pr: PullRequestData<'_>,
+    author: &GithubUser,
+    command_group: &str,
+) -> anyhow::Result<()> {
+    if !has_permission(&repo, author, pr, PermissionType::Review).await? {
+        deny_request(&repo, &db, pr.number(), author, PermissionType::Review).await?;
+        return Ok(());
+    }
+
+    repo.client
+        .post_comment(
+            pr.number(),
+            Comment::new(format!(
+                "@{}: Henosis {command_group} commands are not yet wired. (stub)",
+                author.username,
+            )),
+            &db,
+        )
+        .await?;
     Ok(())
 }
 
@@ -1135,5 +1184,15 @@ mod tests {
             Ok(())
         })
             .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_env_command_stub_reply(pool: sqlx::PgPool) {
+        run_test(pool, async |ctx: &mut BorsTester| {
+            ctx.post_comment(Comment::from("@bors env")).await?;
+            insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"@default-user: Henosis env commands are not yet wired. (stub)"#);
+            Ok(())
+        })
+        .await;
     }
 }

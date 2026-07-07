@@ -135,6 +135,14 @@ pub enum BorsCommand {
     SetPriority(Priority),
     /// Get information about the current PR.
     Info,
+    /// Show this PR's environment assignment.
+    Env,
+    /// Join a named preview environment.
+    EnvJoin { name: String },
+    /// Leave the current environment.
+    EnvLeave,
+    /// Show gate status for this PR.
+    GateStatus,
     /// Delegate approval authority to the pull request author.
     Delegate(DelegateCommand),
     /// Revoke any previously granted delegation.
