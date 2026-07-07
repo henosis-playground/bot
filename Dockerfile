@@ -48,6 +48,8 @@ RUN apt-get update \
         openssl \
     && rm -rf /var/lib/apt/lists/*
 
+ADD https://api.github.com/repos/henosis-playground/platform/commits/main /tmp/platform-main.json
+
 RUN corepack enable \
     && corepack prepare pnpm@11.3.0 --activate \
     && git clone --depth=1 --branch "$PLATFORM_REF" "$PLATFORM_REPO" /opt/henosis-platform \
