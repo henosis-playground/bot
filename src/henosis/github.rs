@@ -1,4 +1,5 @@
 use anyhow::Context;
+use http::StatusCode;
 use octocrab::models::CheckRunId;
 use octocrab::params::checks::{
     CheckRunConclusion, CheckRunOutput as OctoCheckRunOutput, CheckRunStatus,
@@ -475,20 +476,69 @@ struct PullRequestMergeResponse {
     sha: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct PullRequestMergeState {
+    merged: bool,
+    merge_commit_sha: Option<String>,
+}
+
 async fn squash_merge_pull_request(
     client: &GithubRepositoryClient,
     pr: PullRequestNumber,
 ) -> anyhow::Result<CommitSha> {
     let route = format!("/repos/{}/pulls/{}/merge", client.repository(), pr.0);
+    if let Some(sha) = already_merged_sha(client, pr).await? {
+        return Ok(sha);
+    }
+
     let request = PullRequestMergeRequest {
         merge_method: "squash",
     };
-    let response: PullRequestMergeResponse = client
+    let response = client
         .client()
-        .post(route, Some(&request))
+        ._put(route, Some(&request))
         .await
         .with_context(|| format!("Cannot squash-merge PR {}#{}", client.repository(), pr.0))?;
+    let status = response.status();
+    let text = client.client().body_to_string(response).await?;
+    if status != StatusCode::OK {
+        if let Some(sha) = already_merged_sha(client, pr).await? {
+            return Ok(sha);
+        }
+        anyhow::bail!(
+            "Cannot squash-merge PR {}#{}: GitHub returned {status}: {text}",
+            client.repository(),
+            pr.0
+        );
+    }
+
+    let response: PullRequestMergeResponse =
+        serde_json::from_str(&text).context("Cannot parse pull request merge response")?;
     Ok(CommitSha(response.sha))
+}
+
+async fn already_merged_sha(
+    client: &GithubRepositoryClient,
+    pr: PullRequestNumber,
+) -> anyhow::Result<Option<CommitSha>> {
+    let route = format!("/repos/{}/pulls/{}", client.repository(), pr.0);
+    let state: PullRequestMergeState = client
+        .client()
+        .get(route, None::<&()>)
+        .await
+        .with_context(|| format!("Cannot inspect PR {}#{}", client.repository(), pr.0))?;
+    if !state.merged {
+        return Ok(None);
+    }
+
+    let sha = state.merge_commit_sha.with_context(|| {
+        format!(
+            "PR {}#{} is merged but GitHub did not return merge_commit_sha",
+            client.repository(),
+            pr.0
+        )
+    })?;
+    Ok(Some(CommitSha(sha)))
 }
 
 pub struct GithubDevManifestBumper<'a> {
