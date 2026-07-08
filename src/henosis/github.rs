@@ -261,7 +261,24 @@ impl GateCheckReporter for GithubGateCheckReporter<'_> {
 
         let mut resolved = false;
         for repo in self.repositories.repositories() {
-            let check_runs = list_check_runs_for_ref(&repo.client, head_sha).await?;
+            let repo_external_id_prefix = format!(
+                "gate-{}-",
+                repo.client.repository().to_string().replace('/', "-")
+            );
+            if !external_id.starts_with(&repo_external_id_prefix) {
+                continue;
+            }
+
+            let check_runs = match list_check_runs_for_ref(&repo.client, head_sha).await {
+                Ok(runs) => runs,
+                Err(e) => {
+                    tracing::debug!(
+                        "Skipping repo {} when resolving check run (SHA not found or other error): {e:#}",
+                        repo.client.repository()
+                    );
+                    continue;
+                }
+            };
             for check_run in check_runs
                 .into_iter()
                 .filter(|check_run| check_run.name == self.check_name)

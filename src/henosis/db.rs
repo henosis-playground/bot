@@ -274,14 +274,7 @@ WHERE repository = ANY($1)
       WHERE cwm.repo = pr.repository
         AND cwm.pr_number = pr.number
         AND cwm.head_sha = pr.approved_sha
-        AND gr.status IN (
-            'pending',
-            'pending-executor',
-            'running',
-            'gate-passed',
-            'merging-pr',
-            'bumping-dev'
-        )
+        AND gr.status != 'invalidated'
   )
 ORDER BY pr.created_at ASC, pr.id ASC
 LIMIT 1
