@@ -15,11 +15,11 @@ pub struct StatusSnapshot {
 
 pub fn render_status_section(snapshot: &StatusSnapshot) -> String {
     let advisory_gate = match &snapshot.advisory_gate {
-        Some(gate) => format!("Advisory gate: `{}` (`{}`)", gate.status, gate.external_id),
+        Some(gate) => gate_line("Advisory gate", gate),
         None => "Advisory gate: no advisory run recorded".to_string(),
     };
     let gate = match &snapshot.gate {
-        Some(gate) => format!("Final gate: `{}` (`{}`)", gate.status, gate.external_id),
+        Some(gate) => gate_line("Final gate", gate),
         None => "Final gate: no gate run recorded".to_string(),
     };
     let render = match &snapshot.render {
@@ -48,6 +48,15 @@ pub fn render_status_section(snapshot: &StatusSnapshot) -> String {
         snapshot.branch_url,
         member_list(&snapshot.environment.members),
     )
+}
+
+fn gate_line(label: &str, gate: &GateStatus) -> String {
+    let mut line = format!("{label}: `{}` (`{}`)", gate.status, gate.external_id);
+    if let Some(diagnostic) = &gate.diagnostic {
+        line.push('\n');
+        line.push_str(diagnostic);
+    }
+    line
 }
 
 pub fn upsert_status_section(body: &str, section: &str) -> String {

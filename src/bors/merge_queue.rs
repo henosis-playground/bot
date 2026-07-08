@@ -954,7 +954,7 @@ manifest_path = "dev.toml"
         let report = if ok {
             r#"{"ok":true,"failures":[]}"#
         } else {
-            r#"{"ok":false,"failures":[{"component":"borstest","consumerOf":"service-b","kind":"compile","message":"service-b consumes a changed borstest contract","excerpt":"Property 'message' does not exist"}]}"#
+            r#"{"ok":false,"failures":[{"consumer":"service-b","producer":"borstest","pinnedSha":"1111111111111111111111111111111111111111","resolvedSha":"2222222222222222222222222222222222222222","outputsSchemaAtPinned":{"kind":"object","shape":{"message":{"kind":"string"}}},"outputsSchemaAtResolved":{"kind":"object","shape":{}},"consumedPaths":["message"],"kind":"compile","message":"service-b consumes a changed borstest contract","excerpt":"Property 'message' does not exist"}]}"#
         };
         fs::write(
             &path,

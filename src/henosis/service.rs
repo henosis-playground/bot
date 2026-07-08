@@ -381,7 +381,12 @@ pub async fn run_advisory_gate_on_approval(
     match gate_executor.execute(&gate_run).await {
         Ok(report) if report.ok => {
             store
-                .record_advisory_gate_status(&advisory_pr, &external_id, ADVISORY_PASSED_STATUS)
+                .record_advisory_gate_status(
+                    &advisory_pr,
+                    &external_id,
+                    ADVISORY_PASSED_STATUS,
+                    None,
+                )
                 .await?;
             reporter
                 .resolve_check_run(
@@ -392,8 +397,14 @@ pub async fn run_advisory_gate_on_approval(
                 .await?;
         }
         Ok(report) => {
+            let diagnostic = report.status_diagnostic();
             store
-                .record_advisory_gate_status(&advisory_pr, &external_id, ADVISORY_FAILED_STATUS)
+                .record_advisory_gate_status(
+                    &advisory_pr,
+                    &external_id,
+                    ADVISORY_FAILED_STATUS,
+                    diagnostic.as_deref(),
+                )
                 .await?;
             reporter
                 .resolve_check_run(
@@ -405,7 +416,12 @@ pub async fn run_advisory_gate_on_approval(
         }
         Err(error) => {
             store
-                .record_advisory_gate_status(&advisory_pr, &external_id, ADVISORY_FAILED_STATUS)
+                .record_advisory_gate_status(
+                    &advisory_pr,
+                    &external_id,
+                    ADVISORY_FAILED_STATUS,
+                    None,
+                )
                 .await?;
             reporter
                 .resolve_check_run(
@@ -772,10 +788,17 @@ pub fn environment_status_comment(
 
 pub fn gate_status_comment(status: Option<GateStatus>) -> String {
     match status {
-        Some(status) => format!(
-            "Latest Henosis gate: `{}` is `{}`.",
-            status.external_id, status.status
-        ),
+        Some(status) => {
+            let mut body = format!(
+                "Latest Henosis gate: `{}` is `{}`.",
+                status.external_id, status.status
+            );
+            if let Some(diagnostic) = status.diagnostic {
+                body.push_str("\n\n");
+                body.push_str(&diagnostic);
+            }
+            body
+        }
         None => "No Henosis gate run has been recorded for this PR.".to_string(),
     }
 }

@@ -200,8 +200,21 @@ mod tests {
         let report = GateReport {
             ok: false,
             failures: vec![GateFailure {
-                component: "service-b".to_string(),
-                consumer_of: Some("service-a".to_string()),
+                consumer: "service-b".to_string(),
+                producer: "service-a".to_string(),
+                pinned_sha: Some("1111111111111111111111111111111111111111".to_string()),
+                resolved_sha: Some("2222222222222222222222222222222222222222".to_string()),
+                outputs_schema_at_pinned: Some(serde_json::json!({
+                    "kind": "object",
+                    "shape": {
+                        "url": { "kind": "url" }
+                    }
+                })),
+                outputs_schema_at_resolved: Some(serde_json::json!({
+                    "kind": "object",
+                    "shape": {}
+                })),
+                consumed_paths: vec!["url".to_string()],
                 kind: "compile".to_string(),
                 message: "service-b consumes service-a.url which no longer exists".to_string(),
                 excerpt: "error TS2339".to_string(),

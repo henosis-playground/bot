@@ -135,6 +135,7 @@ pub type GateRun = RecordedGateRun;
 pub struct GateStatus {
     pub external_id: String,
     pub status: String,
+    pub diagnostic: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +157,11 @@ pub trait QueueStore {
     async fn record_gate_run(&mut self, world: &CandidateWorld) -> anyhow::Result<RecordedGateRun>;
     async fn mark_gate_run_status(&mut self, external_id: &str, status: &str)
     -> anyhow::Result<()>;
+    async fn record_gate_run_diagnostic(
+        &mut self,
+        external_id: &str,
+        diagnostic: &str,
+    ) -> anyhow::Result<()>;
     async fn latest_gate_status(&self, key: &PullRequestKey) -> anyhow::Result<Option<GateStatus>>;
     async fn invalidate_active_gate_runs(
         &mut self,
@@ -189,6 +195,7 @@ pub trait AdvisoryGateStore {
         pr: &QueuePullRequest,
         external_id: &str,
         status: &str,
+        diagnostic: Option<&str>,
     ) -> anyhow::Result<()>;
     async fn latest_advisory_gate_status(
         &self,
@@ -373,8 +380,12 @@ impl QueueManager {
                 .await?;
             merge_executor.execute(&gate_run).await?;
         } else {
+            let diagnostic = report.pr_comment();
             store
                 .mark_gate_run_status(&gate_run.external_id, GATE_FAILED_STATUS)
+                .await?;
+            store
+                .record_gate_run_diagnostic(&gate_run.external_id, &diagnostic)
                 .await?;
             gate_run.status = GATE_FAILED_STATUS.to_string();
             check_reporter
@@ -384,9 +395,8 @@ impl QueueManager {
                     &report.check_run_summary(),
                 )
                 .await?;
-            let comment = report.pr_comment();
             for member in &gate_run.world.members {
-                commenter.post_comment(member, &comment).await?;
+                commenter.post_comment(member, &diagnostic).await?;
             }
         }
 
@@ -543,6 +553,7 @@ mod tests {
         ready: VecDeque<QueuePullRequest>,
         recorded: Vec<RecordedGateRun>,
         statuses: BTreeMap<String, String>,
+        diagnostics: BTreeMap<String, String>,
         reenqueued: Vec<QueuePullRequest>,
         cleared_repo_validations: Vec<PullRequestKey>,
     }
@@ -632,6 +643,16 @@ mod tests {
             Ok(())
         }
 
+        async fn record_gate_run_diagnostic(
+            &mut self,
+            external_id: &str,
+            diagnostic: &str,
+        ) -> anyhow::Result<()> {
+            self.diagnostics
+                .insert(external_id.to_string(), diagnostic.to_string());
+            Ok(())
+        }
+
         async fn latest_gate_status(
             &self,
             key: &PullRequestKey,
@@ -651,6 +672,7 @@ mod tests {
                     .get(&run.external_id)
                     .cloned()
                     .unwrap_or_else(|| "pending".to_string()),
+                diagnostic: self.diagnostics.get(&run.external_id).cloned(),
             }))
         }
 
@@ -679,6 +701,7 @@ mod tests {
                     invalidated.push(GateStatus {
                         external_id,
                         status: INVALIDATED_STATUS.to_string(),
+                        diagnostic: None,
                     });
                 }
             }
@@ -824,8 +847,23 @@ mod tests {
         GateReport {
             ok: false,
             failures: vec![GateFailure {
-                component: "service-b".to_string(),
-                consumer_of: Some("service-a".to_string()),
+                consumer: "service-b".to_string(),
+                producer: "service-a".to_string(),
+                pinned_sha: Some("a-main".repeat(8)),
+                resolved_sha: Some("a-pr".repeat(10)),
+                outputs_schema_at_pinned: Some(serde_json::json!({
+                    "kind": "object",
+                    "shape": {
+                        "databaseUrl": { "kind": "url" }
+                    }
+                })),
+                outputs_schema_at_resolved: Some(serde_json::json!({
+                    "kind": "object",
+                    "shape": {
+                        "apiUrl": { "kind": "url" }
+                    }
+                })),
+                consumed_paths: vec!["databaseUrl".to_string()],
                 kind: "compile".to_string(),
                 message: "service-b consumes service-a.databaseUrl which no longer exists"
                     .to_string(),

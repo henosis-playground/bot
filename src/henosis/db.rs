@@ -624,10 +624,29 @@ WHERE external_id = $1
         Ok(())
     }
 
+    async fn record_gate_run_diagnostic(
+        &mut self,
+        external_id: &str,
+        diagnostic: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+UPDATE gate_run
+SET diagnostic = $2, updated_at = NOW()
+WHERE external_id = $1
+"#,
+        )
+        .bind(external_id)
+        .bind(diagnostic)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn latest_gate_status(&self, key: &PullRequestKey) -> anyhow::Result<Option<GateStatus>> {
         let row = sqlx::query(
             r#"
-SELECT gr.external_id, gr.status
+SELECT gr.external_id, gr.status, gr.diagnostic
 FROM gate_run AS gr
 JOIN candidate_world AS cw ON cw.gate_run_id = gr.id
 JOIN candidate_world_member AS cwm ON cwm.candidate_world_id = cw.id
@@ -646,6 +665,7 @@ LIMIT 1
             Ok(GateStatus {
                 external_id: row.try_get("external_id")?,
                 status: row.try_get("status")?,
+                diagnostic: row.try_get("diagnostic")?,
             })
         })
         .transpose()
@@ -666,7 +686,7 @@ WHERE cw.gate_run_id = gr.id
   AND cwm.repo = $1
   AND cwm.pr_number = $2
   AND gr.status = ANY($4)
-RETURNING gr.external_id, gr.status
+RETURNING gr.external_id, gr.status, gr.diagnostic
 "#,
         )
         .bind(&key.repo)
@@ -681,6 +701,7 @@ RETURNING gr.external_id, gr.status
                 Ok(GateStatus {
                     external_id: row.try_get("external_id")?,
                     status: row.try_get("status")?,
+                    diagnostic: row.try_get("diagnostic")?,
                 })
             })
             .collect()
@@ -731,13 +752,14 @@ impl AdvisoryGateStore for PgQueueStore {
         pr: &QueuePullRequest,
         external_id: &str,
         status: &str,
+        diagnostic: Option<&str>,
     ) -> anyhow::Result<()> {
         sqlx::query(
             r#"
-INSERT INTO advisory_gate_run (repo, pr_number, head_sha, external_id, status)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO advisory_gate_run (repo, pr_number, head_sha, external_id, status, diagnostic)
+VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (external_id)
-DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
+DO UPDATE SET status = EXCLUDED.status, diagnostic = EXCLUDED.diagnostic, updated_at = NOW()
 "#,
         )
         .bind(&pr.key.repo)
@@ -745,6 +767,7 @@ DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
         .bind(&pr.head_sha)
         .bind(external_id)
         .bind(status)
+        .bind(diagnostic)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -756,7 +779,7 @@ DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
     ) -> anyhow::Result<Option<GateStatus>> {
         let row = sqlx::query(
             r#"
-SELECT external_id, status
+SELECT external_id, status, diagnostic
 FROM advisory_gate_run
 WHERE repo = $1
   AND pr_number = $2
@@ -773,6 +796,7 @@ LIMIT 1
             Ok(GateStatus {
                 external_id: row.try_get("external_id")?,
                 status: row.try_get("status")?,
+                diagnostic: row.try_get("diagnostic")?,
             })
         })
         .transpose()

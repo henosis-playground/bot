@@ -70,6 +70,7 @@ which = "8"
 # Text processing
 pulldown-cmark = "0.13"
 regex = "1"
+similar = "2.7"
 
 [dev-dependencies]
 insta = "1.26"
