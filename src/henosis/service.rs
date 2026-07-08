@@ -83,6 +83,36 @@ pub async fn reopen_preview_environment(
     Ok(Some(change))
 }
 
+pub async fn refresh_preview_environment(
+    ctx: &BorsContext,
+    repo: &GithubRepoName,
+    pr: &PullRequest,
+) -> anyhow::Result<Option<EnvironmentChange>> {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return Ok(None);
+    };
+    let Some(pr) = preview_pull_request(config, repo, pr) else {
+        return Ok(None);
+    };
+
+    let manager = EnvironmentManager::new(config.registered_components());
+    let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
+    let deploy_repo = deploy_repo(ctx, config)?;
+    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.manifest_branch);
+    let dev = GithubDevManifestReader::new(
+        &deploy_repo.client,
+        &config.manifest_branch,
+        &config.dev_manifest_path,
+    );
+    let packages = GithubComponentPackageReader::new(&ctx.repositories);
+    let digest = GithubImageDigestResolver::new(&ctx.repositories);
+
+    let change = manager
+        .refresh_pr(&mut store, &mut writer, &packages, &dev, &digest, pr)
+        .await?;
+    Ok(Some(change))
+}
+
 pub async fn retire_preview_environment(
     ctx: &BorsContext,
     repo: &GithubRepoName,

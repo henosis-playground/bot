@@ -211,6 +211,52 @@ impl EnvironmentManager {
         .await
     }
 
+    pub async fn refresh_pr<S, W, R, D>(
+        &self,
+        store: &mut S,
+        writer: &mut W,
+        package_reader: &R,
+        dev_manifests: &D,
+        digest_resolver: &impl ImageDigestResolver,
+        pr: PreviewPullRequest,
+    ) -> anyhow::Result<EnvironmentChange>
+    where
+        S: EnvironmentStore,
+        W: DeployRepoWriter,
+        R: ComponentPackageReader,
+        D: DevManifestReader,
+    {
+        let Some(environment) = store.environment_for_pr(&pr.key).await? else {
+            return self
+                .open_pr(
+                    store,
+                    writer,
+                    package_reader,
+                    dev_manifests,
+                    digest_resolver,
+                    pr,
+                )
+                .await;
+        };
+
+        store.put_member(&environment.id, &pr).await?;
+        let write = self
+            .write_environment(
+                store,
+                writer,
+                package_reader,
+                dev_manifests,
+                digest_resolver,
+                &environment.id,
+            )
+            .await?;
+
+        Ok(EnvironmentChange {
+            written: vec![write],
+            retired: vec![],
+        })
+    }
+
     pub async fn retire_pr<S, W>(
         &self,
         store: &mut S,
@@ -828,6 +874,13 @@ mod tests {
                 ),
                 (
                     (
+                        "henosis-playground/service-a".to_string(),
+                        "a-pr-2".to_string(),
+                    ),
+                    service_a.clone(),
+                ),
+                (
+                    (
                         "henosis-playground/service-b".to_string(),
                         "b-main".to_string(),
                     ),
@@ -1012,6 +1065,107 @@ mod tests {
         assert!(matches!(
             solo.components.get("service-a"),
             Some(ComponentEntry::Pinned(PinnedEntry { r#ref, .. })) if r#ref == "pr/3"
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_preserves_shared_environment_membership() {
+        let manager = EnvironmentManager::new(components());
+        let mut store = MemoryStore::default();
+        let mut writer = MemoryWriter::default();
+        let packages = package_reader();
+        let dev = StaticDevManifest(dev_manifest());
+        let digest = NoDigestResolver;
+        let service_a = PreviewPullRequest::new(
+            "henosis-playground/service-a",
+            3,
+            "service-a",
+            "pr/3",
+            "a-pr",
+        );
+        let service_b = PreviewPullRequest::new(
+            "henosis-playground/service-b",
+            7,
+            "service-b",
+            "pr/7",
+            "b-pr",
+        );
+
+        manager
+            .open_pr(
+                &mut store,
+                &mut writer,
+                &packages,
+                &dev,
+                &digest,
+                service_a.clone(),
+            )
+            .await
+            .unwrap();
+        manager
+            .open_pr(
+                &mut store,
+                &mut writer,
+                &packages,
+                &dev,
+                &digest,
+                service_b.clone(),
+            )
+            .await
+            .unwrap();
+        manager
+            .join(
+                &mut store,
+                &mut writer,
+                &packages,
+                &dev,
+                &digest,
+                service_a,
+                "demo stack",
+            )
+            .await
+            .unwrap();
+        manager
+            .join(
+                &mut store,
+                &mut writer,
+                &packages,
+                &dev,
+                &digest,
+                service_b,
+                "demo stack",
+            )
+            .await
+            .unwrap();
+
+        let change = manager
+            .refresh_pr(
+                &mut store,
+                &mut writer,
+                &packages,
+                &dev,
+                &digest,
+                PreviewPullRequest::new(
+                    "henosis-playground/service-a",
+                    3,
+                    "service-a",
+                    "pr/3",
+                    "a-pr-2",
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(change.written[0].id, "demo-stack");
+        let shared = read_written(&writer, "demo-stack.toml");
+        assert!(matches!(
+            shared.components.get("service-a"),
+            Some(ComponentEntry::Pinned(PinnedEntry { r#ref, digest, .. }))
+                if r#ref == "pr/3" && digest == &synthetic_digest_for_ref("a-pr-2")
+        ));
+        assert!(matches!(
+            shared.components.get("service-b"),
+            Some(ComponentEntry::Pinned(PinnedEntry { r#ref, .. })) if r#ref == "pr/7"
         ));
     }
 

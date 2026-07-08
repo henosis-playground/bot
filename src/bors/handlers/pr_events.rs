@@ -68,6 +68,8 @@ pub(super) async fn handle_push_to_pull_request(
 
     hide_tagged_comments(&repo_state, &db, &pr_model, CommentTag::MergeConflict).await?;
 
+    refresh_henosis_preview_for_pr(&repo_state, &db, &ctx, pr).await?;
+
     if on_pr_push(&ctx, repo_state.repository(), pr).await? {
         return Ok(());
     }
@@ -368,6 +370,30 @@ async fn recreate_henosis_preview_for_pr(
     };
     let Some(change) =
         crate::henosis::service::reopen_preview_environment(ctx, repo_state.repository(), pr)
+            .await?
+    else {
+        return Ok(());
+    };
+    if let Some(comment) = environment_change_comment(config, &change) {
+        repo_state
+            .client
+            .post_comment(pr.number, crate::bors::Comment::new(comment), db)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn refresh_henosis_preview_for_pr(
+    repo_state: &RepositoryState,
+    db: &PgDbClient,
+    ctx: &BorsContext,
+    pr: &crate::github::PullRequest,
+) -> anyhow::Result<()> {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return Ok(());
+    };
+    let Some(change) =
+        crate::henosis::service::refresh_preview_environment(ctx, repo_state.repository(), pr)
             .await?
     else {
         return Ok(());
