@@ -7,7 +7,7 @@ use serde::Deserialize;
 pub struct GateFailure {
     pub component: String,
     #[serde(rename = "consumerOf")]
-    pub consumer_of: String,
+    pub consumer_of: Option<String>,
     pub kind: String,
     pub message: String,
     pub excerpt: String,
@@ -38,10 +38,11 @@ impl GateReport {
 
         let mut summary = "Henosis gate failed.\n\nContract breaks:\n".to_string();
         for failure in &self.failures {
+            let consumer_of = failure.consumer_of.as_deref().unwrap_or("unknown");
             writeln!(
                 summary,
                 "- `{}` consuming `{}`: {}",
-                failure.component, failure.consumer_of, failure.message
+                failure.component, consumer_of, failure.message
             )
             .unwrap();
         }
@@ -61,10 +62,11 @@ impl GateReport {
         }
 
         for failure in &self.failures {
+            let consumer_of = failure.consumer_of.as_deref().unwrap_or("unknown");
             writeln!(
                 body,
                 "\n\n### `{}` consuming `{}`\n\n{}\n\nKind: `{}`",
-                failure.component, failure.consumer_of, failure.message, failure.kind
+                failure.component, consumer_of, failure.message, failure.kind
             )
             .unwrap();
 
@@ -123,8 +125,31 @@ mod tests {
 
         assert!(!report.ok);
         assert_eq!(report.failures.len(), 2);
-        assert_eq!(report.failures[0].consumer_of, "service-a");
+        assert_eq!(report.failures[0].consumer_of.as_deref(), Some("service-a"));
         assert_eq!(report.failures[1].kind, "render");
+    }
+
+    #[test]
+    fn parses_failure_report_without_consumer_of() {
+        let report = GateReport::parse(
+            r#"
+{
+  "ok": false,
+  "failures": [
+    {
+      "component": "service-a",
+      "kind": "validate",
+      "message": "service-a.api expected url, got string",
+      "excerpt": "service-a.api expected url, got string"
+    }
+  ]
+}
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(report.failures[0].consumer_of, None);
+        assert!(report.check_run_summary().contains("unknown"));
     }
 
     #[test]
@@ -133,7 +158,7 @@ mod tests {
             ok: false,
             failures: vec![GateFailure {
                 component: "service-b".to_string(),
-                consumer_of: "service-a".to_string(),
+                consumer_of: Some("service-a".to_string()),
                 kind: "compile".to_string(),
                 message: "service-b consumes service-a.databaseUrl which no longer exists"
                     .to_string(),

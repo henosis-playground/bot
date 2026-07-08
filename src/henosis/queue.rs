@@ -650,7 +650,7 @@ mod tests {
             ok: false,
             failures: vec![GateFailure {
                 component: "service-b".to_string(),
-                consumer_of: "service-a".to_string(),
+                consumer_of: Some("service-a".to_string()),
                 kind: "compile".to_string(),
                 message: "service-b consumes service-a.databaseUrl which no longer exists"
                     .to_string(),
