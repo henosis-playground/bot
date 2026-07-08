@@ -8,6 +8,7 @@ use crate::henosis::config::RegisteredComponent;
 use crate::henosis::graph::{ComponentGraph, ComponentPackageReader, ComponentRef};
 use crate::henosis::manifest::{
     self, ComponentEntry, EnvironmentSection, Manifest, PinnedEntry, follower_dev, pinned,
+    synthetic_digest_for_ref,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -463,13 +464,13 @@ impl EnvironmentManager {
         for component in &self.components {
             let entry = match members_by_component.get(&component.name) {
                 Some(member) => {
-                    let dev_pin = dev_pins.get(&component.name).with_context(|| {
+                    dev_pins.get(&component.name).with_context(|| {
                         format!("No dev pin found for component `{}`", component.name)
                     })?;
                     let digest = digest_resolver
                         .image_digest(&member.key.repo, &member.head_sha)
                         .await?
-                        .unwrap_or_else(|| dev_pin.digest.clone());
+                        .unwrap_or_else(|| synthetic_digest_for_ref(&member.head_sha));
                     pinned(member.key.repo.clone(), member.head_branch.clone(), digest)
                 }
                 None if closure.contains(&component.name) => {
@@ -882,7 +883,7 @@ mod tests {
         assert!(matches!(
             manifest.components.get("service-a"),
             Some(ComponentEntry::Pinned(PinnedEntry { r#ref, digest, .. }))
-                if r#ref == "pr/3" && digest == "sha256:a"
+                if r#ref == "pr/3" && digest == &synthetic_digest_for_ref("a-pr")
         ));
         assert!(matches!(
             manifest.components.get("service-b"),

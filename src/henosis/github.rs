@@ -16,7 +16,9 @@ use crate::henosis::environment::{
     DeployRepoWriter, DeployWriteResult, DevManifestReader, ImageDigestResolver,
 };
 use crate::henosis::graph::{ComponentPackageReader, PackageJson};
-use crate::henosis::manifest::{self, ComponentEntry, Manifest, PinnedEntry};
+use crate::henosis::manifest::{
+    self, ComponentEntry, Manifest, PinnedEntry, synthetic_digest_for_ref,
+};
 use crate::henosis::merge::{
     DevBump, DevManifestBumper, MergeExecutor, PullRequestMerger, StateMachineMergeExecutor,
 };
@@ -517,7 +519,7 @@ impl DevManifestBumper for GithubDevManifestBumper<'_> {
             let resolved_digest = digest
                 .image_digest(&component.repo, merge_commit_sha)
                 .await?
-                .unwrap_or_else(|| component.digest.clone());
+                .unwrap_or_else(|| synthetic_digest_for_ref(merge_commit_sha));
             manifest.components.insert(
                 component.name.clone(),
                 ComponentEntry::Pinned(PinnedEntry {

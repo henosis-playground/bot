@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::henosis::config::RegisteredComponent;
 use crate::henosis::environment::{DevManifestReader, PullRequestKey};
 use crate::henosis::gate::GateExecutor;
-use crate::henosis::manifest::{ComponentEntry, PinnedEntry};
+use crate::henosis::manifest::{ComponentEntry, PinnedEntry, synthetic_digest_for_ref};
 use crate::henosis::merge::MergeExecutor;
 
 pub const GLOBAL_QUEUE_LOCK_KEY: i64 = 0x4845_4e4f_5155_4555;
@@ -320,7 +320,7 @@ impl QueueManager {
                     name: component.name.clone(),
                     repo: member.key.repo.clone(),
                     r#ref: member.head_sha.clone(),
-                    digest: dev_pin.digest.clone(),
+                    digest: synthetic_digest_for_ref(&member.head_sha),
                     candidate: true,
                 });
             } else {
@@ -376,7 +376,9 @@ mod tests {
     use crate::henosis::environment::DevManifestReader;
     use crate::henosis::gate::FakeGateExecutor;
     use crate::henosis::gate_report::{GateFailure, GateReport};
-    use crate::henosis::manifest::{EnvironmentSection, Manifest, pinned};
+    use crate::henosis::manifest::{
+        EnvironmentSection, Manifest, pinned, synthetic_digest_for_ref,
+    };
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex;
 
@@ -671,7 +673,7 @@ mod tests {
                         name: "service-a".to_string(),
                         repo: "henosis-playground/service-a".to_string(),
                         r#ref: "a-pr".to_string(),
-                        digest: "sha256:a".to_string(),
+                        digest: synthetic_digest_for_ref("a-pr"),
                         candidate: true,
                     },
                     CandidateComponent {

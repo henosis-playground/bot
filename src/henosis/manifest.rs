@@ -1,5 +1,6 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// The manifest schema shared by the Henosis renderer and bot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +61,10 @@ pub fn follower_dev() -> ComponentEntry {
     ComponentEntry::Follower(FollowerEntry {
         follow: "dev".to_string(),
     })
+}
+
+pub fn synthetic_digest_for_ref(r#ref: &str) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(r#ref.as_bytes())))
 }
 
 pub fn validate(manifest: &Manifest) -> anyhow::Result<()> {
@@ -176,5 +181,15 @@ unexpected = true
         };
 
         assert!(validate(&manifest).is_err());
+    }
+
+    #[test]
+    fn synthetic_digest_moves_with_ref() {
+        let a = synthetic_digest_for_ref("a-ref");
+        let b = synthetic_digest_for_ref("b-ref");
+
+        assert!(a.starts_with("sha256:"));
+        assert_eq!(a.len(), "sha256:".len() + 64);
+        assert_ne!(a, b);
     }
 }
