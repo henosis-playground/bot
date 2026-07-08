@@ -2,16 +2,17 @@ use anyhow::Context;
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres, Row};
 
-use crate::henosis::config::RegisteredComponent;
+use crate::henosis::config::{ComponentMode, RegisteredComponent};
 use crate::henosis::environment::{
     EnvironmentState, EnvironmentStore, PreviewPullRequest, PullRequestKey, RenderOutcome,
     RenderStatus,
 };
 use crate::henosis::merge::MergeStore;
 use crate::henosis::queue::{
-    BUMPING_DEV_STATUS, CandidateWorld, GATE_PASSED_STATUS, GLOBAL_QUEUE_LOCK_KEY, GateStatus,
-    INVALIDATED_STATUS, MERGING_PR_STATUS, PENDING_EXECUTOR_STATUS, PENDING_STATUS,
-    QueuePullRequest, QueueStore, RUNNING_STATUS, RecordedGateRun, gate_external_id,
+    AdvisoryGateStore, BUMPING_DEV_STATUS, CandidateWorld, GATE_PASSED_STATUS,
+    GLOBAL_QUEUE_LOCK_KEY, GateStatus, INVALIDATED_STATUS, MERGING_PR_STATUS,
+    PENDING_EXECUTOR_STATUS, PENDING_STATUS, QueuePullRequest, QueueStore, RUNNING_STATUS,
+    RecordedGateRun, gate_external_id,
 };
 
 pub struct PgEnvironmentStore {
@@ -393,15 +394,23 @@ impl QueueStore for PgQueueStore {
             .iter()
             .map(|component| component.repo.clone())
             .collect::<Vec<_>>();
-        let row = sqlx::query(
+        let rows = sqlx::query(
             r#"
-SELECT repository, number, head_branch, approved_sha
+SELECT
+    pr.repository,
+    pr.number,
+    pr.head_branch,
+    pr.base_branch,
+    pr.approved_sha,
+    auto_build.commit_sha AS auto_build_commit_sha,
+    auto_build.parent AS auto_build_parent,
+    auto_build.status AS auto_build_status
 FROM pull_request AS pr
-WHERE repository = ANY($1)
-  AND status = 'open'
+LEFT JOIN build AS auto_build ON auto_build.id = pr.auto_build_id
+WHERE pr.repository = ANY($1)
+  AND pr.status = 'open'
   AND approved_by IS NOT NULL
   AND approved_sha IS NOT NULL
-  AND auto_build_id IS NULL
   AND NOT EXISTS (
       SELECT 1
       FROM candidate_world_member AS cwm
@@ -409,39 +418,67 @@ WHERE repository = ANY($1)
       JOIN gate_run AS gr ON gr.id = cw.gate_run_id
       WHERE cwm.repo = pr.repository
         AND cwm.pr_number = pr.number
-        AND cwm.head_sha = pr.approved_sha
+        AND cwm.head_sha = COALESCE(auto_build.commit_sha, pr.approved_sha)
         AND gr.status != 'invalidated'
   )
 ORDER BY pr.created_at ASC, pr.id ASC
-LIMIT 1
 "#,
         )
         .bind(&repos)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
 
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let repo: String = row.try_get("repository")?;
-        let component = components
-            .iter()
-            .find(|component| component.repo == repo)
-            .with_context(|| format!("No registered component found for `{repo}`"))?;
-        let number: i64 = row.try_get("number")?;
-        let head_branch: String = row.try_get("head_branch")?;
-        let approved_sha: String = row
-            .try_get::<Option<String>, _>("approved_sha")?
-            .context("ready pull request is missing approved_sha")?;
+        for row in rows {
+            let repo: String = row.try_get("repository")?;
+            let component = components
+                .iter()
+                .find(|component| component.repo == repo)
+                .with_context(|| format!("No registered component found for `{repo}`"))?;
+            let number: i64 = row.try_get("number")?;
+            let head_branch: String = row.try_get("head_branch")?;
+            let base_branch: String = row.try_get("base_branch")?;
+            let approved_sha: String = row
+                .try_get::<Option<String>, _>("approved_sha")?
+                .context("ready pull request is missing approved_sha")?;
+            let auto_build_commit_sha: Option<String> = row.try_get("auto_build_commit_sha")?;
+            let auto_build_parent: Option<String> = row.try_get("auto_build_parent")?;
+            let auto_build_status: Option<String> = row.try_get("auto_build_status")?;
 
-        Ok(Some(QueuePullRequest::new(
-            repo,
-            number as u64,
-            component.name.clone(),
-            approved_sha.clone(),
-            head_branch,
-            approved_sha,
-        )))
+            match component.mode {
+                ComponentMode::GateOnly if auto_build_commit_sha.is_none() => {
+                    return Ok(Some(QueuePullRequest::with_base_branch(
+                        repo,
+                        number as u64,
+                        component.name.clone(),
+                        approved_sha.clone(),
+                        head_branch,
+                        approved_sha,
+                        base_branch,
+                    )));
+                }
+                ComponentMode::Chained if auto_build_status.as_deref() == Some("success") => {
+                    let tested_commit_sha = auto_build_commit_sha
+                        .context("successful auto build is missing commit_sha")?;
+                    let tested_base_sha =
+                        auto_build_parent.context("successful auto build is missing parent")?;
+                    return Ok(Some(
+                        QueuePullRequest::with_base_branch(
+                            repo,
+                            number as u64,
+                            component.name.clone(),
+                            approved_sha.clone(),
+                            head_branch,
+                            approved_sha,
+                            base_branch,
+                        )
+                        .with_repo_validation(tested_commit_sha, tested_base_sha),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(None)
     }
 
     async fn oldest_resumable_merge(&mut self) -> anyhow::Result<Option<RecordedGateRun>> {
@@ -654,7 +691,8 @@ RETURNING gr.external_id, gr.status
             r#"
 UPDATE pull_request
 SET approved_sha = $3,
-    head_branch = $4
+    head_branch = $4,
+    auto_build_id = NULL
 WHERE repository = $1
   AND number = $2
   AND approved_by IS NOT NULL
@@ -667,6 +705,77 @@ WHERE repository = $1
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn clear_repo_validation(&mut self, key: &PullRequestKey) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+UPDATE pull_request
+SET auto_build_id = NULL
+WHERE repository = $1
+  AND number = $2
+  AND approved_by IS NOT NULL
+"#,
+        )
+        .bind(&key.repo)
+        .bind(key.number as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+impl AdvisoryGateStore for PgQueueStore {
+    async fn record_advisory_gate_status(
+        &mut self,
+        pr: &QueuePullRequest,
+        external_id: &str,
+        status: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+INSERT INTO advisory_gate_run (repo, pr_number, head_sha, external_id, status)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (external_id)
+DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
+"#,
+        )
+        .bind(&pr.key.repo)
+        .bind(pr.key.number as i64)
+        .bind(&pr.head_sha)
+        .bind(external_id)
+        .bind(status)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn latest_advisory_gate_status(
+        &self,
+        key: &PullRequestKey,
+    ) -> anyhow::Result<Option<GateStatus>> {
+        let row = sqlx::query(
+            r#"
+SELECT external_id, status
+FROM advisory_gate_run
+WHERE repo = $1
+  AND pr_number = $2
+ORDER BY created_at DESC, id DESC
+LIMIT 1
+"#,
+        )
+        .bind(&key.repo)
+        .bind(key.number as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| {
+            Ok(GateStatus {
+                external_id: row.try_get("external_id")?,
+                status: row.try_get("status")?,
+            })
+        })
+        .transpose()
     }
 }
 

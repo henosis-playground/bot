@@ -17,6 +17,8 @@ pub struct HenosisConfig {
     pub gate_command: String,
     #[serde(default = "default_gate_check_run_name")]
     pub gate_check_run_name: String,
+    #[serde(default = "default_advisory_gate_check_run_name")]
+    pub advisory_gate_check_run_name: String,
     #[serde(default = "default_render_workflow_name")]
     pub render_workflow_name: String,
     #[serde(default = "default_queue_tick_interval_secs")]
@@ -32,6 +34,19 @@ pub struct HenosisConfig {
     pub environments: Vec<EnvironmentConfig>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComponentMode {
+    GateOnly,
+    Chained,
+}
+
+impl Default for ComponentMode {
+    fn default() -> Self {
+        Self::GateOnly
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentConfig {
@@ -39,6 +54,8 @@ pub struct ComponentConfig {
     pub repo: String,
     #[serde(default = "default_main_branch")]
     pub main_branch: String,
+    #[serde(default, alias = "queue_mode")]
+    pub mode: ComponentMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +63,7 @@ pub struct RegisteredComponent {
     pub name: String,
     pub repo: String,
     pub main_branch: String,
+    pub mode: ComponentMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -79,6 +97,7 @@ impl HenosisConfig {
                     name: component.name.clone(),
                     repo: component.repo.clone(),
                     main_branch: component.main_branch.clone(),
+                    mode: component.mode,
                 })
                 .collect();
         }
@@ -89,6 +108,7 @@ impl HenosisConfig {
                 name: component_name_from_repo(repo),
                 repo: repo.clone(),
                 main_branch: default_main_branch(),
+                mode: ComponentMode::GateOnly,
             })
             .collect()
     }
@@ -103,6 +123,15 @@ impl HenosisConfig {
         self.registered_components()
             .into_iter()
             .find(|component| component.repo == repo)
+    }
+
+    pub fn component_mode_for_repo(&self, repo: &str) -> Option<ComponentMode> {
+        self.component_for_repo(repo)
+            .map(|component| component.mode)
+    }
+
+    pub fn is_chained_component_repo(&self, repo: &str) -> bool {
+        self.component_mode_for_repo(repo) == Some(ComponentMode::Chained)
     }
 
     pub fn queue_tick_interval(&self) -> Duration {
@@ -128,6 +157,10 @@ fn default_gate_command() -> String {
 
 fn default_gate_check_run_name() -> String {
     "Henosis gate".to_string()
+}
+
+fn default_advisory_gate_check_run_name() -> String {
+    "Henosis advisory gate".to_string()
 }
 
 fn default_render_workflow_name() -> String {
@@ -179,6 +212,7 @@ manifest_path = "dev.toml"
         assert_eq!(config.manifest_branch, "main");
         assert_eq!(config.gate_command, "henosis-gate");
         assert_eq!(config.gate_check_run_name, "Henosis gate");
+        assert_eq!(config.advisory_gate_check_run_name, "Henosis advisory gate");
         assert_eq!(config.render_workflow_name, "Render environments");
         assert_eq!(config.queue_tick_interval_secs, 15);
         assert_eq!(config.queue_tick_interval(), Duration::from_secs(15));
@@ -191,11 +225,13 @@ manifest_path = "dev.toml"
                     name: "service-a".to_string(),
                     repo: "henosis-playground/service-a".to_string(),
                     main_branch: "main".to_string(),
+                    mode: ComponentMode::GateOnly,
                 },
                 RegisteredComponent {
                     name: "service-b".to_string(),
                     repo: "henosis-playground/service-b".to_string(),
                     main_branch: "main".to_string(),
+                    mode: ComponentMode::GateOnly,
                 }
             ]
         );
@@ -209,6 +245,7 @@ deploy_repo = "henosis-playground/deploy"
 manifest_branch = "manifests"
 gate_command = "custom-gate"
 gate_check_run_name = "Custom gate"
+advisory_gate_check_run_name = "Custom advisory"
 render_workflow_name = "Custom render"
 queue_tick_interval_secs = 3
 cmd_prefix = "@custom-bot"
@@ -224,6 +261,7 @@ manifest_path = "staging.toml"
         assert_eq!(config.manifest_branch, "manifests");
         assert_eq!(config.gate_command, "custom-gate");
         assert_eq!(config.gate_check_run_name, "Custom gate");
+        assert_eq!(config.advisory_gate_check_run_name, "Custom advisory");
         assert_eq!(config.render_workflow_name, "Custom render");
         assert_eq!(config.queue_tick_interval(), Duration::from_secs(3));
         assert_eq!(config.cmd_prefix, "@custom-bot");
@@ -239,6 +277,7 @@ deploy_repo = "henosis-playground/deploy"
 name = "api"
 repo = "henosis-playground/service-a"
 main_branch = "trunk"
+mode = "chained"
 
 [[environments]]
 id = "dev"
@@ -253,10 +292,36 @@ manifest_path = "dev.toml"
                 name: "api".to_string(),
                 repo: "henosis-playground/service-a".to_string(),
                 main_branch: "trunk".to_string(),
+                mode: ComponentMode::Chained,
             }]
         );
         assert!(config.is_component_repo("henosis-playground/service-a"));
         assert!(!config.is_component_repo("henosis-playground/service-b"));
+        assert!(config.is_chained_component_repo("henosis-playground/service-a"));
+    }
+
+    #[test]
+    fn parses_component_queue_mode_alias() {
+        let config = parse_config(
+            r#"
+deploy_repo = "henosis-playground/deploy"
+
+[[components]]
+name = "api"
+repo = "henosis-playground/service-a"
+queue_mode = "chained"
+
+[[environments]]
+id = "dev"
+manifest_path = "dev.toml"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.component_mode_for_repo("henosis-playground/service-a"),
+            Some(ComponentMode::Chained)
+        );
     }
 
     #[test]

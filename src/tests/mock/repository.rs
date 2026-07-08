@@ -593,6 +593,58 @@ struct CheckRunResponseOutput {
 
 async fn mock_check_runs(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
     let repo_name = repo.lock().full_name();
+    let list_repo_name = repo_name.clone();
+    dynamic_mock_req(
+        {
+            let repo = repo.clone();
+            move |_request: &Request, [head_sha]: [&str; 1]| {
+                #[derive(serde::Serialize)]
+                struct CheckRunsResponse {
+                    check_runs: Vec<CheckRunResponse>,
+                }
+
+                let repo = repo.lock();
+                let check_runs = repo
+                    .check_runs()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, check_run)| check_run.head_sha == head_sha)
+                    .map(|(id, check_run)| CheckRunResponse {
+                        id: id as u64,
+                        node_id: "1234".to_string(),
+                        name: check_run.name.clone(),
+                        head_sha: check_run.head_sha.clone(),
+                        url: format!(
+                            "https://api.github.com/repos/{list_repo_name}/check-runs/{id}"
+                        ),
+                        html_url: format!("https://github.com/{list_repo_name}/runs/{id}"),
+                        details_url: None,
+                        status: check_run.status.clone(),
+                        conclusion: check_run.conclusion.clone(),
+                        started_at: Utc::now().to_rfc3339(),
+                        completed_at: None,
+                        external_id: check_run.external_id.clone(),
+                        output: CheckRunResponseOutput {
+                            title: check_run.title.clone(),
+                            summary: check_run.summary.clone(),
+                            text: Some(check_run.text.clone()),
+                            annotations_count: 0,
+                            annotations_url: format!(
+                                "https://api.github.com/repos/{list_repo_name}/check-runs/{id}/annotations"
+                            ),
+                        },
+                        pull_requests: vec![],
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(CheckRunsResponse { check_runs })
+            }
+        },
+        "GET",
+        format!("^/repos/{repo_name}/commits/(.*)/check-runs$"),
+    )
+    .mount(mock_server)
+    .await;
+
     Mock::given(method("POST"))
         .and(path(format!("/repos/{repo_name}/check-runs")))
         .respond_with({

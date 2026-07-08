@@ -807,6 +807,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::henosis::config::ComponentMode;
     use crate::henosis::graph::{PackageHenosis, PackageJson};
 
     #[derive(Clone)]
@@ -993,11 +994,13 @@ mod tests {
                 name: "service-a".to_string(),
                 repo: "henosis-playground/service-a".to_string(),
                 main_branch: "main".to_string(),
+                mode: ComponentMode::GateOnly,
             },
             RegisteredComponent {
                 name: "service-b".to_string(),
                 repo: "henosis-playground/service-b".to_string(),
                 main_branch: "main".to_string(),
+                mode: ComponentMode::GateOnly,
             },
         ]
     }

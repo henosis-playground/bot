@@ -8,11 +8,16 @@ pub struct StatusSnapshot {
     pub environment: EnvironmentStatus,
     pub manifest_url: String,
     pub branch_url: String,
+    pub advisory_gate: Option<GateStatus>,
     pub gate: Option<GateStatus>,
     pub render: Option<RenderOutcome>,
 }
 
 pub fn render_status_section(snapshot: &StatusSnapshot) -> String {
+    let advisory_gate = match &snapshot.advisory_gate {
+        Some(gate) => format!("Advisory gate: `{}` (`{}`)", gate.status, gate.external_id),
+        None => "Advisory gate: no advisory run recorded".to_string(),
+    };
     let gate = match &snapshot.gate {
         Some(gate) => format!("Final gate: `{}` (`{}`)", gate.status, gate.external_id),
         None => "Final gate: no gate run recorded".to_string(),
@@ -34,7 +39,7 @@ pub fn render_status_section(snapshot: &StatusSnapshot) -> String {
     };
 
     format!(
-        "{STATUS_START}\n### Henosis status\n\nEnvironment: `{}`\nManifest: [{}]({})\nBranch: [{}]({})\nMembers: {}\n{gate}\n{render}\n{STATUS_END}",
+        "{STATUS_START}\n### Henosis status\n\nEnvironment: `{}`\nManifest: [{}]({})\nBranch: [{}]({})\nMembers: {}\n{advisory_gate}\n{gate}\n{render}\n{STATUS_END}",
         snapshot.environment.environment.id,
         snapshot.environment.environment.manifest_path,
         snapshot.manifest_url,

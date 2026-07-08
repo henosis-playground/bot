@@ -56,7 +56,7 @@ pub(super) async fn handle_push_to_pull_request(
     repo_state: Arc<RepositoryState>,
     db: Arc<PgDbClient>,
     ctx: Arc<BorsContext>,
-    mergeability_queue: &MergeabilityQueueSender,
+    senders: &QueueSenders,
     payload: PullRequestPushed,
 ) -> anyhow::Result<()> {
     let pr = &payload.pull_request;
@@ -64,13 +64,15 @@ pub(super) async fn handle_push_to_pull_request(
         .upsert_pull_request(repo_state.repository(), pr.clone().into())
         .await?;
 
-    set_pr_mergeability_based_on_user_action(&db, pr, &pr_model, mergeability_queue).await?;
+    set_pr_mergeability_based_on_user_action(&db, pr, &pr_model, senders.mergeability_queue())
+        .await?;
 
     hide_tagged_comments(&repo_state, &db, &pr_model, CommentTag::MergeConflict).await?;
 
     refresh_henosis_preview_for_pr(&repo_state, &db, &ctx, pr).await?;
 
     if on_pr_push(&ctx, repo_state.repository(), pr).await? {
+        senders.merge_queue().notify().await?;
         return Ok(());
     }
 

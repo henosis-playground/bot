@@ -30,7 +30,7 @@ pub struct DevBump {
 }
 
 pub trait PullRequestMerger {
-    async fn squash_merge(&self, pr: &QueuePullRequest) -> anyhow::Result<String>;
+    async fn merge(&self, pr: &QueuePullRequest) -> anyhow::Result<String>;
 }
 
 pub trait DevManifestBumper {
@@ -112,7 +112,7 @@ where
 
         let mut merge_commit_shas = Vec::with_capacity(gate_run.world.members.len());
         for pr in &gate_run.world.members {
-            merge_commit_shas.push(self.merger.squash_merge(pr).await?);
+            merge_commit_shas.push(self.merger.merge(pr).await?);
         }
         let merge_commit_sha = merge_commit_shas
             .first()
@@ -205,7 +205,7 @@ mod tests {
     }
 
     impl PullRequestMerger for FakeMerger {
-        async fn squash_merge(&self, pr: &QueuePullRequest) -> anyhow::Result<String> {
+        async fn merge(&self, pr: &QueuePullRequest) -> anyhow::Result<String> {
             self.calls.lock().unwrap().push(pr.clone());
             Ok("merge-sha".to_string())
         }

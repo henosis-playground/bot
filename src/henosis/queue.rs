@@ -4,7 +4,7 @@ use anyhow::Context;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::henosis::config::RegisteredComponent;
+use crate::henosis::config::{ComponentMode, RegisteredComponent};
 use crate::henosis::environment::{DevManifestReader, PullRequestKey};
 use crate::henosis::gate::GateExecutor;
 use crate::henosis::manifest::{ComponentEntry, PinnedEntry, synthetic_digest_for_ref};
@@ -20,6 +20,8 @@ pub const MERGING_PR_STATUS: &str = "merging-pr";
 pub const BUMPING_DEV_STATUS: &str = "bumping-dev";
 pub const MERGED_STATUS: &str = "merged";
 pub const INVALIDATED_STATUS: &str = "invalidated";
+pub const ADVISORY_PASSED_STATUS: &str = "advisory-passed";
+pub const ADVISORY_FAILED_STATUS: &str = "advisory-failed";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuePullRequest {
@@ -28,6 +30,16 @@ pub struct QueuePullRequest {
     pub head_sha: String,
     pub head_branch: String,
     pub approved_sha: String,
+    #[serde(default = "default_base_branch")]
+    pub base_branch: String,
+    #[serde(default)]
+    pub repo_validation: Option<RepoValidation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoValidation {
+    pub tested_commit_sha: String,
+    pub base_sha: String,
 }
 
 impl QueuePullRequest {
@@ -39,14 +51,57 @@ impl QueuePullRequest {
         head_branch: impl Into<String>,
         approved_sha: impl Into<String>,
     ) -> Self {
+        Self::with_base_branch(
+            repo,
+            number,
+            component,
+            head_sha,
+            head_branch,
+            approved_sha,
+            default_base_branch(),
+        )
+    }
+
+    pub fn with_base_branch(
+        repo: impl Into<String>,
+        number: u64,
+        component: impl Into<String>,
+        head_sha: impl Into<String>,
+        head_branch: impl Into<String>,
+        approved_sha: impl Into<String>,
+        base_branch: impl Into<String>,
+    ) -> Self {
         Self {
             key: PullRequestKey::new(repo, number),
             component: component.into(),
             head_sha: head_sha.into(),
             head_branch: head_branch.into(),
             approved_sha: approved_sha.into(),
+            base_branch: base_branch.into(),
+            repo_validation: None,
         }
     }
+
+    pub fn with_repo_validation(mut self, tested_commit_sha: String, base_sha: String) -> Self {
+        self.head_sha = tested_commit_sha.clone();
+        self.repo_validation = Some(RepoValidation {
+            tested_commit_sha,
+            base_sha,
+        });
+        self
+    }
+
+    pub fn mode(&self) -> ComponentMode {
+        if self.repo_validation.is_some() {
+            ComponentMode::Chained
+        } else {
+            ComponentMode::GateOnly
+        }
+    }
+}
+
+fn default_base_branch() -> String {
+    "main".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +162,7 @@ pub trait QueueStore {
         key: &PullRequestKey,
     ) -> anyhow::Result<Vec<GateStatus>>;
     async fn reenqueue_pr(&mut self, pr: &QueuePullRequest) -> anyhow::Result<()>;
+    async fn clear_repo_validation(&mut self, key: &PullRequestKey) -> anyhow::Result<()>;
 }
 
 pub trait GateCheckReporter {
@@ -127,6 +183,32 @@ pub trait PrCommenter {
     async fn post_comment(&self, pr: &QueuePullRequest, body: &str) -> anyhow::Result<()>;
 }
 
+pub trait AdvisoryGateStore {
+    async fn record_advisory_gate_status(
+        &mut self,
+        pr: &QueuePullRequest,
+        external_id: &str,
+        status: &str,
+    ) -> anyhow::Result<()>;
+    async fn latest_advisory_gate_status(
+        &self,
+        key: &PullRequestKey,
+    ) -> anyhow::Result<Option<GateStatus>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoValidationStatus {
+    Current,
+    Stale,
+}
+
+pub trait RepoValidationChecker {
+    async fn check_repo_validation(
+        &self,
+        pr: &QueuePullRequest,
+    ) -> anyhow::Result<RepoValidationStatus>;
+}
+
 pub struct QueueManager {
     components: Vec<RegisteredComponent>,
 }
@@ -136,7 +218,7 @@ impl QueueManager {
         Self { components }
     }
 
-    pub async fn tick<S, D, R, E, M, C>(
+    pub async fn tick<S, D, R, E, M, C, V>(
         &self,
         store: &mut S,
         dev_manifests: &D,
@@ -144,6 +226,7 @@ impl QueueManager {
         gate_executor: &E,
         merge_executor: &M,
         commenter: &C,
+        repo_validation: &V,
     ) -> anyhow::Result<Option<RecordedGateRun>>
     where
         S: QueueStore,
@@ -152,6 +235,7 @@ impl QueueManager {
         E: GateExecutor,
         M: MergeExecutor,
         C: PrCommenter,
+        V: RepoValidationChecker,
     {
         if !store.try_acquire_global_lock().await? {
             return Ok(None);
@@ -165,6 +249,7 @@ impl QueueManager {
                 gate_executor,
                 merge_executor,
                 commenter,
+                repo_validation,
             )
             .await;
         let release = store.release_global_lock().await;
@@ -176,7 +261,7 @@ impl QueueManager {
         }
     }
 
-    async fn tick_with_lock<S, D, R, E, M, C>(
+    async fn tick_with_lock<S, D, R, E, M, C, V>(
         &self,
         store: &mut S,
         dev_manifests: &D,
@@ -184,6 +269,7 @@ impl QueueManager {
         gate_executor: &E,
         merge_executor: &M,
         commenter: &C,
+        repo_validation: &V,
     ) -> anyhow::Result<Option<RecordedGateRun>>
     where
         S: QueueStore,
@@ -192,6 +278,7 @@ impl QueueManager {
         E: GateExecutor,
         M: MergeExecutor,
         C: PrCommenter,
+        V: RepoValidationChecker,
     {
         if let Some(gate_run) = store.oldest_resumable_merge().await? {
             merge_executor.execute(&gate_run).await?;
@@ -214,6 +301,13 @@ impl QueueManager {
         let Some(candidate) = store.oldest_ready_candidate(&self.components).await? else {
             return Ok(None);
         };
+        if candidate.repo_validation.is_some()
+            && repo_validation.check_repo_validation(&candidate).await?
+                == RepoValidationStatus::Stale
+        {
+            store.clear_repo_validation(&candidate.key).await?;
+            return Ok(None);
+        }
 
         let world = self
             .candidate_world(dev_manifests, vec![candidate.clone()])
@@ -328,7 +422,7 @@ impl QueueManager {
         Ok(true)
     }
 
-    async fn candidate_world<D>(
+    pub async fn candidate_world<D>(
         &self,
         dev_manifests: &D,
         members: Vec<QueuePullRequest>,
@@ -413,6 +507,15 @@ pub fn gate_external_id(world: &CandidateWorld) -> anyhow::Result<String> {
     ))
 }
 
+pub fn advisory_gate_external_id(pr: &QueuePullRequest) -> String {
+    format!(
+        "gate-{}-{}-advisory-{}",
+        pr.key.repo.replace('/', "-"),
+        pr.key.number,
+        pr.head_sha
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +544,7 @@ mod tests {
         recorded: Vec<RecordedGateRun>,
         statuses: BTreeMap<String, String>,
         reenqueued: Vec<QueuePullRequest>,
+        cleared_repo_validations: Vec<PullRequestKey>,
     }
 
     impl QueueStore for MemoryQueueStore {
@@ -588,6 +692,11 @@ mod tests {
             }
             Ok(())
         }
+
+        async fn clear_repo_validation(&mut self, key: &PullRequestKey) -> anyhow::Result<()> {
+            self.cleared_repo_validations.push(key.clone());
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -654,17 +763,30 @@ mod tests {
         }
     }
 
+    struct StaticRepoValidation(RepoValidationStatus);
+
+    impl RepoValidationChecker for StaticRepoValidation {
+        async fn check_repo_validation(
+            &self,
+            _pr: &QueuePullRequest,
+        ) -> anyhow::Result<RepoValidationStatus> {
+            Ok(self.0)
+        }
+    }
+
     fn components() -> Vec<RegisteredComponent> {
         vec![
             RegisteredComponent {
                 name: "service-a".to_string(),
                 repo: "henosis-playground/service-a".to_string(),
                 main_branch: "main".to_string(),
+                mode: ComponentMode::GateOnly,
             },
             RegisteredComponent {
                 name: "service-b".to_string(),
                 repo: "henosis-playground/service-b".to_string(),
                 main_branch: "main".to_string(),
+                mode: ComponentMode::GateOnly,
             },
         ]
     }
@@ -774,6 +896,7 @@ mod tests {
                 &executor,
                 &merge_executor,
                 &commenter,
+                &StaticRepoValidation(RepoValidationStatus::Current),
             )
             .await
             .unwrap()
@@ -843,6 +966,7 @@ mod tests {
                 &executor,
                 &merge_executor,
                 &commenter,
+                &StaticRepoValidation(RepoValidationStatus::Current),
             )
             .await
             .unwrap()
@@ -894,6 +1018,7 @@ mod tests {
                 &executor,
                 &merge_executor,
                 &commenter,
+                &StaticRepoValidation(RepoValidationStatus::Current),
             )
             .await
             .unwrap()

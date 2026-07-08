@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::PgDbClient;
-use crate::bors::Comment;
 use crate::bors::RepositoryStore;
+use crate::bors::{Comment, PullRequestStatus};
 use crate::github::api::client::{CheckRunOutput, GithubRepositoryClient};
+use crate::github::api::operations::{BranchUpdateError, ForcePush};
 use crate::github::{CommitSha, GithubRepoName, PullRequestNumber};
 use crate::henosis::config::HenosisConfig;
 use crate::henosis::environment::{
@@ -25,6 +26,7 @@ use crate::henosis::merge::{
 };
 use crate::henosis::queue::{
     CheckConclusion, GateCheckReporter, GateRun, PrCommenter, QueuePullRequest,
+    RepoValidationChecker, RepoValidationStatus,
 };
 
 pub struct GithubDeployRepoWriter<'a> {
@@ -241,7 +243,7 @@ impl GateCheckReporter for GithubGateCheckReporter<'_> {
                 &CommitSha(pr.head_sha.clone()),
                 CheckRunStatus::InProgress,
                 CheckRunOutput {
-                    title: "Henosis gate".to_string(),
+                    title: self.check_name.clone(),
                     summary: "Gate run created; waiting for executor.".to_string(),
                 },
                 external_id,
@@ -256,19 +258,19 @@ impl GateCheckReporter for GithubGateCheckReporter<'_> {
         conclusion: CheckConclusion,
         summary: &str,
     ) -> anyhow::Result<()> {
-        let Some(head_sha) = external_id.rsplit_once('-').map(|(_, sha)| sha) else {
-            anyhow::bail!("Cannot extract head SHA from gate external id `{external_id}`");
-        };
-
         let mut resolved = false;
         for repo in self.repositories.repositories() {
             let repo_external_id_prefix = format!(
                 "gate-{}-",
                 repo.client.repository().to_string().replace('/', "-")
             );
-            if !external_id.starts_with(&repo_external_id_prefix) {
+            let Some(rest) = external_id.strip_prefix(&repo_external_id_prefix) else {
                 continue;
-            }
+            };
+            let Some((_pr_number, head_sha)) = rest.split_once('-') else {
+                anyhow::bail!("Cannot extract head SHA from gate external id `{external_id}`");
+            };
+            let head_sha = head_sha.strip_prefix("advisory-").unwrap_or(head_sha);
 
             let check_runs = match list_check_runs_for_ref(&repo.client, head_sha).await {
                 Ok(runs) => runs,
@@ -413,6 +415,41 @@ pub struct GitHubMergeExecutor<'a> {
     config: &'a HenosisConfig,
 }
 
+pub struct GithubRepoValidationChecker<'a> {
+    repositories: &'a RepositoryStore,
+}
+
+impl<'a> GithubRepoValidationChecker<'a> {
+    pub fn new(repositories: &'a RepositoryStore) -> Self {
+        Self { repositories }
+    }
+}
+
+impl RepoValidationChecker for GithubRepoValidationChecker<'_> {
+    async fn check_repo_validation(
+        &self,
+        pr: &QueuePullRequest,
+    ) -> anyhow::Result<RepoValidationStatus> {
+        let Some(validation) = &pr.repo_validation else {
+            return Ok(RepoValidationStatus::Current);
+        };
+        let repo_name: GithubRepoName =
+            pr.key.repo.parse().map_err(|error| {
+                anyhow::anyhow!("Invalid GitHub repo `{}`: {error}", pr.key.repo)
+            })?;
+        let repo = self
+            .repositories
+            .get(&repo_name)
+            .with_context(|| format!("Repository `{repo_name}` is not loaded"))?;
+        let current = repo.client.get_branch_sha(&pr.base_branch).await?;
+        if current.as_ref() == validation.base_sha {
+            Ok(RepoValidationStatus::Current)
+        } else {
+            Ok(RepoValidationStatus::Stale)
+        }
+    }
+}
+
 impl<'a> GitHubMergeExecutor<'a> {
     pub fn new(
         pool: PgPool,
@@ -432,7 +469,7 @@ impl<'a> GitHubMergeExecutor<'a> {
 impl MergeExecutor for GitHubMergeExecutor<'_> {
     async fn execute(&self, gate_run: &GateRun) -> anyhow::Result<()> {
         let store = crate::henosis::db::PgQueueStore::new(self.pool.clone());
-        let merger = GithubPullRequestMerger::new(self.repositories);
+        let merger = GithubPullRequestMerger::new(self.repositories, self.db);
         let bumper = GithubDevManifestBumper::new(self.repositories, self.config);
         let commenter = GithubPrCommenter::new(self.repositories, self.db);
         StateMachineMergeExecutor::new(store, merger, bumper, commenter)
@@ -443,16 +480,17 @@ impl MergeExecutor for GitHubMergeExecutor<'_> {
 
 pub struct GithubPullRequestMerger<'a> {
     repositories: &'a RepositoryStore,
+    db: &'a PgDbClient,
 }
 
 impl<'a> GithubPullRequestMerger<'a> {
-    pub fn new(repositories: &'a RepositoryStore) -> Self {
-        Self { repositories }
+    pub fn new(repositories: &'a RepositoryStore, db: &'a PgDbClient) -> Self {
+        Self { repositories, db }
     }
 }
 
 impl PullRequestMerger for GithubPullRequestMerger<'_> {
-    async fn squash_merge(&self, pr: &QueuePullRequest) -> anyhow::Result<String> {
+    async fn merge(&self, pr: &QueuePullRequest) -> anyhow::Result<String> {
         let repo_name: GithubRepoName =
             pr.key.repo.parse().map_err(|error| {
                 anyhow::anyhow!("Invalid GitHub repo `{}`: {error}", pr.key.repo)
@@ -461,8 +499,58 @@ impl PullRequestMerger for GithubPullRequestMerger<'_> {
             .repositories
             .get(&repo_name)
             .with_context(|| format!("Repository `{repo_name}` is not loaded"))?;
-        let sha = squash_merge_pull_request(&repo.client, PullRequestNumber(pr.key.number)).await?;
-        Ok(sha.to_string())
+        let merge_sha = if pr.repo_validation.is_some() {
+            fast_forward_validated_commit(&repo.client, pr).await?
+        } else {
+            squash_merge_pull_request(&repo.client, PullRequestNumber(pr.key.number)).await?
+        };
+        self.db
+            .set_pr_status(
+                &repo_name,
+                PullRequestNumber(pr.key.number),
+                PullRequestStatus::Merged,
+            )
+            .await?;
+        Ok(merge_sha.to_string())
+    }
+}
+
+async fn fast_forward_validated_commit(
+    client: &GithubRepositoryClient,
+    pr: &QueuePullRequest,
+) -> anyhow::Result<CommitSha> {
+    let validation = pr
+        .repo_validation
+        .as_ref()
+        .context("fast-forward merge requested without repo validation")?;
+    let current_base = client.get_branch_sha(&pr.base_branch).await?;
+    if current_base.as_ref() != validation.base_sha {
+        anyhow::bail!(
+            "Cannot fast-forward {}#{}: `{}` moved from tested base {} to {}",
+            pr.key.repo,
+            pr.key.number,
+            pr.base_branch,
+            validation.base_sha,
+            current_base.as_ref()
+        );
+    }
+
+    let tested_commit = CommitSha(validation.tested_commit_sha.clone());
+    match client
+        .set_branch_to_sha(&pr.base_branch, &tested_commit, ForcePush::No)
+        .await
+    {
+        Ok(()) => Ok(tested_commit),
+        Err(BranchUpdateError::Conflict(branch_name))
+        | Err(BranchUpdateError::ValidationFailed(branch_name)) => {
+            anyhow::bail!(
+                "Cannot fast-forward {}#{}: tested commit {} is not current for `{branch_name}`",
+                pr.key.repo,
+                pr.key.number,
+                tested_commit.as_ref()
+            )
+        }
+        Err(error) => Err(error.into()),
     }
 }
 

@@ -30,9 +30,62 @@ pub async fn mock_pull_requests(
     mock_pr(repo.clone(), github.clone(), mock_server).await;
     mock_pr_create(repo.clone(), github.clone(), mock_server).await;
     mock_pr_update(repo.clone(), github.clone(), mock_server).await;
+    mock_pr_merge(repo.clone(), github.clone(), mock_server).await;
     mock_pr_comments(repo.clone(), github, mock_server).await;
     mock_pr_labels(repo.clone(), mock_server).await;
     mock_pr_commits(repo, mock_server).await;
+}
+
+async fn mock_pr_merge(
+    repo: Arc<Mutex<Repo>>,
+    _github: Arc<Mutex<GitHub>>,
+    mock_server: &MockServer,
+) {
+    let repo_name = repo.lock().full_name();
+    dynamic_mock_req(
+        move |req: &Request, [pr_number]: [&str; 1]| {
+            let pr_number: u64 = pr_number.parse().unwrap();
+
+            #[derive(serde::Deserialize)]
+            struct MergeRequest {
+                merge_method: String,
+            }
+
+            let data: MergeRequest = req.body_json().unwrap();
+            assert_eq!(data.merge_method, "squash");
+
+            let mut repo = repo.lock();
+            if let Some(status) = repo.merge_behavior.get_failure_status_code() {
+                return ResponseTemplate::new(status);
+            }
+
+            let base_branch_name = {
+                let pr = repo.get_pr(pr_number);
+                pr.base_branch.name().to_string()
+            };
+            let merge_counter = {
+                let branch = repo.get_branch_by_name(&base_branch_name).unwrap();
+                let merge_counter = branch.merge_counter;
+                branch.merge_counter += 1;
+                merge_counter
+            };
+            let sha = format!("squash-pr-{pr_number}-{merge_counter}");
+            let commit = crate::tests::Commit::new(&sha, &format!("squash PR #{pr_number}"));
+            repo.push_commit(&base_branch_name, commit, false);
+            let pr = repo.get_pr_mut(pr_number);
+            pr.merge();
+
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": sha,
+                "merged": true,
+                "message": "Pull Request successfully merged"
+            }))
+        },
+        "PUT",
+        format!("^/repos/{repo_name}/pulls/([0-9]+)/merge$"),
+    )
+    .mount(mock_server)
+    .await;
 }
 
 async fn mock_pr(repo: Arc<Mutex<Repo>>, github: Arc<Mutex<GitHub>>, mock_server: &MockServer) {
@@ -441,6 +494,8 @@ pub struct GitHubPullRequest {
     draft: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     merged_at: Option<DateTime<Utc>>,
+    merged: bool,
+    merge_commit_sha: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     closed_at: Option<DateTime<Utc>>,
 
@@ -484,6 +539,12 @@ impl GitHubPullRequest {
             comment_queue_rx: _,
             comment_history: _,
         } = pr;
+        let merged = merged_at.is_some();
+        let merge_commit_sha = if merged {
+            Some(base_branch.sha())
+        } else {
+            None
+        };
 
         if let Some(head_repository) = &head_repository {
             assert_ne!(head_repository, &repo);
@@ -511,6 +572,8 @@ impl GitHubPullRequest {
                 sha: base_branch.sha(),
             }),
             merged_at,
+            merged,
+            merge_commit_sha,
             closed_at,
             assignees: assignees.into_iter().map(Into::into).collect(),
             labels: labels

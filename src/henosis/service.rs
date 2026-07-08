@@ -9,14 +9,16 @@ use crate::henosis::environment::{
     EnvironmentChange, EnvironmentManager, EnvironmentStatus, EnvironmentStore, PreviewPullRequest,
     PullRequestKey, RenderOutcome, RenderStatus, environment_branch,
 };
-use crate::henosis::gate::CliGateExecutor;
+use crate::henosis::gate::{CliGateExecutor, GateExecutor};
 use crate::henosis::github::{
     GitHubMergeExecutor, GithubComponentPackageReader, GithubDeployRepoWriter,
     GithubDevManifestReader, GithubGateCheckReporter, GithubImageDigestResolver, GithubPrCommenter,
-    deploy_branch_url, deploy_manifest_url,
+    GithubRepoValidationChecker, deploy_branch_url, deploy_manifest_url,
 };
 use crate::henosis::queue::{
-    GateStatus, QueueManager, QueuePullRequest, QueueStore, RecordedGateRun,
+    ADVISORY_FAILED_STATUS, ADVISORY_PASSED_STATUS, AdvisoryGateStore, CheckConclusion,
+    GateCheckReporter, GateStatus, QueueManager, QueuePullRequest, QueueStore, RecordedGateRun,
+    advisory_gate_external_id,
 };
 use crate::henosis::status::{StatusSnapshot, render_status_section, upsert_status_section};
 use anyhow::Context;
@@ -26,6 +28,13 @@ pub fn is_henosis_component_repo(ctx: &BorsContext, repo: &GithubRepoName) -> bo
     ctx.henosis_config
         .as_ref()
         .map(|config| config.is_component_repo(&repo.to_string()))
+        .unwrap_or(false)
+}
+
+pub fn is_chained_component_repo(ctx: &BorsContext, repo: &GithubRepoName) -> bool {
+    ctx.henosis_config
+        .as_ref()
+        .map(|config| config.is_chained_component_repo(&repo.to_string()))
         .unwrap_or(false)
 }
 
@@ -283,6 +292,7 @@ pub async fn tick_queue(ctx: &BorsContext) -> anyhow::Result<Option<RecordedGate
         config,
     );
     let commenter = GithubPrCommenter::new(ctx.repositories.as_ref(), ctx.db.as_ref());
+    let repo_validation = GithubRepoValidationChecker::new(ctx.repositories.as_ref());
     let result = manager
         .tick(
             &mut store,
@@ -291,6 +301,7 @@ pub async fn tick_queue(ctx: &BorsContext) -> anyhow::Result<Option<RecordedGate
             &gate_executor,
             &merge_executor,
             &commenter,
+            &repo_validation,
         )
         .await?;
     if let Some(gate_run) = &result {
@@ -306,6 +317,106 @@ pub async fn tick_queue(ctx: &BorsContext) -> anyhow::Result<Option<RecordedGate
         .await?;
     }
     Ok(result)
+}
+
+pub async fn run_advisory_gate_on_approval(
+    ctx: &BorsContext,
+    repo: &GithubRepoName,
+    pr: &PullRequest,
+) -> anyhow::Result<bool> {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return Ok(false);
+    };
+    let Some(component) = config.component_for_repo(&repo.to_string()) else {
+        return Ok(false);
+    };
+    if !config.is_chained_component_repo(&repo.to_string()) {
+        return Ok(false);
+    }
+
+    let advisory_pr = QueuePullRequest::with_base_branch(
+        repo.to_string(),
+        pr.number.0,
+        component.name,
+        pr.head.sha.to_string(),
+        pr.head.name.clone(),
+        pr.head.sha.to_string(),
+        pr.base.name.clone(),
+    );
+    let external_id = advisory_gate_external_id(&advisory_pr);
+    let deploy_repo = deploy_repo(ctx, config)?;
+    let dev = GithubDevManifestReader::new(
+        &deploy_repo.client,
+        &config.manifest_branch,
+        &config.dev_manifest_path,
+    );
+    let manager = QueueManager::new(config.registered_components());
+    let world = manager
+        .candidate_world(&dev, vec![advisory_pr.clone()])
+        .await?;
+    let gate_run = RecordedGateRun {
+        id: 0,
+        external_id: external_id.clone(),
+        status: crate::henosis::queue::RUNNING_STATUS.to_string(),
+        world,
+        merge_commit_sha: None,
+        dev_bump_commit_sha: None,
+    };
+
+    let reporter =
+        GithubGateCheckReporter::new(&ctx.repositories, &config.advisory_gate_check_run_name);
+    reporter
+        .create_in_progress_check(&advisory_pr, &external_id)
+        .await?;
+    let gate_dev = GithubDevManifestReader::new(
+        &deploy_repo.client,
+        &config.manifest_branch,
+        &config.dev_manifest_path,
+    );
+    let gate_executor = CliGateExecutor::new(&config.gate_command, gate_dev);
+    let mut store = PgQueueStore::new(ctx.db.pool().clone());
+    match gate_executor.execute(&gate_run).await {
+        Ok(report) if report.ok => {
+            store
+                .record_advisory_gate_status(&advisory_pr, &external_id, ADVISORY_PASSED_STATUS)
+                .await?;
+            reporter
+                .resolve_check_run(
+                    &external_id,
+                    CheckConclusion::Success,
+                    &report.check_run_summary(),
+                )
+                .await?;
+        }
+        Ok(report) => {
+            store
+                .record_advisory_gate_status(&advisory_pr, &external_id, ADVISORY_FAILED_STATUS)
+                .await?;
+            reporter
+                .resolve_check_run(
+                    &external_id,
+                    CheckConclusion::Failure,
+                    &report.check_run_summary(),
+                )
+                .await?;
+        }
+        Err(error) => {
+            store
+                .record_advisory_gate_status(&advisory_pr, &external_id, ADVISORY_FAILED_STATUS)
+                .await?;
+            reporter
+                .resolve_check_run(
+                    &external_id,
+                    CheckConclusion::Failure,
+                    &format!("Advisory gate could not run: {error:#}"),
+                )
+                .await?;
+            return Err(error);
+        }
+    }
+
+    reconcile_status_for_pr(ctx, repo, pr.number).await?;
+    Ok(true)
 }
 
 /// On startup, invalidate any gate runs left in transient states (pending, running).
@@ -357,9 +468,19 @@ pub async fn on_pr_push(
     let manager = QueueManager::new(config.registered_components());
     let mut store = PgQueueStore::new(ctx.db.pool().clone());
     let reporter = GithubGateCheckReporter::new(&ctx.repositories, &config.gate_check_run_name);
-    manager
+    let invalidated = manager
         .invalidate_pr_push(&mut store, &reporter, &pushed)
-        .await
+        .await?;
+    if invalidated {
+        return Ok(true);
+    }
+
+    if config.is_chained_component_repo(&repo.to_string()) {
+        store.reenqueue_pr(&pushed).await?;
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 pub async fn reconcile_status_for_pr(
@@ -509,6 +630,7 @@ async fn reconcile_environment_status(
         let pr_number = PullRequestNumber(member.key.number);
         let pr = repo.client.get_pull_request(pr_number).await?;
         let gate = queue_store.latest_gate_status(&member.key).await?;
+        let advisory_gate = queue_store.latest_advisory_gate_status(&member.key).await?;
         let snapshot = StatusSnapshot {
             environment: EnvironmentStatus {
                 environment: environment.clone(),
@@ -524,6 +646,7 @@ async fn reconcile_environment_status(
                 &config.deploy_repo,
                 &environment_branch(&environment.id),
             ),
+            advisory_gate,
             gate,
             render: render.clone(),
         };

@@ -99,15 +99,19 @@ pub async fn merge_queue_tick(
     let repos: Vec<Arc<RepositoryState>> = ctx.repositories.repositories();
 
     for repo in repos {
-        if let Some(config) = ctx.henosis_config.as_ref()
-            && (config.is_component_repo(&repo.repository().to_string())
-                || config.deploy_repo == repo.repository().to_string())
-        {
-            tracing::debug!(
-                "Skipping bors repo-local merge queue for Henosis-managed repo {}",
-                repo.repository()
-            );
-            continue;
+        if let Some(config) = ctx.henosis_config.as_ref() {
+            let repo_name = repo.repository().to_string();
+            if config.deploy_repo == repo_name {
+                tracing::debug!("Skipping bors repo-local merge queue for deploy repo {repo_name}");
+                continue;
+            }
+            if config.is_component_repo(&repo_name) && !config.is_chained_component_repo(&repo_name)
+            {
+                tracing::debug!(
+                    "Skipping bors repo-local merge queue for gate-only Henosis repo {repo_name}"
+                );
+                continue;
+            }
         }
 
         let repo_name = repo.repository().to_string();
@@ -273,6 +277,10 @@ async fn handle_successful_build(
     approval_info: &ApprovalInfo,
     pr_num: PullRequestNumber,
 ) -> anyhow::Result<()> {
+    if crate::henosis::service::is_chained_component_repo(ctx, repo.repository()) {
+        return handle_successful_chained_build(repo, ctx, pr, auto_build, pr_num).await;
+    }
+
     let commit_sha = CommitSha(auto_build.commit_sha.clone());
     let workflow_runs = load_workflow_runs(repo, &ctx.db, auto_build)
         .await
@@ -326,6 +334,31 @@ async fn handle_successful_build(
             .await?;
     }
 
+    Ok(())
+}
+
+async fn handle_successful_chained_build(
+    repo: &RepositoryState,
+    ctx: &BorsContext,
+    pr: &PullRequestModel,
+    auto_build: &BuildModel,
+    pr_num: PullRequestNumber,
+) -> anyhow::Result<()> {
+    let current_base = repo.client.get_branch_sha(&pr.base_branch).await?;
+    if current_base.as_ref() != auto_build.parent {
+        tracing::info!(
+            "Auto build for chained Henosis PR {pr_num} is stale: tested base={}, current base={}",
+            auto_build.parent,
+            current_base.as_ref()
+        );
+        ctx.db.clear_auto_build(pr).await?;
+        return Ok(());
+    }
+
+    tracing::info!(
+        "Auto build for chained Henosis PR {pr_num} validated commit {}; deferring base fast-forward to Henosis global queue",
+        auto_build.commit_sha
+    );
     Ok(())
 }
 
@@ -820,11 +853,17 @@ pub fn start_merge_queue(
 #[cfg(test)]
 mod tests {
     use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
+    use tempfile::TempDir;
 
     use crate::bors::with_mocked_time;
+    use crate::github::GithubRepoName;
     use crate::github::api::client::HideCommentReason;
-    use crate::tests::{BorsBuilder, Commit, GitHub, run_test};
+    use crate::henosis::config::HenosisConfig;
+    use crate::tests::{BorsBuilder, Commit, GitHub, Repo, run_test};
     use crate::tests::{default_branch_name, default_repo_name};
     use crate::{
         bors::{
@@ -834,6 +873,147 @@ mod tests {
         database::{BuildStatus, MergeableState, OctocrabMergeableState},
         tests::{BorsTester, BranchPushBehaviour, BranchPushError, Comment},
     };
+
+    fn deploy_repo_name() -> GithubRepoName {
+        GithubRepoName::new("rust-lang", "deploy")
+    }
+
+    fn d19_manifest(component_ref: &str) -> String {
+        format!(
+            r#"
+[environment]
+id = "dev"
+
+[components.borstest]
+repo = "{}"
+ref = "{component_ref}"
+digest = "sha256:dev"
+"#,
+            default_repo_name()
+        )
+    }
+
+    fn d19_github(default_config: &str) -> GitHub {
+        let mut github = GitHub::default().with_default_config(default_config);
+        github.default_repo().lock().set_file(
+            "henosis/package.json",
+            r#"{"name":"@henosis/borstest","dependencies":{},"henosis":{"component":"borstest"}}"#,
+        );
+        let org = github.get_user("rust-lang").unwrap().clone();
+        let mut deploy = Repo::new(org, "deploy");
+        deploy.config = "merge_queue_enabled = false".to_string();
+        deploy.set_file("dev.toml", &d19_manifest("main-sha1"));
+        github.add_repo(deploy);
+        github
+    }
+
+    fn d19_config(gate_command: &str, mode: Option<&str>) -> HenosisConfig {
+        let mode = mode
+            .map(|mode| format!(r#"mode = "{mode}""#))
+            .unwrap_or_default();
+        toml::from_str(&format!(
+            r#"
+deploy_repo = "{}"
+gate_command = "{gate_command}"
+render_workflow_name = "Workflow1"
+
+[[components]]
+name = "borstest"
+repo = "{}"
+{mode}
+
+[[environments]]
+id = "dev"
+manifest_path = "dev.toml"
+"#,
+            deploy_repo_name(),
+            default_repo_name(),
+        ))
+        .unwrap()
+    }
+
+    fn d19_non_henosis_config() -> HenosisConfig {
+        toml::from_str(
+            r#"
+deploy_repo = "rust-lang/deploy"
+
+[[components]]
+name = "service-a"
+repo = "rust-lang/service-a"
+mode = "chained"
+
+[[environments]]
+id = "dev"
+manifest_path = "dev.toml"
+"#,
+        )
+        .unwrap()
+    }
+
+    fn gate_script(ok: bool) -> (TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gate.sh");
+        let report = if ok {
+            r#"{"ok":true,"failures":[]}"#
+        } else {
+            r#"{"ok":false,"failures":[{"component":"borstest","consumerOf":"service-b","kind":"compile","message":"service-b consumes a changed borstest contract","excerpt":"Property 'message' does not exist"}]}"#
+        };
+        fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+set -eu
+output=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output)
+      output="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+test -n "$output"
+printf '%s\n' '{report}' > "$output/report.json"
+"#
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).unwrap();
+        }
+        let path = path.to_string_lossy().to_string();
+        (dir, path)
+    }
+
+    fn branch_sha(ctx: &BorsTester, repo: &GithubRepoName, branch: &str) -> String {
+        ctx.get_repo(repo)
+            .lock()
+            .get_branch_by_name(branch)
+            .unwrap()
+            .sha()
+    }
+
+    fn deploy_manifest(ctx: &BorsTester) -> String {
+        ctx.get_repo(deploy_repo_name())
+            .lock()
+            .get_file("dev.toml")
+            .unwrap()
+    }
+
+    fn check_count(ctx: &BorsTester, repo: &GithubRepoName, name: &str) -> usize {
+        ctx.get_repo(repo)
+            .lock()
+            .check_runs()
+            .iter()
+            .filter(|check| check.name == name)
+            .count()
+    }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn disabled_merge_queue(pool: sqlx::PgPool) {
@@ -852,6 +1032,175 @@ merge_queue_enabled = false
                         .get_pending_builds(&default_repo_name())
                         .await?
                         .is_empty()
+                );
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_chained_happy_path_defers_ff_until_final_gate(pool: sqlx::PgPool) {
+        let (_gate_dir, gate_command) = gate_script(true);
+        BorsBuilder::new(pool)
+            .github(d19_github(
+                r#"
+merge_queue_enabled = true
+report_merge_conflicts = true
+"#,
+            ))
+            .henosis_config(d19_config(&gate_command, Some("chained")))
+            .run_test(async |ctx: &mut BorsTester| {
+                let service_repo = default_repo_name();
+                let main_before = branch_sha(ctx, &service_repo, "main");
+
+                ctx.approve(()).await?;
+                assert_eq!(check_count(ctx, &service_repo, "Henosis advisory gate"), 1);
+
+                ctx.start_auto_build(()).await?;
+                let tested_auto_commit = ctx.auto_branch().sha();
+                ctx.workflow_full_success(ctx.auto_workflow()).await?;
+                ctx.run_merge_queue_until_merge_attempt().await;
+
+                assert_eq!(branch_sha(ctx, &service_repo, "main"), main_before);
+                ctx.pr(()).await.expect_auto_build(|build| {
+                    build.status == BuildStatus::Success && build.commit_sha == tested_auto_commit
+                });
+
+                ctx.run_henosis_queue_now().await?.unwrap();
+
+                assert_eq!(branch_sha(ctx, &service_repo, "main"), tested_auto_commit);
+                assert!(deploy_manifest(ctx).contains(&format!(r#"ref = "{tested_auto_commit}""#)));
+                assert_eq!(check_count(ctx, &service_repo, "Henosis gate"), 1);
+                ctx.pr(()).await.expect_status(PullRequestStatus::Merged);
+                let landed = ctx.get_next_comment_text(()).await?;
+                assert!(landed.contains(&format!("Landed as {tested_auto_commit}")));
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_chained_gate_red_after_ci_green_leaves_unmerged(pool: sqlx::PgPool) {
+        let (_gate_dir, gate_command) = gate_script(false);
+        BorsBuilder::new(pool)
+            .github(d19_github(
+                r#"
+merge_queue_enabled = true
+report_merge_conflicts = true
+"#,
+            ))
+            .henosis_config(d19_config(&gate_command, Some("chained")))
+            .run_test(async |ctx: &mut BorsTester| {
+                let service_repo = default_repo_name();
+                let main_before = branch_sha(ctx, &service_repo, "main");
+                let deploy_before = branch_sha(ctx, &deploy_repo_name(), "main");
+
+                ctx.approve(()).await?;
+                ctx.start_auto_build(()).await?;
+                ctx.workflow_full_success(ctx.auto_workflow()).await?;
+                ctx.run_merge_queue_until_merge_attempt().await;
+                ctx.run_henosis_queue_now().await?.unwrap();
+
+                assert_eq!(branch_sha(ctx, &service_repo, "main"), main_before);
+                assert_eq!(branch_sha(ctx, &deploy_repo_name(), "main"), deploy_before);
+                assert!(deploy_manifest(ctx).contains(r#"ref = "main-sha1""#));
+                ctx.pr(()).await.expect_status(PullRequestStatus::Open);
+                let failure = ctx.get_next_comment_text(()).await?;
+                assert!(failure.contains("Henosis gate failed"));
+                assert!(failure.contains("service-b"));
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_chained_push_after_repo_validation_requeues_repo_stage(pool: sqlx::PgPool) {
+        let (_gate_dir, gate_command) = gate_script(true);
+        BorsBuilder::new(pool)
+            .github(d19_github(
+                r#"
+merge_queue_enabled = true
+report_merge_conflicts = true
+"#,
+            ))
+            .henosis_config(d19_config(&gate_command, Some("chained")))
+            .run_test(async |ctx: &mut BorsTester| {
+                ctx.approve(()).await?;
+                ctx.start_auto_build(()).await?;
+                let first_auto = ctx.auto_branch().sha();
+                ctx.workflow_full_success(ctx.auto_workflow()).await?;
+                ctx.run_merge_queue_until_merge_attempt().await;
+                ctx.pr(()).await.expect_auto_build(|build| {
+                    build.status == BuildStatus::Success && build.commit_sha == first_auto
+                });
+
+                ctx.push_to_pr((), Commit::new("pr-1-new", "new PR commit"))
+                    .await?;
+                ctx.modify_pr_in_gh((), |pr| {
+                    pr.mergeable_state = OctocrabMergeableState::Clean;
+                });
+                ctx.run_mergeability_check().await?;
+
+                ctx.pr(())
+                    .await
+                    .expect_approved_sha("pr-1-new")
+                    .expect_no_auto_build();
+
+                ctx.start_auto_build(()).await?;
+                let second_auto = ctx.auto_branch().sha();
+                assert_ne!(first_auto, second_auto);
+                ctx.pr(()).await.expect_auto_build(|build| {
+                    build.status == BuildStatus::Pending && build.commit_sha == second_auto
+                });
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_gate_only_mode_still_uses_global_queue_only(pool: sqlx::PgPool) {
+        let (_gate_dir, gate_command) = gate_script(true);
+        BorsBuilder::new(pool)
+            .github(d19_github(
+                r#"
+merge_queue_enabled = true
+report_merge_conflicts = true
+"#,
+            ))
+            .henosis_config(d19_config(&gate_command, None))
+            .run_test(async |ctx: &mut BorsTester| {
+                let service_repo = default_repo_name();
+                let main_before = branch_sha(ctx, &service_repo, "main");
+
+                ctx.approve(()).await?;
+                ctx.run_merge_queue_now().await;
+                assert!(ctx.db().get_pending_builds(&service_repo).await?.is_empty());
+                assert_eq!(branch_sha(ctx, &service_repo, "main"), main_before);
+                assert_eq!(check_count(ctx, &service_repo, "Henosis advisory gate"), 0);
+
+                ctx.run_henosis_queue_now().await?.unwrap();
+                let main_after = branch_sha(ctx, &service_repo, "main");
+                assert_ne!(main_after, main_before);
+                assert!(main_after.starts_with("squash-pr-1-"));
+                assert!(deploy_manifest(ctx).contains(&format!(r#"ref = "{main_after}""#)));
+                let landed = ctx.get_next_comment_text(()).await?;
+                assert!(landed.contains(&format!("Landed as {main_after}")));
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_config_does_not_touch_upstream_non_henosis_repo(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .henosis_config(d19_non_henosis_config())
+            .run_test(async |ctx: &mut BorsTester| {
+                ctx.approve(()).await?;
+                ctx.start_and_finish_auto_build(()).await?;
+                ctx.pr(()).await.expect_status(PullRequestStatus::Merged);
+                assert_eq!(
+                    check_count(ctx, &default_repo_name(), "Henosis advisory gate"),
+                    0
                 );
                 Ok(())
             })
