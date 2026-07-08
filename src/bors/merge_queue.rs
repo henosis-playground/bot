@@ -92,9 +92,9 @@ pub async fn merge_queue_tick(
     ctx: Arc<BorsContext>,
     mergeability_sender: &MergeabilityQueueSender,
 ) -> anyhow::Result<()> {
-    if ctx.henosis_config.is_some() {
-        crate::henosis::service::tick_queue(&ctx).await?;
-    }
+    // Henosis queue is driven exclusively by the HenosisQueueTick scheduler
+    // (see process.rs:consume_henosis_queue_ticks). Running it here too would
+    // cause concurrent tick() calls and duplicate-key races on gate_run.
 
     let repos: Vec<Arc<RepositoryState>> = ctx.repositories.repositories();
 
