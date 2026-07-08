@@ -299,7 +299,7 @@ LIMIT 1
             .iter()
             .find(|component| component.repo == repo)
             .with_context(|| format!("No registered component found for `{repo}`"))?;
-        let number: i32 = row.try_get("number")?;
+        let number: i64 = row.try_get("number")?;
         let head_branch: String = row.try_get("head_branch")?;
         let approved_sha: String = row
             .try_get::<Option<String>, _>("approved_sha")?
