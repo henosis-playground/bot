@@ -70,12 +70,19 @@ impl DeployRepoWriter for GithubDeployRepoWriter<'_> {
     }
 
     async fn create_branch(&mut self, branch: &str) -> anyhow::Result<()> {
-        let base = self.client.get_branch_sha(&self.lockfile_branch).await?;
-        match self.client.create_branch(branch, &base).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.to_string().contains("Reference already exists") => Ok(()),
-            Err(error) => Err(error),
+        if self.client.get_branch_sha(branch).await.is_ok() {
+            return Ok(());
         }
+
+        let base = self.client.get_branch_sha(&self.lockfile_branch).await?;
+        if let Err(error) = self.client.create_branch(branch, &base).await {
+            if self.client.get_branch_sha(branch).await.is_ok() {
+                return Ok(());
+            }
+            return Err(error);
+        }
+
+        Ok(())
     }
 
     async fn delete_branch(&mut self, branch: &str) -> anyhow::Result<()> {
