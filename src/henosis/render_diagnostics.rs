@@ -125,14 +125,30 @@ fn log_excerpt(logs: &str, step_name: Option<&str>) -> Option<String> {
         relevant
     };
 
-    let from = relevant.len().saturating_sub(LOG_EXCERPT_LINES);
+    let end = relevant
+        .iter()
+        .rposition(|line| diagnostic_log_line(line))
+        .map(|index| index + 1)
+        .unwrap_or(relevant.len());
+    let from = end.saturating_sub(LOG_EXCERPT_LINES);
     Some(
-        relevant[from..]
+        relevant[from..end]
             .iter()
             .map(|line| line.replace("```", "'''"))
             .collect::<Vec<_>>()
             .join("\n"),
     )
+}
+
+fn diagnostic_log_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    line.contains("##[error]")
+        || line.contains("[ERR_")
+        || lower.contains("error:")
+        || lower.contains("failed")
+        || lower.contains("exception")
+        || lower.contains("panic")
+        || lower.contains("exit code")
 }
 
 fn clean_log_line(line: &str) -> String {
@@ -165,5 +181,30 @@ mod tests {
             log_excerpt(logs, Some("Render dev")).unwrap(),
             "Render dev\nline 1\nline 2"
         );
+    }
+
+    #[test]
+    fn focuses_on_failure_before_post_job_cleanup() {
+        let cleanup = (0..40)
+            .map(|index| format!("2026-07-08T10:01:{index:02}.000Z cleanup line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let logs = format!(
+            "\
+2026-07-08T10:00:00.000Z Render changed manifests
+2026-07-08T10:00:01.000Z Rendering preview.toml
+2026-07-08T10:00:02.000Z Failed to evaluate service-b: live render failure first 2026-07-08
+2026-07-08T10:00:03.000Z [ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL] Command failed with exit code 1
+2026-07-08T10:00:04.000Z ##[error]Process completed with exit code 1.
+2026-07-08T10:00:05.000Z Post job cleanup.
+{cleanup}
+"
+        );
+
+        let excerpt = log_excerpt(&logs, Some("Render changed manifests")).unwrap();
+
+        assert!(excerpt.contains("live render failure first 2026-07-08"));
+        assert!(excerpt.contains("##[error]Process completed with exit code 1."));
+        assert!(!excerpt.contains("cleanup line 39"));
     }
 }
