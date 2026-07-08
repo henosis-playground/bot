@@ -435,6 +435,28 @@ impl GithubRepositoryClient {
         Ok(())
     }
 
+    pub async fn update_pull_request_body(
+        &self,
+        pr: PullRequestNumber,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        perform_retryable(
+            "update_pull_request_body",
+            RetryMethod::default(),
+            || async {
+                self.client
+                    .pulls(&self.repository().owner, &self.repository().name)
+                    .update(pr.0)
+                    .body(body.to_string())
+                    .send()
+                    .await
+                    .with_context(|| format!("Cannot update body for PR {}", self.format_pr(pr)))
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Set the given branch to a commit with the given `sha`.
     pub async fn set_branch_to_sha(
         &self,

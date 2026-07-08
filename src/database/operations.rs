@@ -168,28 +168,28 @@ pub(crate) async fn upsert_pull_request(
                 RETURNING *
             )
             SELECT
-                pr.id,
-                pr.repository as "repository: GithubRepoName",
+                pr.id as "id!",
+                pr.repository as "repository!: GithubRepoName",
                 pr.number as "number!: i64",
-                pr.title,
-                pr.author,
-                pr.assignees as "assignees: Assignees",
+                pr.title as "title!",
+                pr.author as "author!",
+                pr.assignees as "assignees!: Assignees",
                 (
                     pr.approved_by,
                     pr.approved_sha
                 ) AS "approval_status!: ApprovalStatus",
-                pr.status as "status: PullRequestStatus",
+                pr.status as "status!: PullRequestStatus",
                 pr.priority,
                 pr.rollup as "rollup: RollupMode",
                 (
                     pr.delegatee_id,
                     pr.delegated_permission
                 ) AS "delegation!: DelegationStatus",
-                pr.head_branch,
-                pr.base_branch,
-                pr.mergeable_state as "mergeable_state: MergeableState",
-                pr.mergeable_state_is_stale,
-                pr.created_at as "created_at: DateTime<Utc>",
+                pr.head_branch as "head_branch!",
+                pr.base_branch as "base_branch!",
+                pr.mergeable_state as "mergeable_state!: MergeableState",
+                pr.mergeable_state_is_stale as "mergeable_state_is_stale!",
+                pr.created_at as "created_at!: DateTime<Utc>",
                 try_build AS "try_build: BuildModel",
                 auto_build AS "auto_build: BuildModel"
             FROM upserted_pr as pr
@@ -223,28 +223,28 @@ pub(crate) async fn get_nonclosed_pull_requests(
             PullRequestModel,
             r#"
             SELECT
-                pr.id,
-                pr.repository as "repository: GithubRepoName",
+                pr.id as "id!",
+                pr.repository as "repository!: GithubRepoName",
                 pr.number as "number!: i64",
-                pr.title,
-                pr.author,
-                pr.assignees as "assignees: Assignees",
+                pr.title as "title!",
+                pr.author as "author!",
+                pr.assignees as "assignees!: Assignees",
                 (
                     pr.approved_by,
                     pr.approved_sha
                 ) AS "approval_status!: ApprovalStatus",
-                pr.status as "status: PullRequestStatus",
+                pr.status as "status!: PullRequestStatus",
                 pr.priority,
                 pr.rollup as "rollup: RollupMode",
                 (
                     pr.delegatee_id,
                     pr.delegated_permission
                 ) AS "delegation!: DelegationStatus",
-                pr.head_branch,
-                pr.base_branch,
-                pr.mergeable_state as "mergeable_state: MergeableState",
-                pr.mergeable_state_is_stale,
-                pr.created_at as "created_at: DateTime<Utc>",
+                pr.head_branch as "head_branch!",
+                pr.base_branch as "base_branch!",
+                pr.mergeable_state as "mergeable_state!: MergeableState",
+                pr.mergeable_state_is_stale as "mergeable_state_is_stale!",
+                pr.created_at as "created_at!: DateTime<Utc>",
                 try_build AS "try_build: BuildModel",
                 auto_build AS "auto_build: BuildModel"
             FROM pull_request as pr
@@ -307,28 +307,28 @@ pub(crate) async fn get_prs_with_stale_mergeability_or_approved(
             PullRequestModel,
             r#"
             SELECT
-                pr.id,
-                pr.repository as "repository: GithubRepoName",
+                pr.id as "id!",
+                pr.repository as "repository!: GithubRepoName",
                 pr.number as "number!: i64",
-                pr.title,
-                pr.author,
-                pr.assignees as "assignees: Assignees",
+                pr.title as "title!",
+                pr.author as "author!",
+                pr.assignees as "assignees!: Assignees",
                 (
                     pr.approved_by,
                     pr.approved_sha
                 ) AS "approval_status!: ApprovalStatus",
-                pr.status as "status: PullRequestStatus",
+                pr.status as "status!: PullRequestStatus",
                 pr.priority,
                 pr.rollup as "rollup: RollupMode",
                 (
                     pr.delegatee_id,
                     pr.delegated_permission
                 ) AS "delegation!: DelegationStatus",
-                pr.head_branch,
-                pr.base_branch,
-                pr.mergeable_state as "mergeable_state: MergeableState",
-                pr.mergeable_state_is_stale,
-                pr.created_at as "created_at: DateTime<Utc>",
+                pr.head_branch as "head_branch!",
+                pr.base_branch as "base_branch!",
+                pr.mergeable_state as "mergeable_state!: MergeableState",
+                pr.mergeable_state_is_stale as "mergeable_state_is_stale!",
+                pr.created_at as "created_at!: DateTime<Utc>",
                 try_build AS "try_build: BuildModel",
                 auto_build AS "auto_build: BuildModel"
             FROM pull_request as pr
@@ -366,28 +366,28 @@ pub(crate) async fn set_stale_mergeability_status_by_base_branch(
                 RETURNING pull_request.*
             )
             SELECT
-                pr.id,
-                pr.repository as "repository: GithubRepoName",
+                pr.id as "id!",
+                pr.repository as "repository!: GithubRepoName",
                 pr.number as "number!: i64",
-                pr.title,
-                pr.author,
-                pr.assignees as "assignees: Assignees",
+                pr.title as "title!",
+                pr.author as "author!",
+                pr.assignees as "assignees!: Assignees",
                 (
                     pr.approved_by,
                     pr.approved_sha
                 ) AS "approval_status!: ApprovalStatus",
-                pr.status as "status: PullRequestStatus",
+                pr.status as "status!: PullRequestStatus",
                 pr.priority,
                 pr.rollup as "rollup: RollupMode",
                 (
                     pr.delegatee_id,
                     pr.delegated_permission
                 ) AS "delegation!: DelegationStatus",
-                pr.head_branch,
-                pr.base_branch,
-                pr.mergeable_state as "mergeable_state: MergeableState",
-                pr.mergeable_state_is_stale,
-                pr.created_at as "created_at: DateTime<Utc>",
+                pr.head_branch as "head_branch!",
+                pr.base_branch as "base_branch!",
+                pr.mergeable_state as "mergeable_state!: MergeableState",
+                pr.mergeable_state_is_stale as "mergeable_state_is_stale!",
+                pr.created_at as "created_at!: DateTime<Utc>",
                 try_build AS "try_build: BuildModel",
                 auto_build AS "auto_build: BuildModel"
             FROM pr

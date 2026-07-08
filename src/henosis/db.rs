@@ -4,7 +4,8 @@ use sqlx::{PgPool, Postgres, Row};
 
 use crate::henosis::config::RegisteredComponent;
 use crate::henosis::environment::{
-    EnvironmentState, EnvironmentStore, PreviewPullRequest, PullRequestKey,
+    EnvironmentState, EnvironmentStore, PreviewPullRequest, PullRequestKey, RenderOutcome,
+    RenderStatus,
 };
 use crate::henosis::merge::MergeStore;
 use crate::henosis::queue::{
@@ -20,6 +21,89 @@ pub struct PgEnvironmentStore {
 impl PgEnvironmentStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub async fn active_preview_environments_for_commit_sha(
+        &self,
+        commit_sha: &str,
+    ) -> anyhow::Result<Vec<EnvironmentState>> {
+        let rows = sqlx::query(
+            r#"
+SELECT DISTINCT e.id, e.manifest_path, e.is_preview
+FROM manifest_revision AS mr
+JOIN environment AS e ON e.id = mr.environment_id
+WHERE mr.commit_sha = $1
+  AND e.retired_at IS NULL
+  AND e.is_preview = TRUE
+ORDER BY e.id
+"#,
+        )
+        .bind(commit_sha)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(EnvironmentState {
+                    id: row.try_get("id")?,
+                    manifest_path: row.try_get("manifest_path")?,
+                    is_preview: row.try_get("is_preview")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn record_render_outcome(&self, outcome: &RenderOutcome) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+INSERT INTO environment_render (
+    environment_id,
+    commit_sha,
+    status,
+    run_url,
+    excerpt
+)
+VALUES ($1, $2, $3, $4, $5)
+"#,
+        )
+        .bind(&outcome.environment_id)
+        .bind(&outcome.commit_sha)
+        .bind(outcome.status.as_str())
+        .bind(&outcome.run_url)
+        .bind(&outcome.excerpt)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn latest_render_outcome(
+        &self,
+        environment_id: &str,
+    ) -> anyhow::Result<Option<RenderOutcome>> {
+        let row = sqlx::query(
+            r#"
+SELECT environment_id, commit_sha, status, run_url, excerpt
+FROM environment_render
+WHERE environment_id = $1
+ORDER BY created_at DESC, id DESC
+LIMIT 1
+"#,
+        )
+        .bind(environment_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| {
+            let status: String = row.try_get("status")?;
+            Ok(RenderOutcome {
+                environment_id: row.try_get("environment_id")?,
+                commit_sha: row.try_get("commit_sha")?,
+                status: RenderStatus::try_from(status.as_str())?,
+                run_url: row.try_get("run_url")?,
+                excerpt: row.try_get("excerpt")?,
+            })
+        })
+        .transpose()
     }
 }
 
@@ -38,15 +122,17 @@ ON CONFLICT (id)
 DO UPDATE SET
     manifest_path = EXCLUDED.manifest_path,
     is_preview = EXCLUDED.is_preview,
-    retired_at = NULL,
     updated_at = NOW()
+WHERE environment.retired_at IS NULL
+RETURNING id
 "#,
         )
         .bind(id)
         .bind(manifest_path)
         .bind(is_preview)
-        .execute(&self.pool)
-        .await?;
+        .fetch_optional(&self.pool)
+        .await?
+        .with_context(|| format!("Cannot reuse retired environment id `{id}`"))?;
         Ok(())
     }
 
@@ -149,6 +235,29 @@ LIMIT 1
         .transpose()
     }
 
+    async fn active_environment(&self, id: &str) -> anyhow::Result<Option<EnvironmentState>> {
+        let row = sqlx::query(
+            r#"
+SELECT id, manifest_path, is_preview
+FROM environment
+WHERE id = $1
+  AND retired_at IS NULL
+"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| {
+            Ok(EnvironmentState {
+                id: row.try_get("id")?,
+                manifest_path: row.try_get("manifest_path")?,
+                is_preview: row.try_get("is_preview")?,
+            })
+        })
+        .transpose()
+    }
+
     async fn active_members(
         &self,
         environment_id: &str,
@@ -214,6 +323,33 @@ impl PgQueueStore {
             pool,
             lock_conn: None,
         }
+    }
+
+    pub async fn pull_requests_for_dev_bump_commit_sha(
+        &self,
+        commit_sha: &str,
+    ) -> anyhow::Result<Vec<PullRequestKey>> {
+        let rows = sqlx::query(
+            r#"
+SELECT DISTINCT cwm.repo, cwm.pr_number
+FROM gate_run AS gr
+JOIN candidate_world AS cw ON cw.gate_run_id = gr.id
+JOIN candidate_world_member AS cwm ON cwm.candidate_world_id = cw.id
+WHERE gr.dev_bump_commit_sha = $1
+ORDER BY cwm.repo, cwm.pr_number
+"#,
+        )
+        .bind(commit_sha)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let repo: String = row.try_get("repo")?;
+                let number: i64 = row.try_get("pr_number")?;
+                Ok(PullRequestKey::new(repo, number as u64))
+            })
+            .collect()
     }
 }
 

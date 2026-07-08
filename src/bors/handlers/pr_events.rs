@@ -16,7 +16,7 @@ use crate::bors::{AUTO_BRANCH_NAME, BorsContext, hide_tagged_comments};
 use crate::bors::{PullRequestStatus, RepositoryState};
 use crate::database::{PullRequestModel, UpsertPullRequestParams};
 use crate::github::CommitSha;
-use crate::henosis::service::{environment_change_comment, on_pr_push};
+use crate::henosis::service::on_pr_push;
 use std::sync::Arc;
 
 pub(super) async fn handle_pull_request_edited(
@@ -342,20 +342,8 @@ async fn create_henosis_preview_for_pr(
     ctx: &BorsContext,
     pr: &crate::github::PullRequest,
 ) -> anyhow::Result<()> {
-    let Some(config) = ctx.henosis_config.as_ref() else {
-        return Ok(());
-    };
-    let Some(change) =
-        crate::henosis::service::open_preview_environment(ctx, repo_state.repository(), pr).await?
-    else {
-        return Ok(());
-    };
-    if let Some(comment) = environment_change_comment(config, &change) {
-        repo_state
-            .client
-            .post_comment(pr.number, crate::bors::Comment::new(comment), db)
-            .await?;
-    }
+    let _ = db;
+    crate::henosis::service::open_preview_environment(ctx, repo_state.repository(), pr).await?;
     Ok(())
 }
 
@@ -365,21 +353,8 @@ async fn recreate_henosis_preview_for_pr(
     ctx: &BorsContext,
     pr: &crate::github::PullRequest,
 ) -> anyhow::Result<()> {
-    let Some(config) = ctx.henosis_config.as_ref() else {
-        return Ok(());
-    };
-    let Some(change) =
-        crate::henosis::service::reopen_preview_environment(ctx, repo_state.repository(), pr)
-            .await?
-    else {
-        return Ok(());
-    };
-    if let Some(comment) = environment_change_comment(config, &change) {
-        repo_state
-            .client
-            .post_comment(pr.number, crate::bors::Comment::new(comment), db)
-            .await?;
-    }
+    let _ = db;
+    crate::henosis::service::reopen_preview_environment(ctx, repo_state.repository(), pr).await?;
     Ok(())
 }
 
@@ -389,21 +364,8 @@ async fn refresh_henosis_preview_for_pr(
     ctx: &BorsContext,
     pr: &crate::github::PullRequest,
 ) -> anyhow::Result<()> {
-    let Some(config) = ctx.henosis_config.as_ref() else {
-        return Ok(());
-    };
-    let Some(change) =
-        crate::henosis::service::refresh_preview_environment(ctx, repo_state.repository(), pr)
-            .await?
-    else {
-        return Ok(());
-    };
-    if let Some(comment) = environment_change_comment(config, &change) {
-        repo_state
-            .client
-            .post_comment(pr.number, crate::bors::Comment::new(comment), db)
-            .await?;
-    }
+    let _ = db;
+    crate::henosis::service::refresh_preview_environment(ctx, repo_state.repository(), pr).await?;
     Ok(())
 }
 
@@ -413,24 +375,9 @@ async fn retire_henosis_preview_for_pr(
     ctx: &BorsContext,
     pr_number: crate::github::PullRequestNumber,
 ) -> anyhow::Result<()> {
-    let Some(config) = ctx.henosis_config.as_ref() else {
-        return Ok(());
-    };
-    let Some(change) = crate::henosis::service::retire_preview_environment(
-        ctx,
-        repo_state.repository(),
-        pr_number,
-    )
-    .await?
-    else {
-        return Ok(());
-    };
-    if let Some(comment) = environment_change_comment(config, &change) {
-        repo_state
-            .client
-            .post_comment(pr_number, crate::bors::Comment::new(comment), db)
-            .await?;
-    }
+    let _ = db;
+    crate::henosis::service::retire_preview_environment(ctx, repo_state.repository(), pr_number)
+        .await?;
     Ok(())
 }
 

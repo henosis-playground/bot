@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use anyhow::Context;
 use indexmap::IndexMap;
@@ -87,6 +88,42 @@ pub struct EnvironmentStatus {
     pub members: Vec<PreviewPullRequest>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderStatus {
+    Success,
+    Failure,
+}
+
+impl RenderStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+impl TryFrom<&str> for RenderStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "success" => Ok(Self::Success),
+            "failure" => Ok(Self::Failure),
+            _ => anyhow::bail!("unknown render status `{value}`"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderOutcome {
+    pub environment_id: String,
+    pub commit_sha: String,
+    pub status: RenderStatus,
+    pub run_url: String,
+    pub excerpt: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeployWriteResult {
     pub commit_sha: String,
@@ -129,6 +166,7 @@ pub trait EnvironmentStore {
         &self,
         key: &PullRequestKey,
     ) -> anyhow::Result<Option<EnvironmentState>>;
+    async fn active_environment(&self, id: &str) -> anyhow::Result<Option<EnvironmentState>>;
     async fn active_members(&self, environment_id: &str)
     -> anyhow::Result<Vec<PreviewPullRequest>>;
     async fn record_manifest_revision(
@@ -138,13 +176,43 @@ pub trait EnvironmentStore {
     ) -> anyhow::Result<()>;
 }
 
+pub trait EnvironmentIdGenerator {
+    fn new_preview_environment_id(&self) -> String;
+}
+
+#[derive(Default)]
+pub struct RandomEnvironmentIdGenerator;
+
+impl EnvironmentIdGenerator for RandomEnvironmentIdGenerator {
+    fn new_preview_environment_id(&self) -> String {
+        let mut bytes = rand::random::<[u8; 16]>();
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        preview_environment_id(bytes)
+    }
+}
+
 pub struct EnvironmentManager {
     components: Vec<RegisteredComponent>,
+    id_generator: Arc<dyn EnvironmentIdGenerator + Send + Sync>,
 }
 
 impl EnvironmentManager {
     pub fn new(components: Vec<RegisteredComponent>) -> Self {
-        Self { components }
+        Self {
+            components,
+            id_generator: Arc::new(RandomEnvironmentIdGenerator),
+        }
+    }
+
+    pub fn with_id_generator(
+        components: Vec<RegisteredComponent>,
+        id_generator: Arc<dyn EnvironmentIdGenerator + Send + Sync>,
+    ) -> Self {
+        Self {
+            components,
+            id_generator,
+        }
     }
 
     pub async fn open_pr<S, W, R, D>(
@@ -162,11 +230,35 @@ impl EnvironmentManager {
         R: ComponentPackageReader,
         D: DevManifestReader,
     {
-        let id = solo_environment_id(&pr.key.repo, pr.key.number);
+        let previous = store.environment_for_pr(&pr.key).await?;
+        let id = self.id_generator.new_preview_environment_id();
         let manifest_path = environment_manifest_path(&id);
         store.upsert_environment(&id, &manifest_path, true).await?;
         store.retire_member(&pr.key).await?;
         store.put_member(&id, &pr).await?;
+
+        let mut change = EnvironmentChange::default();
+        if let Some(previous) = previous.filter(|previous| previous.id != id) {
+            change.extend(self.retire_if_empty(store, writer, &previous).await?);
+            if store
+                .active_members(&previous.id)
+                .await
+                .map(|members| !members.is_empty())
+                .unwrap_or(false)
+            {
+                change.written.push(
+                    self.write_environment(
+                        store,
+                        writer,
+                        package_reader,
+                        dev_manifests,
+                        digest_resolver,
+                        &previous.id,
+                    )
+                    .await?,
+                );
+            }
+        }
 
         let write = self
             .write_environment(
@@ -178,11 +270,9 @@ impl EnvironmentManager {
                 &id,
             )
             .await?;
+        change.written.push(write);
 
-        Ok(EnvironmentChange {
-            written: vec![write],
-            retired: vec![],
-        })
+        Ok(change)
     }
 
     pub async fn reopen_pr<S, W, R, D>(
@@ -261,6 +351,9 @@ impl EnvironmentManager {
         &self,
         store: &mut S,
         writer: &mut W,
+        package_reader: &impl ComponentPackageReader,
+        dev_manifests: &impl DevManifestReader,
+        digest_resolver: &impl ImageDigestResolver,
         key: PullRequestKey,
     ) -> anyhow::Result<EnvironmentChange>
     where
@@ -271,7 +364,21 @@ impl EnvironmentManager {
             return Ok(EnvironmentChange::default());
         };
         store.retire_member(&key).await?;
-        self.retire_if_empty(store, writer, &environment).await
+        let mut change = self.retire_if_empty(store, writer, &environment).await?;
+        if change.retired.is_empty() {
+            change.written.push(
+                self.write_environment(
+                    store,
+                    writer,
+                    package_reader,
+                    dev_manifests,
+                    digest_resolver,
+                    &environment.id,
+                )
+                .await?,
+            );
+        }
+        Ok(change)
     }
 
     pub async fn join<S, W, R, D>(
@@ -290,18 +397,25 @@ impl EnvironmentManager {
         R: ComponentPackageReader,
         D: DevManifestReader,
     {
-        let target_id = shared_environment_id(name);
-        let target_path = environment_manifest_path(&target_id);
+        let target_id = name.trim();
+        anyhow::ensure!(
+            is_preview_environment_id(target_id),
+            "`{target_id}` is not a preview environment id"
+        );
+        let Some(target) = store.active_environment(target_id).await? else {
+            anyhow::bail!("preview environment `{target_id}` is not active");
+        };
+        anyhow::ensure!(
+            target.is_preview,
+            "environment `{target_id}` is not a preview environment"
+        );
         let previous = store.environment_for_pr(&pr.key).await?;
 
-        store
-            .upsert_environment(&target_id, &target_path, true)
-            .await?;
         store.retire_member(&pr.key).await?;
-        store.put_member(&target_id, &pr).await?;
+        store.put_member(target_id, &pr).await?;
 
         let mut change = EnvironmentChange::default();
-        if let Some(previous) = previous.filter(|previous| previous.id != target_id) {
+        if let Some(previous) = previous.filter(|previous| previous.id != target.id) {
             change.extend(self.retire_if_empty(store, writer, &previous).await?);
             if store
                 .active_members(&previous.id)
@@ -330,7 +444,7 @@ impl EnvironmentManager {
                 package_reader,
                 dev_manifests,
                 digest_resolver,
-                &target_id,
+                &target.id,
             )
             .await?,
         );
@@ -353,7 +467,7 @@ impl EnvironmentManager {
         D: DevManifestReader,
     {
         let previous = store.environment_for_pr(&pr.key).await?;
-        let solo_id = solo_environment_id(&pr.key.repo, pr.key.number);
+        let solo_id = self.id_generator.new_preview_environment_id();
         let solo_path = environment_manifest_path(&solo_id);
 
         store.upsert_environment(&solo_id, &solo_path, true).await?;
@@ -588,6 +702,50 @@ pub fn shared_environment_id(name: &str) -> String {
     slugify(name)
 }
 
+pub fn preview_environment_id(mut bytes: [u8; 16]) -> String {
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "preview-{0:02x}{1:02x}{2:02x}{3:02x}-{4:02x}{5:02x}-{6:02x}{7:02x}-{8:02x}{9:02x}-{10:02x}{11:02x}{12:02x}{13:02x}{14:02x}{15:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    )
+}
+
+pub fn is_preview_environment_id(id: &str) -> bool {
+    let Some(uuid) = id.strip_prefix("preview-") else {
+        return false;
+    };
+    if uuid.len() != 36 {
+        return false;
+    }
+    for (index, ch) in uuid.chars().enumerate() {
+        match index {
+            8 | 13 | 18 | 23 if ch == '-' => {}
+            14 if ch == '4' => {}
+            19 if matches!(ch, '8' | '9' | 'a' | 'b') => {}
+            8 | 13 | 18 | 23 | 14 | 19 => return false,
+            _ if ch.is_ascii_digit() || matches!(ch, 'a'..='f') => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 pub fn environment_manifest_path(environment_id: &str) -> String {
     format!("{environment_id}.toml")
 }
@@ -645,6 +803,8 @@ fn _graph_refs_for_docs(_refs: &[ComponentRef]) {}
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     use super::*;
     use crate::henosis::graph::{PackageHenosis, PackageJson};
@@ -720,7 +880,10 @@ mod tests {
             manifest_path: &str,
             is_preview: bool,
         ) -> anyhow::Result<()> {
-            self.retired_environments.remove(id);
+            anyhow::ensure!(
+                !self.retired_environments.contains(id),
+                "Cannot reuse retired environment id `{id}`"
+            );
             self.environments.insert(
                 id.to_string(),
                 EnvironmentState {
@@ -762,6 +925,14 @@ mod tests {
                 .members
                 .get(key)
                 .and_then(|(environment_id, _)| self.environments.get(environment_id))
+                .cloned())
+        }
+
+        async fn active_environment(&self, id: &str) -> anyhow::Result<Option<EnvironmentState>> {
+            Ok(self
+                .environments
+                .get(id)
+                .filter(|environment| !self.retired_environments.contains(&environment.id))
                 .cloned())
         }
 
@@ -903,9 +1074,33 @@ mod tests {
         manifest::parse_toml(writer.writes.get(path).unwrap()).unwrap()
     }
 
+    struct FixedIdGenerator(Mutex<VecDeque<String>>);
+
+    impl FixedIdGenerator {
+        fn new(ids: &[&str]) -> Arc<Self> {
+            Arc::new(Self(Mutex::new(
+                ids.iter().map(|id| id.to_string()).collect(),
+            )))
+        }
+    }
+
+    impl EnvironmentIdGenerator for FixedIdGenerator {
+        fn new_preview_environment_id(&self) -> String {
+            self.0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("test exhausted preview ids")
+        }
+    }
+
+    fn manager_with_ids(ids: &[&str]) -> EnvironmentManager {
+        EnvironmentManager::with_id_generator(components(), FixedIdGenerator::new(ids))
+    }
+
     #[tokio::test]
     async fn opens_and_retires_solo_environment() {
-        let manager = EnvironmentManager::new(components());
+        let manager = manager_with_ids(&["preview-00000000-0000-4000-8000-000000000001"]);
         let mut store = MemoryStore::default();
         let mut writer = MemoryWriter::default();
         let packages = package_reader();
@@ -930,9 +1125,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(change.written[0].id, "pr-service-a-3");
-        assert_eq!(writer.created_branches, vec!["env/pr-service-a-3"]);
-        let manifest = read_written(&writer, "pr-service-a-3.toml");
+        assert_eq!(
+            change.written[0].id,
+            "preview-00000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(
+            writer.created_branches,
+            vec!["env/preview-00000000-0000-4000-8000-000000000001"]
+        );
+        let manifest = read_written(&writer, "preview-00000000-0000-4000-8000-000000000001.toml");
         assert!(matches!(
             manifest.components.get("service-a"),
             Some(ComponentEntry::Pinned(PinnedEntry { r#ref, digest, .. }))
@@ -947,19 +1148,35 @@ mod tests {
             .retire_pr(
                 &mut store,
                 &mut writer,
+                &packages,
+                &dev,
+                &digest,
                 PullRequestKey::new("henosis-playground/service-a", 3),
             )
             .await
             .unwrap();
 
-        assert_eq!(close.retired[0].id, "pr-service-a-3");
-        assert_eq!(writer.deleted_manifests, vec!["pr-service-a-3.toml"]);
-        assert_eq!(writer.deleted_branches, vec!["env/pr-service-a-3"]);
+        assert_eq!(
+            close.retired[0].id,
+            "preview-00000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(
+            writer.deleted_manifests,
+            vec!["preview-00000000-0000-4000-8000-000000000001.toml"]
+        );
+        assert_eq!(
+            writer.deleted_branches,
+            vec!["env/preview-00000000-0000-4000-8000-000000000001"]
+        );
     }
 
     #[tokio::test]
     async fn join_and_leave_regenerate_affected_manifests() {
-        let manager = EnvironmentManager::new(components());
+        let manager = manager_with_ids(&[
+            "preview-00000000-0000-4000-8000-000000000001",
+            "preview-00000000-0000-4000-8000-000000000002",
+            "preview-00000000-0000-4000-8000-000000000003",
+        ]);
         let mut store = MemoryStore::default();
         let mut writer = MemoryWriter::default();
         let packages = package_reader();
@@ -1010,7 +1227,7 @@ mod tests {
                 &dev,
                 &digest,
                 service_a.clone(),
-                "demo stack",
+                "preview-00000000-0000-4000-8000-000000000001",
             )
             .await
             .unwrap();
@@ -1022,12 +1239,12 @@ mod tests {
                 &dev,
                 &digest,
                 service_b.clone(),
-                "demo stack",
+                "preview-00000000-0000-4000-8000-000000000001",
             )
             .await
             .unwrap();
 
-        let shared = read_written(&writer, "demo-stack.toml");
+        let shared = read_written(&writer, "preview-00000000-0000-4000-8000-000000000001.toml");
         assert!(matches!(
             shared.components.get("service-a"),
             Some(ComponentEntry::Pinned(PinnedEntry { r#ref, .. })) if r#ref == "pr/3"
@@ -1039,12 +1256,7 @@ mod tests {
         assert!(
             writer
                 .deleted_manifests
-                .contains(&"pr-service-a-3.toml".to_string())
-        );
-        assert!(
-            writer
-                .deleted_manifests
-                .contains(&"pr-service-b-7.toml".to_string())
+                .contains(&"preview-00000000-0000-4000-8000-000000000002.toml".to_string())
         );
 
         manager
@@ -1052,7 +1264,7 @@ mod tests {
             .await
             .unwrap();
 
-        let shared = read_written(&writer, "demo-stack.toml");
+        let shared = read_written(&writer, "preview-00000000-0000-4000-8000-000000000001.toml");
         assert!(matches!(
             shared.components.get("service-a"),
             Some(ComponentEntry::Follower(_))
@@ -1061,7 +1273,7 @@ mod tests {
             shared.components.get("service-b"),
             Some(ComponentEntry::Pinned(PinnedEntry { r#ref, .. })) if r#ref == "pr/7"
         ));
-        let solo = read_written(&writer, "pr-service-a-3.toml");
+        let solo = read_written(&writer, "preview-00000000-0000-4000-8000-000000000003.toml");
         assert!(matches!(
             solo.components.get("service-a"),
             Some(ComponentEntry::Pinned(PinnedEntry { r#ref, .. })) if r#ref == "pr/3"
@@ -1070,7 +1282,10 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_preserves_shared_environment_membership() {
-        let manager = EnvironmentManager::new(components());
+        let manager = manager_with_ids(&[
+            "preview-00000000-0000-4000-8000-000000000001",
+            "preview-00000000-0000-4000-8000-000000000002",
+        ]);
         let mut store = MemoryStore::default();
         let mut writer = MemoryWriter::default();
         let packages = package_reader();
@@ -1121,7 +1336,7 @@ mod tests {
                 &dev,
                 &digest,
                 service_a,
-                "demo stack",
+                "preview-00000000-0000-4000-8000-000000000001",
             )
             .await
             .unwrap();
@@ -1133,7 +1348,7 @@ mod tests {
                 &dev,
                 &digest,
                 service_b,
-                "demo stack",
+                "preview-00000000-0000-4000-8000-000000000001",
             )
             .await
             .unwrap();
@@ -1156,8 +1371,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(change.written[0].id, "demo-stack");
-        let shared = read_written(&writer, "demo-stack.toml");
+        assert_eq!(
+            change.written[0].id,
+            "preview-00000000-0000-4000-8000-000000000001"
+        );
+        let shared = read_written(&writer, "preview-00000000-0000-4000-8000-000000000001.toml");
         assert!(matches!(
             shared.components.get("service-a"),
             Some(ComponentEntry::Pinned(PinnedEntry { r#ref, digest, .. }))
@@ -1170,7 +1388,14 @@ mod tests {
     }
 
     #[test]
-    fn slug_ids_are_lowercase_ascii_hyphenated_and_capped() {
+    fn preview_ids_are_uuid_v4_and_legacy_slug_helper_still_behaves() {
+        let id = preview_environment_id([0; 16]);
+        assert_eq!(id, "preview-00000000-0000-4000-8000-000000000000");
+        assert!(is_preview_environment_id(&id));
+        assert!(!is_preview_environment_id("pr-service-a-42"));
+        assert!(!is_preview_environment_id(
+            "preview-00000000-0000-5000-8000-000000000000"
+        ));
         assert_eq!(solo_environment_id("Org/Service_A", 42), "pr-service-a-42");
         assert_eq!(shared_environment_id("Demo Stack!!"), "demo-stack");
         assert_eq!(slugify("----"), "env");

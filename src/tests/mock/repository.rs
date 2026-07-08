@@ -69,12 +69,13 @@ pub async fn mock_repo(
     mock_check_runs(repo.clone(), mock_server).await;
     mock_workflow_runs(repo.clone(), mock_server).await;
     mock_workflow_jobs(repo.clone(), mock_server).await;
-    mock_config(repo.clone(), mock_server).await;
+    mock_contents(repo.clone(), mock_server).await;
 }
 
 async fn mock_branches_and_commits(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
     mock_get_branch(repo.clone(), mock_server).await;
     mock_create_branch(repo.clone(), mock_server).await;
+    mock_delete_branch(repo.clone(), mock_server).await;
     mock_update_branch(repo.clone(), mock_server).await;
     mock_merge_branch(repo.clone(), mock_server).await;
     mock_create_commit(repo.clone(), mock_server).await;
@@ -178,6 +179,24 @@ async fn mock_create_branch(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
         })
         .mount(mock_server)
         .await;
+}
+
+async fn mock_delete_branch(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
+    let repo_name = repo.lock().full_name();
+    dynamic_mock_req(
+        move |_req: &Request, [branch_name]: [&str; 1]| {
+            let mut repo = repo.lock();
+            if repo.remove_branch(branch_name) {
+                ResponseTemplate::new(204)
+            } else {
+                ResponseTemplate::new(404)
+            }
+        },
+        "DELETE",
+        format!("^/repos/{repo_name}/git/refs/heads/(.*)$"),
+    )
+    .mount(mock_server)
+    .await;
 }
 
 async fn mock_update_branch(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
@@ -451,22 +470,91 @@ fn get_query_param(req: &Request, key: &str) -> String {
         .unwrap_or_else(|| panic!("Query parameter {key} not found in {}", req.url))
 }
 
-async fn mock_config(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
-    // Extracted into a block to avoid holding the lock over an await point
-    let mock = {
-        let repo = repo.lock();
-        Mock::given(method("GET"))
-            .and(path(format!(
-                "/repos/{}/contents/rust-bors.toml",
-                repo.full_name()
-            )))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(GitHubContent::new("rust-bors.toml", &repo.config)),
-            )
-            .mount(mock_server)
-    };
-    mock.await;
+async fn mock_contents(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
+    let repo_name = repo.lock().full_name();
+    dynamic_mock_req(
+        {
+            let repo = repo.clone();
+            move |_req: &Request, [path]: [&str; 1]| {
+                let repo = repo.lock();
+                let Some(content) = repo.get_file(path) else {
+                    return ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                        "message": "Not Found",
+                        "documentation_url": "https://docs.github.com/rest/repos/contents#get-repository-content"
+                    }));
+                };
+                ResponseTemplate::new(200).set_body_json(GitHubContent::new(path, &content))
+            }
+        },
+        "GET",
+        format!("^/repos/{repo_name}/contents/(.*)$"),
+    )
+    .mount(mock_server)
+    .await;
+
+    dynamic_mock_req(
+        {
+            let repo = repo.clone();
+            move |req: &Request, [path]: [&str; 1]| {
+                #[derive(serde::Deserialize)]
+                struct WriteFileRequest {
+                    message: String,
+                    content: String,
+                    branch: Option<String>,
+                    sha: Option<String>,
+                }
+
+                let data: WriteFileRequest = req.body_json().unwrap();
+                let _ = data.sha;
+                let content = base64::prelude::BASE64_STANDARD
+                    .decode(data.content.replace('\n', ""))
+                    .unwrap();
+                let content = String::from_utf8(content).unwrap();
+                let branch = data.branch.unwrap_or_else(|| "main".to_string());
+                let mut repo = repo.lock();
+                let commit = repo.write_file(&branch, path, &content, &data.message);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content": GitHubContent::new(path, &content),
+                    "commit": {
+                        "sha": commit.sha()
+                    }
+                }))
+            }
+        },
+        "PUT",
+        format!("^/repos/{repo_name}/contents/(.*)$"),
+    )
+    .mount(mock_server)
+    .await;
+
+    dynamic_mock_req(
+        move |req: &Request, [path]: [&str; 1]| {
+            #[derive(serde::Deserialize)]
+            struct DeleteFileRequest {
+                message: String,
+                branch: Option<String>,
+                sha: String,
+            }
+
+            let data: DeleteFileRequest = req.body_json().unwrap();
+            let _ = data.sha;
+            let branch = data.branch.unwrap_or_else(|| "main".to_string());
+            let mut repo = repo.lock();
+            let Some(commit) = repo.delete_file(&branch, path, &data.message) else {
+                return ResponseTemplate::new(404);
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": null,
+                "commit": {
+                    "sha": commit.sha()
+                }
+            }))
+        },
+        "DELETE",
+        format!("^/repos/{repo_name}/contents/(.*)$"),
+    )
+    .mount(mock_server)
+    .await;
 }
 
 #[derive(serde::Deserialize)]

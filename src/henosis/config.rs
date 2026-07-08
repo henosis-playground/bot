@@ -17,6 +17,8 @@ pub struct HenosisConfig {
     pub gate_command: String,
     #[serde(default = "default_gate_check_run_name")]
     pub gate_check_run_name: String,
+    #[serde(default = "default_render_workflow_name")]
+    pub render_workflow_name: String,
     #[serde(default = "default_queue_tick_interval_secs")]
     pub queue_tick_interval_secs: u64,
     #[serde(default = "default_cmd_prefix")]
@@ -128,6 +130,10 @@ fn default_gate_check_run_name() -> String {
     "Henosis gate".to_string()
 }
 
+fn default_render_workflow_name() -> String {
+    "Render environments".to_string()
+}
+
 fn default_queue_tick_interval_secs() -> u64 {
     15
 }
@@ -173,6 +179,7 @@ manifest_path = "dev.toml"
         assert_eq!(config.manifest_branch, "main");
         assert_eq!(config.gate_command, "henosis-gate");
         assert_eq!(config.gate_check_run_name, "Henosis gate");
+        assert_eq!(config.render_workflow_name, "Render environments");
         assert_eq!(config.queue_tick_interval_secs, 15);
         assert_eq!(config.queue_tick_interval(), Duration::from_secs(15));
         assert_eq!(config.cmd_prefix, "@henosis-bot");
@@ -202,6 +209,7 @@ deploy_repo = "henosis-playground/deploy"
 manifest_branch = "manifests"
 gate_command = "custom-gate"
 gate_check_run_name = "Custom gate"
+render_workflow_name = "Custom render"
 queue_tick_interval_secs = 3
 cmd_prefix = "@custom-bot"
 source_repos = ["henosis-playground/service-a"]
@@ -216,6 +224,7 @@ manifest_path = "staging.toml"
         assert_eq!(config.manifest_branch, "manifests");
         assert_eq!(config.gate_command, "custom-gate");
         assert_eq!(config.gate_check_run_name, "Custom gate");
+        assert_eq!(config.render_workflow_name, "Custom render");
         assert_eq!(config.queue_tick_interval(), Duration::from_secs(3));
         assert_eq!(config.cmd_prefix, "@custom-bot");
     }

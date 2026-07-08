@@ -379,6 +379,8 @@ pub struct Repo {
     pub workflow_cancel_error: bool,
     /// All workflows that we know about from the side of the test.
     workflow_runs: Vec<WorkflowRun>,
+    files: HashMap<String, String>,
+    file_commit_counter: u64,
     pull_requests: HashMap<u64, PullRequest>,
     check_runs: Vec<CheckRunData>,
     /// Cause pull request fetch to fail.
@@ -402,6 +404,8 @@ impl Repo {
             workflows_cancelled_by_bors: vec![],
             workflow_cancel_error: false,
             workflow_runs: vec![],
+            files: HashMap::default(),
+            file_commit_counter: 0,
             pull_request_error: false,
             check_runs: vec![],
             push_behaviour: BranchPushBehaviour::default(),
@@ -466,6 +470,12 @@ impl Repo {
         self.branches.push(branch);
     }
 
+    pub fn remove_branch(&mut self, name: &str) -> bool {
+        let len = self.branches.len();
+        self.branches.retain(|branch| branch.name() != name);
+        self.branches.len() != len
+    }
+
     pub fn get_branch_by_name(&mut self, name: &str) -> Option<&mut Branch> {
         if let Some(branch) = self.branches.iter_mut().find(|b| b.name == name) {
             Some(branch)
@@ -497,6 +507,50 @@ impl Repo {
             .get(&CommitSha(sha.to_owned()))
             .expect("Looking up non-existing commit SHA")
             .clone()
+    }
+
+    pub fn set_file(&mut self, path: &str, content: &str) {
+        self.files.insert(path.to_string(), content.to_string());
+    }
+
+    pub fn get_file(&self, path: &str) -> Option<String> {
+        if path == "rust-bors.toml" {
+            Some(self.config.clone())
+        } else {
+            self.files.get(path).cloned()
+        }
+    }
+
+    pub fn write_file(&mut self, branch: &str, path: &str, content: &str, message: &str) -> Commit {
+        self.files.insert(path.to_string(), content.to_string());
+        self.file_commit_counter += 1;
+        let branch_slug = branch.replace('/', "-");
+        let path_slug = path.replace(['/', '.'], "-");
+        let commit = Commit::new(
+            &format!(
+                "{branch_slug}-{path_slug}-file-{}",
+                self.file_commit_counter
+            ),
+            message,
+        );
+        self.push_commit(branch, commit.clone(), false);
+        commit
+    }
+
+    pub fn delete_file(&mut self, branch: &str, path: &str, message: &str) -> Option<Commit> {
+        self.files.remove(path)?;
+        self.file_commit_counter += 1;
+        let branch_slug = branch.replace('/', "-");
+        let path_slug = path.replace(['/', '.'], "-");
+        let commit = Commit::new(
+            &format!(
+                "{branch_slug}-{path_slug}-delete-{}",
+                self.file_commit_counter
+            ),
+            message,
+        );
+        self.push_commit(branch, commit.clone(), false);
+        Some(commit)
     }
 
     pub fn add_cancelled_workflow(&mut self, run_id: RunId) {

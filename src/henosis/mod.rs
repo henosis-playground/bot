@@ -11,3 +11,4 @@ pub mod manifest;
 pub mod merge;
 pub mod queue;
 pub mod service;
+pub mod status;

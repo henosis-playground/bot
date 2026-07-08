@@ -342,9 +342,11 @@ fn parse_workflow_run_events(body: &[u8]) -> anyhow::Result<Option<BorsEvent>> {
             Some(BorsEvent::Repository(
                 BorsRepositoryEvent::WorkflowCompleted(WorkflowRunCompleted {
                     repository: repository_name,
+                    name: payload.workflow_run.run.name,
                     branch: payload.workflow_run.run.head_branch,
                     commit_sha: CommitSha(payload.workflow_run.run.head_sha),
                     run_id: payload.workflow_run.run.id,
+                    url: payload.workflow_run.run.html_url.into(),
                     check_suite_id: payload.workflow_run.check_suite_id,
                     running_time,
                     status: match payload
@@ -1698,6 +1700,7 @@ mod tests {
                     WorkflowCompleted(
                         WorkflowRunCompleted {
                             repository: kobzol/bors-kindergarten,
+                            name: "Workflow 1",
                             branch: "automation/bors/try",
                             commit_sha: CommitSha(
                                 "c9abcadf285659684c0975cead8bf982fa84e123",
@@ -1705,6 +1708,7 @@ mod tests {
                             run_id: RunId(
                                 4900979072,
                             ),
+                            url: "https://github.com/Kobzol/bors-kindergarten/actions/runs/4900979072",
                             status: Failure,
                             running_time: Some(
                                 TimeDelta {

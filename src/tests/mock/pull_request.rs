@@ -132,7 +132,8 @@ async fn mock_pr_update(
 
             #[derive(serde::Deserialize)]
             struct RequestData {
-                state: String,
+                state: Option<String>,
+                body: Option<String>,
             }
 
             let data: RequestData = req.body_json::<RequestData>().unwrap();
@@ -140,10 +141,15 @@ async fn mock_pr_update(
             let mut repo = repo.lock();
             let pr = repo.get_pr_mut(pr_number);
 
-            if data.state == "closed" {
-                pr.close();
-            } else {
-                panic!("Invalid PR update state {}", data.state);
+            if let Some(state) = data.state {
+                if state == "closed" {
+                    pr.close();
+                } else {
+                    panic!("Invalid PR update state {state}");
+                }
+            }
+            if let Some(body) = data.body {
+                pr.description = body;
             }
             ResponseTemplate::new(200)
                 .set_body_json(GitHubPullRequest::new(&github.lock(), pr.clone()))

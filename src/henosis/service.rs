@@ -1,10 +1,13 @@
 use crate::BorsContext;
+use crate::bors::Comment;
+use crate::bors::event::WorkflowRunCompleted;
+use crate::database::WorkflowStatus;
 use crate::github::{GithubRepoName, PullRequest, PullRequestNumber};
 use crate::henosis::config::HenosisConfig;
 use crate::henosis::db::{PgEnvironmentStore, PgQueueStore};
 use crate::henosis::environment::{
-    EnvironmentChange, EnvironmentManager, EnvironmentStatus, PreviewPullRequest, PullRequestKey,
-    environment_branch,
+    EnvironmentChange, EnvironmentManager, EnvironmentStatus, EnvironmentStore, PreviewPullRequest,
+    PullRequestKey, RenderOutcome, RenderStatus, environment_branch,
 };
 use crate::henosis::gate::CliGateExecutor;
 use crate::henosis::github::{
@@ -15,6 +18,9 @@ use crate::henosis::github::{
 use crate::henosis::queue::{
     GateStatus, QueueManager, QueuePullRequest, QueueStore, RecordedGateRun,
 };
+use crate::henosis::status::{StatusSnapshot, render_status_section, upsert_status_section};
+use anyhow::Context;
+use std::collections::BTreeSet;
 
 pub fn is_henosis_component_repo(ctx: &BorsContext, repo: &GithubRepoName) -> bool {
     ctx.henosis_config
@@ -50,6 +56,7 @@ pub async fn open_preview_environment(
     let change = manager
         .open_pr(&mut store, &mut writer, &packages, &dev, &digest, pr)
         .await?;
+    reconcile_status_for_change(ctx, &change).await?;
     Ok(Some(change))
 }
 
@@ -80,6 +87,7 @@ pub async fn reopen_preview_environment(
     let change = manager
         .reopen_pr(&mut store, &mut writer, &packages, &dev, &digest, pr)
         .await?;
+    reconcile_status_for_change(ctx, &change).await?;
     Ok(Some(change))
 }
 
@@ -110,6 +118,7 @@ pub async fn refresh_preview_environment(
     let change = manager
         .refresh_pr(&mut store, &mut writer, &packages, &dev, &digest, pr)
         .await?;
+    reconcile_status_for_change(ctx, &change).await?;
     Ok(Some(change))
 }
 
@@ -129,13 +138,24 @@ pub async fn retire_preview_environment(
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
     let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.manifest_branch);
+    let dev = GithubDevManifestReader::new(
+        &deploy_repo.client,
+        &config.manifest_branch,
+        &config.dev_manifest_path,
+    );
+    let packages = GithubComponentPackageReader::new(&ctx.repositories);
+    let digest = GithubImageDigestResolver::new(&ctx.repositories);
     let change = manager
         .retire_pr(
             &mut store,
             &mut writer,
+            &packages,
+            &dev,
+            &digest,
             PullRequestKey::new(repo.to_string(), pr_number.0),
         )
         .await?;
+    reconcile_status_for_change(ctx, &change).await?;
     Ok(Some(change))
 }
 
@@ -167,6 +187,7 @@ pub async fn join_environment(
     let change = manager
         .join(&mut store, &mut writer, &packages, &dev, &digest, pr, name)
         .await?;
+    reconcile_status_for_change(ctx, &change).await?;
     Ok(Some(change))
 }
 
@@ -197,6 +218,7 @@ pub async fn leave_environment(
     let change = manager
         .leave(&mut store, &mut writer, &packages, &dev, &digest, pr)
         .await?;
+    reconcile_status_for_change(ctx, &change).await?;
     Ok(Some(change))
 }
 
@@ -261,7 +283,7 @@ pub async fn tick_queue(ctx: &BorsContext) -> anyhow::Result<Option<RecordedGate
         config,
     );
     let commenter = GithubPrCommenter::new(ctx.repositories.as_ref(), ctx.db.as_ref());
-    manager
+    let result = manager
         .tick(
             &mut store,
             &dev,
@@ -270,7 +292,20 @@ pub async fn tick_queue(ctx: &BorsContext) -> anyhow::Result<Option<RecordedGate
             &merge_executor,
             &commenter,
         )
-        .await
+        .await?;
+    if let Some(gate_run) = &result {
+        reconcile_status_for_keys(
+            ctx,
+            gate_run
+                .world
+                .members
+                .iter()
+                .map(|member| member.key.clone())
+                .collect(),
+        )
+        .await?;
+    }
+    Ok(result)
 }
 
 /// On startup, invalidate any gate runs left in transient states (pending, running).
@@ -325,6 +360,228 @@ pub async fn on_pr_push(
     manager
         .invalidate_pr_push(&mut store, &reporter, &pushed)
         .await
+}
+
+pub async fn reconcile_status_for_pr(
+    ctx: &BorsContext,
+    repo: &GithubRepoName,
+    pr_number: PullRequestNumber,
+) -> anyhow::Result<bool> {
+    reconcile_status_for_keys(
+        ctx,
+        vec![PullRequestKey::new(repo.to_string(), pr_number.0)],
+    )
+    .await
+}
+
+pub async fn handle_render_workflow_completed(
+    ctx: &BorsContext,
+    payload: &WorkflowRunCompleted,
+) -> anyhow::Result<bool> {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return Ok(false);
+    };
+    if config.deploy_repo != payload.repository.to_string()
+        || config.render_workflow_name != payload.name
+        || config.manifest_branch != payload.branch
+    {
+        return Ok(false);
+    }
+
+    let status = match payload.status {
+        WorkflowStatus::Success => RenderStatus::Success,
+        WorkflowStatus::Failure => RenderStatus::Failure,
+        WorkflowStatus::Pending => return Ok(true),
+    };
+    let excerpt = (status == RenderStatus::Failure).then(|| render_failure_excerpt(payload));
+
+    let environment_store = PgEnvironmentStore::new(ctx.db.pool().clone());
+    let environments = environment_store
+        .active_preview_environments_for_commit_sha(&payload.commit_sha.0)
+        .await?;
+    for environment in environments {
+        let outcome = RenderOutcome {
+            environment_id: environment.id.clone(),
+            commit_sha: payload.commit_sha.0.clone(),
+            status,
+            run_url: payload.url.clone(),
+            excerpt: excerpt.clone(),
+        };
+        let previous = environment_store
+            .latest_render_outcome(&environment.id)
+            .await?;
+        environment_store.record_render_outcome(&outcome).await?;
+        if should_post_render_failure(&previous, &outcome) {
+            for member in environment_store.active_members(&environment.id).await? {
+                post_render_failure_comment(ctx, &member.key, &outcome).await?;
+            }
+        }
+        reconcile_environment_status(ctx, &environment.id).await?;
+    }
+
+    let queue_store = PgQueueStore::new(ctx.db.pool().clone());
+    let merged_prs = queue_store
+        .pull_requests_for_dev_bump_commit_sha(&payload.commit_sha.0)
+        .await?;
+    if !merged_prs.is_empty() {
+        let outcome = RenderOutcome {
+            environment_id: "dev".to_string(),
+            commit_sha: payload.commit_sha.0.clone(),
+            status,
+            run_url: payload.url.clone(),
+            excerpt,
+        };
+        let previous = environment_store.latest_render_outcome("dev").await?;
+        environment_store.record_render_outcome(&outcome).await?;
+        if should_post_render_failure(&previous, &outcome) {
+            for key in &merged_prs {
+                post_render_failure_comment(ctx, key, &outcome).await?;
+            }
+        }
+        reconcile_status_for_keys(ctx, merged_prs).await?;
+    }
+
+    Ok(true)
+}
+
+async fn reconcile_status_for_change(
+    ctx: &BorsContext,
+    change: &EnvironmentChange,
+) -> anyhow::Result<()> {
+    let mut environment_ids = BTreeSet::new();
+    for write in &change.written {
+        environment_ids.insert(write.id.clone());
+    }
+    for environment_id in environment_ids {
+        reconcile_environment_status(ctx, &environment_id).await?;
+    }
+    Ok(())
+}
+
+async fn reconcile_status_for_keys(
+    ctx: &BorsContext,
+    keys: Vec<PullRequestKey>,
+) -> anyhow::Result<bool> {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return Ok(false);
+    };
+    let store = PgEnvironmentStore::new(ctx.db.pool().clone());
+    let mut environment_ids = BTreeSet::new();
+    for key in keys {
+        if !config.is_component_repo(&key.repo) {
+            continue;
+        }
+        if let Some(environment) = store.environment_for_pr(&key).await? {
+            environment_ids.insert(environment.id);
+        }
+    }
+    for environment_id in environment_ids {
+        reconcile_environment_status(ctx, &environment_id).await?;
+    }
+    Ok(true)
+}
+
+async fn reconcile_environment_status(
+    ctx: &BorsContext,
+    environment_id: &str,
+) -> anyhow::Result<()> {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return Ok(());
+    };
+    let environment_store = PgEnvironmentStore::new(ctx.db.pool().clone());
+    let Some(environment) = environment_store.active_environment(environment_id).await? else {
+        return Ok(());
+    };
+    let members = environment_store.active_members(environment_id).await?;
+    let render = environment_store
+        .latest_render_outcome(environment_id)
+        .await?;
+    let queue_store = PgQueueStore::new(ctx.db.pool().clone());
+
+    for member in &members {
+        let repo_name: GithubRepoName = member.key.repo.parse().map_err(|error| {
+            anyhow::anyhow!("Invalid GitHub repo `{}`: {error}", member.key.repo)
+        })?;
+        let repo = ctx
+            .repositories
+            .get(&repo_name)
+            .with_context(|| format!("Repository `{repo_name}` is not loaded"))?;
+        let pr_number = PullRequestNumber(member.key.number);
+        let pr = repo.client.get_pull_request(pr_number).await?;
+        let gate = queue_store.latest_gate_status(&member.key).await?;
+        let snapshot = StatusSnapshot {
+            environment: EnvironmentStatus {
+                environment: environment.clone(),
+                branch: environment_branch(&environment.id),
+                members: members.clone(),
+            },
+            manifest_url: deploy_manifest_url(
+                &config.deploy_repo,
+                &config.manifest_branch,
+                &environment.manifest_path,
+            ),
+            branch_url: deploy_branch_url(
+                &config.deploy_repo,
+                &environment_branch(&environment.id),
+            ),
+            gate,
+            render: render.clone(),
+        };
+        let section = render_status_section(&snapshot);
+        let body = upsert_status_section(&pr.message, &section);
+        if body != pr.message {
+            repo.client
+                .update_pull_request_body(pr_number, &body)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn should_post_render_failure(previous: &Option<RenderOutcome>, outcome: &RenderOutcome) -> bool {
+    outcome.status == RenderStatus::Failure
+        && previous
+            .as_ref()
+            .map(|previous| previous.run_url != outcome.run_url)
+            .unwrap_or(true)
+}
+
+fn render_failure_excerpt(payload: &WorkflowRunCompleted) -> String {
+    format!(
+        "{} failed for commit `{}` on `{}`",
+        payload.name, payload.commit_sha, payload.branch
+    )
+}
+
+async fn post_render_failure_comment(
+    ctx: &BorsContext,
+    key: &PullRequestKey,
+    outcome: &RenderOutcome,
+) -> anyhow::Result<()> {
+    let repo_name: GithubRepoName = key
+        .repo
+        .parse()
+        .map_err(|error| anyhow::anyhow!("Invalid GitHub repo `{}`: {error}", key.repo))?;
+    let repo = ctx
+        .repositories
+        .get(&repo_name)
+        .with_context(|| format!("Repository `{repo_name}` is not loaded"))?;
+    let excerpt = outcome
+        .excerpt
+        .as_deref()
+        .unwrap_or("render workflow failed");
+    repo.client
+        .post_comment(
+            PullRequestNumber(key.number),
+            Comment::new(format!(
+                "couldn't materialise environment `{}`: {} [render run]({})",
+                outcome.environment_id, excerpt, outcome.run_url
+            )),
+            &ctx.db,
+        )
+        .await?;
+    Ok(())
 }
 
 pub fn environment_change_comment(

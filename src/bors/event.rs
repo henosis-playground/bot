@@ -176,9 +176,11 @@ pub struct WorkflowRunStarted {
 #[derive(Debug)]
 pub struct WorkflowRunCompleted {
     pub repository: GithubRepoName,
+    pub name: String,
     pub branch: String,
     pub commit_sha: CommitSha,
     pub run_id: RunId,
+    pub url: String,
     pub status: WorkflowStatus,
     pub running_time: Option<Duration>,
     /// Check suite to which this workflow is attached.

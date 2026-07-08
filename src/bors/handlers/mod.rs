@@ -31,9 +31,7 @@ use crate::database::{DelegatedPermission, DelegationStatus, PullRequestModel};
 use crate::github::{
     CommitSha, GithubUser, LabelTrigger, PullRequest, PullRequestInfo, PullRequestNumber,
 };
-use crate::henosis::service::{
-    environment_change_comment, environment_status_comment, gate_status_comment,
-};
+use crate::henosis::service::{handle_render_workflow_completed, reconcile_status_for_pr};
 use crate::permissions::PermissionType;
 use crate::{PgDbClient, TeamApiClient, load_repositories};
 use anyhow::Context;
@@ -128,6 +126,12 @@ pub async fn handle_bors_repository_event(
                 repo = payload.repository.to_string(),
                 id = payload.run_id.into_inner()
             );
+            if handle_render_workflow_completed(&ctx, &payload)
+                .instrument(span.clone())
+                .await?
+            {
+                return Ok(());
+            }
             handle_workflow_completed(repo, db, payload, senders.build_queue())
                 .instrument(span.clone())
                 .await?;
@@ -670,15 +674,10 @@ async fn command_henosis_env(
     let Some(config) = ctx.henosis_config.as_ref() else {
         return post_henosis_not_configured(&repo, &db, pr.number()).await;
     };
-    let status =
-        crate::henosis::service::environment_status(&ctx, repo.repository(), pr.number()).await?;
-    repo.client
-        .post_comment(
-            pr.number(),
-            Comment::new(environment_status_comment(config, status)),
-            &db,
-        )
-        .await?;
+    if !config.is_component_repo(&repo.repository().to_string()) {
+        return post_henosis_not_managed(&repo, &db, pr.number()).await;
+    }
+    reconcile_status_for_pr(&ctx, repo.repository(), pr.number()).await?;
     Ok(())
 }
 
@@ -698,17 +697,15 @@ async fn command_henosis_env_join(
     let Some(config) = ctx.henosis_config.as_ref() else {
         return post_henosis_not_configured(&repo, &db, pr.number()).await;
     };
+    if !config.is_component_repo(&repo.repository().to_string()) {
+        return post_henosis_not_managed(&repo, &db, pr.number()).await;
+    }
     let Some(change) =
         crate::henosis::service::join_environment(&ctx, repo.repository(), pr.github, name).await?
     else {
         return post_henosis_not_managed(&repo, &db, pr.number()).await;
     };
-
-    if let Some(comment) = environment_change_comment(config, &change) {
-        repo.client
-            .post_comment(pr.number(), Comment::new(comment), &db)
-            .await?;
-    }
+    let _ = change;
     Ok(())
 }
 
@@ -727,17 +724,15 @@ async fn command_henosis_env_leave(
     let Some(config) = ctx.henosis_config.as_ref() else {
         return post_henosis_not_configured(&repo, &db, pr.number()).await;
     };
+    if !config.is_component_repo(&repo.repository().to_string()) {
+        return post_henosis_not_managed(&repo, &db, pr.number()).await;
+    }
     let Some(change) =
         crate::henosis::service::leave_environment(&ctx, repo.repository(), pr.github).await?
     else {
         return post_henosis_not_managed(&repo, &db, pr.number()).await;
     };
-
-    if let Some(comment) = environment_change_comment(config, &change) {
-        repo.client
-            .post_comment(pr.number(), Comment::new(comment), &db)
-            .await?;
-    }
+    let _ = change;
     Ok(())
 }
 
@@ -753,14 +748,13 @@ async fn command_henosis_gate(
         return Ok(());
     }
 
-    if ctx.henosis_config.is_none() {
+    let Some(config) = ctx.henosis_config.as_ref() else {
         return post_henosis_not_configured(&repo, &db, pr.number()).await;
+    };
+    if !config.is_component_repo(&repo.repository().to_string()) {
+        return post_henosis_not_managed(&repo, &db, pr.number()).await;
     }
-    let status =
-        crate::henosis::service::latest_gate_status(&ctx, repo.repository(), pr.number()).await?;
-    repo.client
-        .post_comment(pr.number(), Comment::new(gate_status_comment(status)), &db)
-        .await?;
+    reconcile_status_for_pr(&ctx, repo.repository(), pr.number()).await?;
     Ok(())
 }
 
@@ -1277,13 +1271,17 @@ fn is_bors_observed_branch(branch: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::github::GithubRepoName;
     use crate::henosis::config::HenosisConfig;
-    use crate::tests::{BorsBuilder, BorsTester, Comment, User, run_test};
+    use crate::tests::{
+        BorsBuilder, BorsTester, Comment, GitHub, Repo, User, default_repo_name, run_test,
+    };
 
     fn henosis_config() -> HenosisConfig {
         toml::from_str(
             r#"
 deploy_repo = "rust-lang/borstest"
+render_workflow_name = "Workflow1"
 
 [[components]]
 name = "borstest"
@@ -1295,6 +1293,103 @@ manifest_path = "dev.toml"
 "#,
         )
         .unwrap()
+    }
+
+    fn henosis_github() -> GitHub {
+        let github = GitHub::default();
+        {
+            let repo = github.default_repo();
+            let mut repo = repo.lock();
+            repo.set_file(
+                "dev.toml",
+                r#"
+[environment]
+id = "dev"
+
+[components.borstest]
+repo = "rust-lang/borstest"
+ref = "main-sha"
+digest = "sha256:dev"
+"#,
+            );
+            repo.set_file(
+                "henosis/package.json",
+                r#"{"name":"@henosis/borstest","dependencies":{},"henosis":{"component":"borstest"}}"#,
+            );
+        }
+        github
+    }
+
+    fn multi_henosis_config() -> HenosisConfig {
+        toml::from_str(
+            r#"
+deploy_repo = "rust-lang/borstest"
+render_workflow_name = "Workflow1"
+
+[[components]]
+name = "borstest"
+repo = "rust-lang/borstest"
+
+[[components]]
+name = "service-b"
+repo = "rust-lang/service-b"
+
+[[environments]]
+id = "dev"
+manifest_path = "dev.toml"
+"#,
+        )
+        .unwrap()
+    }
+
+    fn multi_henosis_github() -> GitHub {
+        let mut github = GitHub::default();
+        let permissions = {
+            let repo = github.default_repo();
+            let mut repo = repo.lock();
+            repo.set_file(
+                "dev.toml",
+                r#"
+[environment]
+id = "dev"
+
+[components.borstest]
+repo = "rust-lang/borstest"
+ref = "main-sha"
+digest = "sha256:borstest"
+
+[components.service-b]
+repo = "rust-lang/service-b"
+ref = "main-sha"
+digest = "sha256:service-b"
+"#,
+            );
+            repo.set_file(
+                "henosis/package.json",
+                r#"{"name":"@henosis/borstest","dependencies":{},"henosis":{"component":"borstest"}}"#,
+            );
+            repo.permissions.clone()
+        };
+
+        let org = github.get_user("rust-lang").unwrap().clone();
+        let mut service_b = Repo::new(org, "service-b");
+        service_b.permissions = permissions;
+        service_b.set_file(
+            "henosis/package.json",
+            r#"{"name":"@henosis/service-b","dependencies":{},"henosis":{"component":"service-b"}}"#,
+        );
+        github.add_repo(service_b);
+        github
+    }
+
+    fn status_environment_id(body: &str) -> String {
+        body.lines()
+            .find_map(|line| {
+                line.strip_prefix("Environment: `")
+                    .and_then(|value| value.strip_suffix('`'))
+            })
+            .expect("status section should include environment id")
+            .to_string()
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
@@ -1344,7 +1439,10 @@ manifest_path = "dev.toml"
             .henosis_config(henosis_config())
             .run_test(async |ctx: &mut BorsTester| {
                 ctx.post_comment(Comment::from("@bors env")).await?;
-                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"This PR is not assigned to a Henosis preview environment.");
+                assert_eq!(
+                    ctx.pr(()).await.get_gh_pr().description,
+                    "Description of PR 1"
+                );
                 Ok(())
             })
             .await;
@@ -1356,7 +1454,102 @@ manifest_path = "dev.toml"
             .henosis_config(henosis_config())
             .run_test(async |ctx: &mut BorsTester| {
                 ctx.post_comment(Comment::from("@bors gate")).await?;
-                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"No Henosis gate run has been recorded for this PR.");
+                assert_eq!(
+                    ctx.pr(()).await.get_gh_pr().description,
+                    "Description of PR 1"
+                );
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_preview_open_writes_status_section(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .github(henosis_github())
+            .henosis_config(henosis_config())
+            .run_test(async |ctx: &mut BorsTester| {
+                let pr = ctx.open_pr((), |_| {}).await?;
+                let body = ctx
+                    .pr((default_repo_name(), pr.number().0))
+                    .await
+                    .get_gh_pr()
+                    .description;
+
+                assert!(body.contains("<!-- henosis:status -->"));
+                assert!(body.contains("<!-- /henosis:status -->"));
+                assert!(body.contains("Environment: `preview-"));
+                assert!(body.contains("Manifest: [preview-"));
+                assert!(body.contains("Branch: [env/preview-"));
+                assert!(body.contains("Members: `rust-lang/borstest#2`"));
+                assert!(body.contains("Final gate: no gate run recorded"));
+                assert!(body.contains("Latest render: no render run recorded"));
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_render_failure_comments_and_updates_status(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .github(henosis_github())
+            .henosis_config(henosis_config())
+            .run_test(async |ctx: &mut BorsTester| {
+                let pr = ctx.open_pr((), |_| {}).await?;
+                let pr_id = (default_repo_name(), pr.number().0);
+                let run_id = ctx.create_workflow(default_repo_name(), "main");
+
+                ctx.workflow_full_failure(run_id).await?;
+
+                let comment = ctx.get_next_comment_text(pr_id.clone()).await?;
+                assert!(comment.contains("couldn't materialise environment `preview-"));
+                assert!(comment.contains("Workflow1 failed for commit `"));
+                assert!(
+                    comment.contains(
+                        "[render run](https://github.com/rust-lang/borstest/actions/runs/"
+                    )
+                );
+
+                let body = ctx.pr(pr_id).await.get_gh_pr().description;
+                assert!(body.contains("Latest render: `failure`"));
+                assert!(body.contains("Workflow1 failed for commit `"));
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_join_rewrites_status_on_all_members(pool: sqlx::PgPool) {
+        let service_b = GithubRepoName::new("rust-lang", "service-b");
+        BorsBuilder::new(pool)
+            .github(multi_henosis_github())
+            .henosis_config(multi_henosis_config())
+            .run_test(async |ctx: &mut BorsTester| {
+                let service_a_pr = ctx.open_pr(default_repo_name(), |_| {}).await?;
+                let service_b_pr = ctx.open_pr(service_b.clone(), |_| {}).await?;
+                let service_a_id = (default_repo_name(), service_a_pr.number().0);
+                let service_b_id = (service_b.clone(), service_b_pr.number().0);
+                let service_a_body = ctx.pr(service_a_id.clone()).await.get_gh_pr().description;
+                let environment_id = status_environment_id(&service_a_body);
+
+                ctx.post_comment(Comment::new(
+                    service_b_id.clone(),
+                    &format!("@bors env join {environment_id}"),
+                ))
+                .await?;
+
+                let service_a_body = ctx.pr(service_a_id).await.get_gh_pr().description;
+                let service_b_body = ctx.pr(service_b_id).await.get_gh_pr().description;
+                assert!(service_a_body.contains(&format!("Environment: `{environment_id}`")));
+                assert!(service_b_body.contains(&format!("Environment: `{environment_id}`")));
+                assert!(
+                    service_a_body
+                        .contains("Members: `rust-lang/borstest#2`, `rust-lang/service-b#1`")
+                );
+                assert!(
+                    service_b_body
+                        .contains("Members: `rust-lang/borstest#2`, `rust-lang/service-b#1`")
+                );
                 Ok(())
             })
             .await;
