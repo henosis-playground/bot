@@ -1,3 +1,9 @@
+use crate::henosis::db::PgQueueStore;
+use crate::henosis::queue::{
+    CandidateComponent, CandidateWorld, INVALIDATED_STATUS, PENDING_STATUS, QueuePullRequest,
+    QueueStore, gate_external_id,
+};
+
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn inserts_henosis_gate_schema_rows(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let gate_run_id: i64 = sqlx::query_scalar(
@@ -84,5 +90,71 @@ SELECT EXISTS(
     .await?;
 
     assert!(exists);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn record_gate_run_deletes_invalidated_duplicate_external_id(
+    pool: sqlx::PgPool,
+) -> anyhow::Result<()> {
+    let world = CandidateWorld {
+        members: vec![QueuePullRequest::new(
+            "henosis-playground/service-a",
+            3,
+            "service-a",
+            "abc123",
+            "pr/3",
+            "abc123",
+        )],
+        components: vec![CandidateComponent {
+            name: "service-a".to_string(),
+            repo: "henosis-playground/service-a".to_string(),
+            r#ref: "abc123".to_string(),
+            digest: "sha256:abc123".to_string(),
+            candidate: true,
+        }],
+    };
+    let external_id = gate_external_id(&world)?;
+
+    sqlx::query(
+        r#"
+INSERT INTO gate_run (external_id, status, world)
+VALUES ($1, $2, $3::jsonb)
+"#,
+    )
+    .bind(&external_id)
+    .bind(INVALIDATED_STATUS)
+    .bind(serde_json::to_string(&world)?)
+    .execute(&pool)
+    .await?;
+
+    let mut store = PgQueueStore::new(pool.clone());
+    let run = store.record_gate_run(&world).await?;
+
+    assert_eq!(run.external_id, external_id);
+    assert_eq!(run.status, PENDING_STATUS);
+    let rows: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(*)
+FROM gate_run
+WHERE external_id = $1
+"#,
+    )
+    .bind(&external_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(rows, 1);
+
+    let status: String = sqlx::query_scalar(
+        r#"
+SELECT status
+FROM gate_run
+WHERE external_id = $1
+"#,
+    )
+    .bind(&external_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(status, PENDING_STATUS);
     Ok(())
 }
