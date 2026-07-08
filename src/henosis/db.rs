@@ -371,6 +371,14 @@ LIMIT 1
         let external_id = gate_external_id(world)?;
         let world_json = serde_json::to_string(world).context("Cannot serialize gate world")?;
         let mut tx = self.pool.begin().await?;
+        // Remove any previously-invalidated run with the same external_id so the
+        // INSERT below cannot conflict on the unique constraint.
+        sqlx::query(
+            r#"DELETE FROM gate_run WHERE external_id = $1 AND status = 'invalidated'"#,
+        )
+        .bind(&external_id)
+        .execute(&mut *tx)
+        .await?;
         let gate_run_id: i64 = sqlx::query_scalar(
             r#"
 INSERT INTO gate_run (external_id, status, world)
