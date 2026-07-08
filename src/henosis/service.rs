@@ -273,6 +273,32 @@ pub async fn tick_queue(ctx: &BorsContext) -> anyhow::Result<Option<RecordedGate
         .await
 }
 
+/// On startup, invalidate any gate runs left in transient states (pending, running).
+/// These belong to a previous bot process that died mid-execution; they cannot be
+/// safely resumed because the gate CLI may have been killed partway through.
+pub async fn cleanup_stale_gate_runs(ctx: &BorsContext) -> anyhow::Result<u64> {
+    if ctx.henosis_config.is_none() {
+        return Ok(0);
+    }
+    let affected = sqlx::query(
+        r#"
+UPDATE gate_run
+SET status = 'invalidated', updated_at = NOW()
+WHERE status IN ('pending', 'pending-executor', 'running')
+"#,
+    )
+    .execute(ctx.db.pool())
+    .await?
+    .rows_affected();
+    if affected > 0 {
+        tracing::warn!(
+            count = affected,
+            "Invalidated stale gate run(s) left by previous bot process"
+        );
+    }
+    Ok(affected)
+}
+
 pub async fn on_pr_push(
     ctx: &BorsContext,
     repo: &GithubRepoName,

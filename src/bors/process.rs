@@ -259,6 +259,11 @@ async fn consume_henosis_queue_ticks(ctx: Arc<BorsContext>) {
         "Starting Henosis queue scheduler"
     );
 
+    // Invalidate any gate runs left in transient states from a previous process.
+    if let Err(error) = crate::henosis::service::cleanup_stale_gate_runs(&ctx).await {
+        tracing::error!("Failed to cleanup stale gate runs on startup: {error:#}");
+    }
+
     let mut interval = tokio::time::interval(tick_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
