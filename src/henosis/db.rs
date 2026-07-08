@@ -27,23 +27,23 @@ impl EnvironmentStore for PgEnvironmentStore {
     async fn upsert_environment(
         &mut self,
         id: &str,
-        lockfile_path: &str,
+        manifest_path: &str,
         is_preview: bool,
     ) -> anyhow::Result<()> {
         sqlx::query(
             r#"
-INSERT INTO environment (id, lockfile_path, is_preview, retired_at, updated_at)
+INSERT INTO environment (id, manifest_path, is_preview, retired_at, updated_at)
 VALUES ($1, $2, $3, NULL, NOW())
 ON CONFLICT (id)
 DO UPDATE SET
-    lockfile_path = EXCLUDED.lockfile_path,
+    manifest_path = EXCLUDED.manifest_path,
     is_preview = EXCLUDED.is_preview,
     retired_at = NULL,
     updated_at = NOW()
 "#,
         )
         .bind(id)
-        .bind(lockfile_path)
+        .bind(manifest_path)
         .bind(is_preview)
         .execute(&self.pool)
         .await?;
@@ -123,7 +123,7 @@ WHERE repo = $1
     ) -> anyhow::Result<Option<EnvironmentState>> {
         let row = sqlx::query(
             r#"
-SELECT e.id, e.lockfile_path, e.is_preview
+SELECT e.id, e.manifest_path, e.is_preview
 FROM environment_member AS m
 JOIN environment AS e ON e.id = m.environment_id
 WHERE m.repo = $1
@@ -142,7 +142,7 @@ LIMIT 1
         row.map(|row| {
             Ok(EnvironmentState {
                 id: row.try_get("id")?,
-                lockfile_path: row.try_get("lockfile_path")?,
+                manifest_path: row.try_get("manifest_path")?,
                 is_preview: row.try_get("is_preview")?,
             })
         })
@@ -184,14 +184,14 @@ ORDER BY repo, pr_number
             .collect()
     }
 
-    async fn record_lockfile_revision(
+    async fn record_manifest_revision(
         &mut self,
         environment_id: &str,
         commit_sha: &str,
     ) -> anyhow::Result<()> {
         sqlx::query(
             r#"
-INSERT INTO lockfile_revision (environment_id, commit_sha)
+INSERT INTO manifest_revision (environment_id, commit_sha)
 VALUES ($1, $2)
 "#,
         )

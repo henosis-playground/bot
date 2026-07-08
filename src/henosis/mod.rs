@@ -7,7 +7,7 @@ pub mod gate;
 pub mod gate_report;
 pub mod github;
 pub mod graph;
-pub mod lockfile;
+pub mod manifest;
 pub mod merge;
 pub mod queue;
 pub mod service;

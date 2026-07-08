@@ -33,8 +33,8 @@ pub trait PullRequestMerger {
     async fn squash_merge(&self, pr: &QueuePullRequest) -> anyhow::Result<String>;
 }
 
-pub trait DevLockfileBumper {
-    async fn bump_dev_lockfile(
+pub trait DevManifestBumper {
+    async fn bump_dev_manifest(
         &self,
         gate_run: &GateRun,
         merge_commit_sha: &str,
@@ -63,7 +63,7 @@ impl<S, M, B, C> MergeExecutor for StateMachineMergeExecutor<S, M, B, C>
 where
     S: MergeStore,
     M: PullRequestMerger,
-    B: DevLockfileBumper,
+    B: DevManifestBumper,
     C: PrCommenter,
 {
     async fn execute(&self, gate_run: &GateRun) -> anyhow::Result<()> {
@@ -78,7 +78,7 @@ where
                 .post_comment(
                     pr,
                     &format!(
-                        "Landed as {merge_commit_sha}. Dev bumped: {}",
+                        "Landed as {merge_commit_sha}. Dev manifest bumped: {}",
                         bump.commit_url
                     ),
                 )
@@ -93,7 +93,7 @@ impl<S, M, B, C> StateMachineMergeExecutor<S, M, B, C>
 where
     S: MergeStore,
     M: PullRequestMerger,
-    B: DevLockfileBumper,
+    B: DevManifestBumper,
     C: PrCommenter,
 {
     async fn ensure_merged(&self, gate_run: &GateRun) -> anyhow::Result<String> {
@@ -142,7 +142,7 @@ where
             .await?;
         let bump = self
             .bumper
-            .bump_dev_lockfile(gate_run, merge_commit_sha)
+            .bump_dev_manifest(gate_run, merge_commit_sha)
             .await?;
         self.store
             .record_dev_bump_commit_sha(&gate_run.external_id, &bump.commit_sha)
@@ -158,7 +158,7 @@ mod tests {
     use indexmap::IndexMap;
 
     use super::*;
-    use crate::henosis::lockfile::{EnvironmentSection, Lockfile, pinned};
+    use crate::henosis::manifest::{EnvironmentSection, Manifest, pinned};
     use crate::henosis::queue::{
         CandidateComponent, CandidateWorld, GATE_PASSED_STATUS, QueuePullRequest, RecordedGateRun,
     };
@@ -216,8 +216,8 @@ mod tests {
         calls: Mutex<Vec<(String, String)>>,
     }
 
-    impl DevLockfileBumper for FakeBumper {
-        async fn bump_dev_lockfile(
+    impl DevManifestBumper for FakeBumper {
+        async fn bump_dev_manifest(
             &self,
             gate_run: &GateRun,
             merge_commit_sha: &str,
@@ -309,7 +309,11 @@ mod tests {
         let comments = executor.commenter.comments.lock().unwrap();
         assert_eq!(comments.len(), 1);
         assert!(comments[0].1.contains("Landed as merge-sha"));
-        assert!(comments[0].1.contains("Dev bumped: https://github.com/"));
+        assert!(
+            comments[0]
+                .1
+                .contains("Dev manifest bumped: https://github.com/")
+        );
     }
 
     #[tokio::test]
@@ -336,8 +340,8 @@ mod tests {
     }
 
     #[test]
-    fn test_lockfile_fixture_stays_pinned() {
-        let lockfile = Lockfile {
+    fn test_manifest_fixture_stays_pinned() {
+        let manifest = Manifest {
             environment: EnvironmentSection {
                 id: "dev".to_string(),
             },
@@ -347,6 +351,6 @@ mod tests {
             )]),
         };
 
-        assert_eq!(lockfile.environment.id, "dev");
+        assert_eq!(manifest.environment.id, "dev");
     }
 }

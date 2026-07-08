@@ -4,9 +4,9 @@ use std::sync::Mutex;
 use anyhow::Context;
 use tokio::process::Command;
 
-use crate::henosis::environment::DevLockfileReader;
+use crate::henosis::environment::DevManifestReader;
 use crate::henosis::gate_report::GateReport;
-use crate::henosis::lockfile::{self, EnvironmentSection, Lockfile};
+use crate::henosis::manifest::{self, EnvironmentSection, Manifest};
 use crate::henosis::queue::{GateRun, candidate_world_components};
 
 pub trait GateExecutor {
@@ -15,21 +15,21 @@ pub trait GateExecutor {
 
 pub struct CliGateExecutor<D> {
     gate_command: String,
-    dev_lockfiles: D,
+    dev_manifests: D,
 }
 
 impl<D> CliGateExecutor<D> {
-    pub fn new(gate_command: impl Into<String>, dev_lockfiles: D) -> Self {
+    pub fn new(gate_command: impl Into<String>, dev_manifests: D) -> Self {
         Self {
             gate_command: gate_command.into(),
-            dev_lockfiles,
+            dev_manifests,
         }
     }
 }
 
 impl<D> GateExecutor for CliGateExecutor<D>
 where
-    D: DevLockfileReader + Send + Sync,
+    D: DevManifestReader + Send + Sync,
 {
     async fn execute(&self, gate_run: &GateRun) -> anyhow::Result<GateReport> {
         let tempdir = tempfile::Builder::new()
@@ -37,7 +37,7 @@ where
             .tempdir_in("/tmp")
             .context("Cannot create Henosis gate tempdir")?;
 
-        let lockfile_path = tempdir.path().join("candidate.toml");
+        let manifest_path = tempdir.path().join("candidate.toml");
         let scratch_dir = tempdir.path().join("scratch");
         let output_dir = tempdir.path().join("output");
         tokio::fs::create_dir_all(&scratch_dir)
@@ -47,42 +47,42 @@ where
             .await
             .context("Cannot create Henosis gate output dir")?;
 
-        let lockfile = Lockfile {
+        let manifest = Manifest {
             environment: EnvironmentSection {
                 id: "dev".to_string(),
             },
             components: candidate_world_components(&gate_run.world),
         };
-        let toml = lockfile::to_toml(&lockfile).context("Cannot serialize candidate lockfile")?;
-        tokio::fs::write(&lockfile_path, toml)
+        let toml = manifest::to_toml(&manifest).context("Cannot serialize candidate manifest")?;
+        tokio::fs::write(&manifest_path, toml)
             .await
             .with_context(|| {
                 format!(
-                    "Cannot write candidate lockfile to {}",
-                    lockfile_path.display()
+                    "Cannot write candidate manifest to {}",
+                    manifest_path.display()
                 )
             })?;
 
-        let dev_lockfile_path = tempdir.path().join("dev.toml");
-        let dev_lockfile = self.dev_lockfiles.read_dev_lockfile().await?;
-        let dev_toml = lockfile::to_toml(&dev_lockfile).context("Cannot serialize dev lockfile")?;
-        tokio::fs::write(&dev_lockfile_path, dev_toml)
+        let dev_manifest_path = tempdir.path().join("dev.toml");
+        let dev_manifest = self.dev_manifests.read_dev_manifest().await?;
+        let dev_toml = manifest::to_toml(&dev_manifest).context("Cannot serialize dev manifest")?;
+        tokio::fs::write(&dev_manifest_path, dev_toml)
             .await
             .with_context(|| {
                 format!(
-                    "Cannot write dev lockfile to {}",
-                    dev_lockfile_path.display()
+                    "Cannot write dev manifest to {}",
+                    dev_manifest_path.display()
                 )
             })?;
 
         let output = Command::new(&self.gate_command)
-            .arg(&lockfile_path)
+            .arg(&manifest_path)
             .arg("--scratch")
             .arg(&scratch_dir)
             .arg("--output")
             .arg(&output_dir)
             .arg("--dev-lockfile")
-            .arg(&dev_lockfile_path)
+            .arg(&dev_manifest_path)
             .output()
             .await
             .with_context(|| format!("Cannot execute gate command `{}`", self.gate_command))?;
@@ -141,17 +141,17 @@ mod tests {
     use indexmap::IndexMap;
 
     use super::*;
-    use crate::henosis::environment::DevLockfileReader;
+    use crate::henosis::environment::DevManifestReader;
     use crate::henosis::gate_report::GateFailure;
     use crate::henosis::queue::{
         CandidateComponent, CandidateWorld, PENDING_STATUS, QueuePullRequest, RecordedGateRun,
     };
 
     #[derive(Clone)]
-    struct StaticDevLockfile(Lockfile);
+    struct StaticDevManifest(Manifest);
 
-    impl DevLockfileReader for StaticDevLockfile {
-        async fn read_dev_lockfile(&self) -> anyhow::Result<Lockfile> {
+    impl DevManifestReader for StaticDevManifest {
+        async fn read_dev_manifest(&self) -> anyhow::Result<Manifest> {
             Ok(self.0.clone())
         }
     }
@@ -214,19 +214,19 @@ mod tests {
     }
 
     #[test]
-    fn candidate_world_materializes_to_lockfile_components() {
+    fn candidate_world_materializes_to_manifest_components() {
         let run = gate_run("gate-1");
         assert_eq!(
             candidate_world_components(&run.world),
             IndexMap::from([(
                 "service-a".to_string(),
-                lockfile::pinned("henosis-playground/service-a", "a-pr", "sha256:a")
+                manifest::pinned("henosis-playground/service-a", "a-pr", "sha256:a")
             )])
         );
     }
 
     #[tokio::test]
-    async fn cli_gate_executor_writes_dev_lockfile_into_gate_tempdir() {
+    async fn cli_gate_executor_writes_dev_manifest_with_legacy_gate_flag() {
         let script_dir = tempfile::tempdir().unwrap();
         let script_path = script_dir.path().join("gate.sh");
         tokio::fs::write(
@@ -277,24 +277,24 @@ printf '{"ok":true,"failures":[]}\n' > "$output/report.json"
                 .unwrap();
         }
 
-        let dev_lockfile = Lockfile {
+        let dev_manifest = Manifest {
             environment: EnvironmentSection {
                 id: "dev".to_string(),
             },
             components: IndexMap::from([
                 (
                     "service-a".to_string(),
-                    lockfile::pinned("henosis-playground/service-a", "a-main", "sha256:a"),
+                    manifest::pinned("henosis-playground/service-a", "a-main", "sha256:a"),
                 ),
                 (
                     "service-b".to_string(),
-                    lockfile::pinned("henosis-playground/service-b", "b-main", "sha256:b"),
+                    manifest::pinned("henosis-playground/service-b", "b-main", "sha256:b"),
                 ),
             ]),
         };
         let executor = CliGateExecutor::new(
             script_path.to_string_lossy().to_string(),
-            StaticDevLockfile(dev_lockfile),
+            StaticDevManifest(dev_manifest),
         );
 
         let report = executor.execute(&gate_run("gate-1")).await.unwrap();

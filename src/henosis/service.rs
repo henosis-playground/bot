@@ -9,8 +9,8 @@ use crate::henosis::environment::{
 use crate::henosis::gate::CliGateExecutor;
 use crate::henosis::github::{
     GitHubMergeExecutor, GithubComponentPackageReader, GithubDeployRepoWriter,
-    GithubDevLockfileReader, GithubGateCheckReporter, GithubImageDigestResolver, GithubPrCommenter,
-    deploy_branch_url, deploy_lockfile_url,
+    GithubDevManifestReader, GithubGateCheckReporter, GithubImageDigestResolver, GithubPrCommenter,
+    deploy_branch_url, deploy_manifest_url,
 };
 use crate::henosis::queue::{
     GateStatus, QueueManager, QueuePullRequest, QueueStore, RecordedGateRun,
@@ -38,11 +38,11 @@ pub async fn open_preview_environment(
     let manager = EnvironmentManager::new(config.registered_components());
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
-    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.lockfile_branch);
-    let dev = GithubDevLockfileReader::new(
+    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.manifest_branch);
+    let dev = GithubDevManifestReader::new(
         &deploy_repo.client,
-        &config.lockfile_branch,
-        &config.dev_lockfile_path,
+        &config.manifest_branch,
+        &config.dev_manifest_path,
     );
     let packages = GithubComponentPackageReader::new(&ctx.repositories);
     let digest = GithubImageDigestResolver::new(&ctx.repositories);
@@ -68,11 +68,11 @@ pub async fn reopen_preview_environment(
     let manager = EnvironmentManager::new(config.registered_components());
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
-    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.lockfile_branch);
-    let dev = GithubDevLockfileReader::new(
+    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.manifest_branch);
+    let dev = GithubDevManifestReader::new(
         &deploy_repo.client,
-        &config.lockfile_branch,
-        &config.dev_lockfile_path,
+        &config.manifest_branch,
+        &config.dev_manifest_path,
     );
     let packages = GithubComponentPackageReader::new(&ctx.repositories);
     let digest = GithubImageDigestResolver::new(&ctx.repositories);
@@ -98,7 +98,7 @@ pub async fn retire_preview_environment(
     let manager = EnvironmentManager::new(config.registered_components());
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
-    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.lockfile_branch);
+    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.manifest_branch);
     let change = manager
         .retire_pr(
             &mut store,
@@ -125,11 +125,11 @@ pub async fn join_environment(
     let manager = EnvironmentManager::new(config.registered_components());
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
-    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.lockfile_branch);
-    let dev = GithubDevLockfileReader::new(
+    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.manifest_branch);
+    let dev = GithubDevManifestReader::new(
         &deploy_repo.client,
-        &config.lockfile_branch,
-        &config.dev_lockfile_path,
+        &config.manifest_branch,
+        &config.dev_manifest_path,
     );
     let packages = GithubComponentPackageReader::new(&ctx.repositories);
     let digest = GithubImageDigestResolver::new(&ctx.repositories);
@@ -155,11 +155,11 @@ pub async fn leave_environment(
     let manager = EnvironmentManager::new(config.registered_components());
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
-    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.lockfile_branch);
-    let dev = GithubDevLockfileReader::new(
+    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.manifest_branch);
+    let dev = GithubDevManifestReader::new(
         &deploy_repo.client,
-        &config.lockfile_branch,
-        &config.dev_lockfile_path,
+        &config.manifest_branch,
+        &config.dev_manifest_path,
     );
     let packages = GithubComponentPackageReader::new(&ctx.repositories);
     let digest = GithubImageDigestResolver::new(&ctx.repositories);
@@ -212,16 +212,16 @@ pub async fn tick_queue(ctx: &BorsContext) -> anyhow::Result<Option<RecordedGate
     let manager = QueueManager::new(config.registered_components());
     let mut store = PgQueueStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
-    let dev = GithubDevLockfileReader::new(
+    let dev = GithubDevManifestReader::new(
         &deploy_repo.client,
-        &config.lockfile_branch,
-        &config.dev_lockfile_path,
+        &config.manifest_branch,
+        &config.dev_manifest_path,
     );
     let reporter = GithubGateCheckReporter::new(&ctx.repositories, &config.gate_check_run_name);
-    let gate_dev = GithubDevLockfileReader::new(
+    let gate_dev = GithubDevManifestReader::new(
         &deploy_repo.client,
-        &config.lockfile_branch,
-        &config.dev_lockfile_path,
+        &config.manifest_branch,
+        &config.dev_manifest_path,
     );
     let gate_executor = CliGateExecutor::new(&config.gate_command, gate_dev);
     let merge_executor = GitHubMergeExecutor::new(
@@ -278,12 +278,12 @@ pub fn environment_change_comment(
     let mut lines = Vec::new();
     for write in &change.written {
         lines.push(format!(
-            "Preview environment `{}` is ready.\nLockfile: <{}>\nBranch: <{}>\nMembers: {}",
+            "Preview environment `{}` is ready.\nManifest: <{}>\nBranch: <{}>\nMembers: {}",
             write.id,
-            deploy_lockfile_url(
+            deploy_manifest_url(
                 &config.deploy_repo,
-                &config.lockfile_branch,
-                &write.lockfile_path
+                &config.manifest_branch,
+                &write.manifest_path
             ),
             deploy_branch_url(&config.deploy_repo, &write.branch),
             member_list(&write.members),
@@ -291,8 +291,8 @@ pub fn environment_change_comment(
     }
     for retired in &change.retired {
         lines.push(format!(
-            "Preview environment `{}` was retired.\nLockfile removed: `{}`\nBranch removed: `{}`",
-            retired.id, retired.lockfile_path, retired.branch
+            "Preview environment `{}` was retired.\nManifest removed: `{}`\nBranch removed: `{}`",
+            retired.id, retired.manifest_path, retired.branch
         ));
     }
     if lines.is_empty() {
@@ -308,12 +308,12 @@ pub fn environment_status_comment(
 ) -> String {
     match status {
         Some(status) => format!(
-            "Current preview environment: `{}`\nLockfile: <{}>\nBranch: <{}>\nMembers: {}",
+            "Current preview environment: `{}`\nManifest: <{}>\nBranch: <{}>\nMembers: {}",
             status.environment.id,
-            deploy_lockfile_url(
+            deploy_manifest_url(
                 &config.deploy_repo,
-                &config.lockfile_branch,
-                &status.environment.lockfile_path
+                &config.manifest_branch,
+                &status.environment.manifest_path
             ),
             deploy_branch_url(&config.deploy_repo, &status.branch),
             member_list(&status.members),

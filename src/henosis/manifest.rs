@@ -1,10 +1,10 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-/// The lockfile schema shared by the Henosis renderer and bot.
+/// The manifest schema shared by the Henosis renderer and bot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Lockfile {
+pub struct Manifest {
     pub environment: EnvironmentSection,
     pub components: IndexMap<String, ComponentEntry>,
 }
@@ -36,12 +36,12 @@ pub struct FollowerEntry {
     pub follow: String,
 }
 
-pub fn parse_toml(content: &str) -> Result<Lockfile, toml::de::Error> {
+pub fn parse_toml(content: &str) -> Result<Manifest, toml::de::Error> {
     toml::from_str(content)
 }
 
-pub fn to_toml(lockfile: &Lockfile) -> Result<String, toml::ser::Error> {
-    toml::to_string(lockfile)
+pub fn to_toml(manifest: &Manifest) -> Result<String, toml::ser::Error> {
+    toml::to_string(manifest)
 }
 
 pub fn pinned(
@@ -62,14 +62,14 @@ pub fn follower_dev() -> ComponentEntry {
     })
 }
 
-pub fn validate(lockfile: &Lockfile) -> anyhow::Result<()> {
-    let stable = matches!(lockfile.environment.id.as_str(), "dev" | "staging" | "prod");
+pub fn validate(manifest: &Manifest) -> anyhow::Result<()> {
+    let stable = matches!(manifest.environment.id.as_str(), "dev" | "staging" | "prod");
     if stable {
-        for (name, entry) in &lockfile.components {
+        for (name, entry) in &manifest.components {
             if matches!(entry, ComponentEntry::Follower(_)) {
                 anyhow::bail!(
                     "follower entry for component `{name}` is invalid in {}",
-                    lockfile.environment.id
+                    manifest.environment.id
                 );
             }
         }
@@ -82,7 +82,7 @@ mod tests {
     use super::*;
 
     const SCHEMA_EXAMPLE: &str = r#"
-# deploy repo: dev.toml | staging.toml | prod.toml | preview lockfiles (e.g. pr-service-a-3.toml)
+# deploy repo: dev.toml | staging.toml | prod.toml | preview manifests (e.g. pr-service-a-3.toml)
 
 [environment]
 id = "dev"   # canonical EnvId; must match the filename
@@ -91,10 +91,10 @@ id = "dev"   # canonical EnvId; must match the filename
 [components.service-a]
 repo = "henosis-playground/service-a"
 ref = "0a1b2c3d..."      # git commit sha. dev/staging/prod MUST pin shas.
-                          # Preview lockfiles may use a branch name here (the PR branch).
+                          # Preview manifests may use a branch name here (the PR branch).
 digest = "sha256:..."    # image digest; ref and digest travel as one unit (poc.md fixed decision)
 
-# --- Follower entry (preview lockfiles only): track dev ---
+# --- Follower entry (preview manifests only): track dev ---
 [components.service-b]
 follow = "dev"
 "#;
@@ -116,38 +116,38 @@ digest = "sha256:bbbb"
 
     #[test]
     fn parses_schema_example() {
-        let lockfile: Lockfile = toml::from_str(SCHEMA_EXAMPLE).unwrap();
+        let manifest: Manifest = toml::from_str(SCHEMA_EXAMPLE).unwrap();
 
-        assert_eq!(lockfile.environment.id, "dev");
+        assert_eq!(manifest.environment.id, "dev");
         assert!(matches!(
-            lockfile.components.get("service-a"),
+            manifest.components.get("service-a"),
             Some(ComponentEntry::Pinned(PinnedEntry { repo, r#ref, digest }))
                 if repo == "henosis-playground/service-a"
                     && r#ref == "0a1b2c3d..."
                     && digest == "sha256:..."
         ));
         assert!(matches!(
-            lockfile.components.get("service-b"),
+            manifest.components.get("service-b"),
             Some(ComponentEntry::Follower(FollowerEntry { follow })) if follow == "dev"
         ));
     }
 
     #[test]
     fn round_trips_schema_example() {
-        let lockfile: Lockfile = parse_toml(SCHEMA_EXAMPLE).unwrap();
-        let serialized = to_toml(&lockfile).unwrap();
-        let reparsed: Lockfile = parse_toml(&serialized).unwrap();
+        let manifest: Manifest = parse_toml(SCHEMA_EXAMPLE).unwrap();
+        let serialized = to_toml(&manifest).unwrap();
+        let reparsed: Manifest = parse_toml(&serialized).unwrap();
 
-        assert_eq!(lockfile, reparsed);
+        assert_eq!(manifest, reparsed);
     }
 
     #[test]
     fn round_trips_pinned_entries() {
-        let lockfile: Lockfile = parse_toml(PINNED_ONLY_EXAMPLE).unwrap();
-        let serialized = to_toml(&lockfile).unwrap();
-        let reparsed: Lockfile = parse_toml(&serialized).unwrap();
+        let manifest: Manifest = parse_toml(PINNED_ONLY_EXAMPLE).unwrap();
+        let serialized = to_toml(&manifest).unwrap();
+        let reparsed: Manifest = parse_toml(&serialized).unwrap();
 
-        assert_eq!(lockfile, reparsed);
+        assert_eq!(manifest, reparsed);
     }
 
     #[test]
@@ -163,18 +163,18 @@ digest = "sha256:aaaa"
 unexpected = true
 "#;
 
-        assert!(toml::from_str::<Lockfile>(content).is_err());
+        assert!(toml::from_str::<Manifest>(content).is_err());
     }
 
     #[test]
-    fn rejects_followers_in_stable_lockfiles() {
-        let lockfile = Lockfile {
+    fn rejects_followers_in_stable_manifests() {
+        let manifest = Manifest {
             environment: EnvironmentSection {
                 id: "dev".to_string(),
             },
             components: IndexMap::from([("service-a".to_string(), follower_dev())]),
         };
 
-        assert!(validate(&lockfile).is_err());
+        assert!(validate(&manifest).is_err());
     }
 }

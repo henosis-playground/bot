@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::henosis::config::RegisteredComponent;
 use crate::henosis::graph::{ComponentGraph, ComponentPackageReader, ComponentRef};
-use crate::henosis::lockfile::{
-    self, ComponentEntry, EnvironmentSection, Lockfile, PinnedEntry, follower_dev, pinned,
+use crate::henosis::manifest::{
+    self, ComponentEntry, EnvironmentSection, Manifest, PinnedEntry, follower_dev, pinned,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -53,14 +53,14 @@ impl PreviewPullRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentState {
     pub id: String,
-    pub lockfile_path: String,
+    pub manifest_path: String,
     pub is_preview: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentWrite {
     pub id: String,
-    pub lockfile_path: String,
+    pub manifest_path: String,
     pub branch: String,
     pub commit_sha: String,
     pub members: Vec<PreviewPullRequest>,
@@ -69,7 +69,7 @@ pub struct EnvironmentWrite {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetiredEnvironment {
     pub id: String,
-    pub lockfile_path: String,
+    pub manifest_path: String,
     pub branch: String,
 }
 
@@ -91,8 +91,8 @@ pub struct DeployWriteResult {
     pub commit_sha: String,
 }
 
-pub trait DevLockfileReader {
-    async fn read_dev_lockfile(&self) -> anyhow::Result<Lockfile>;
+pub trait DevManifestReader {
+    async fn read_dev_manifest(&self) -> anyhow::Result<Manifest>;
 }
 
 pub trait ImageDigestResolver {
@@ -100,12 +100,12 @@ pub trait ImageDigestResolver {
 }
 
 pub trait DeployRepoWriter {
-    async fn write_lockfile(
+    async fn write_manifest(
         &mut self,
         path: &str,
         contents: &str,
     ) -> anyhow::Result<DeployWriteResult>;
-    async fn delete_lockfile(&mut self, path: &str) -> anyhow::Result<()>;
+    async fn delete_manifest(&mut self, path: &str) -> anyhow::Result<()>;
     async fn create_branch(&mut self, branch: &str) -> anyhow::Result<()>;
     async fn delete_branch(&mut self, branch: &str) -> anyhow::Result<()>;
 }
@@ -114,7 +114,7 @@ pub trait EnvironmentStore {
     async fn upsert_environment(
         &mut self,
         id: &str,
-        lockfile_path: &str,
+        manifest_path: &str,
         is_preview: bool,
     ) -> anyhow::Result<()>;
     async fn retire_environment(&mut self, id: &str) -> anyhow::Result<()>;
@@ -130,7 +130,7 @@ pub trait EnvironmentStore {
     ) -> anyhow::Result<Option<EnvironmentState>>;
     async fn active_members(&self, environment_id: &str)
     -> anyhow::Result<Vec<PreviewPullRequest>>;
-    async fn record_lockfile_revision(
+    async fn record_manifest_revision(
         &mut self,
         environment_id: &str,
         commit_sha: &str,
@@ -151,7 +151,7 @@ impl EnvironmentManager {
         store: &mut S,
         writer: &mut W,
         package_reader: &R,
-        dev_lockfiles: &D,
+        dev_manifests: &D,
         digest_resolver: &impl ImageDigestResolver,
         pr: PreviewPullRequest,
     ) -> anyhow::Result<EnvironmentChange>
@@ -159,11 +159,11 @@ impl EnvironmentManager {
         S: EnvironmentStore,
         W: DeployRepoWriter,
         R: ComponentPackageReader,
-        D: DevLockfileReader,
+        D: DevManifestReader,
     {
         let id = solo_environment_id(&pr.key.repo, pr.key.number);
-        let lockfile_path = environment_lockfile_path(&id);
-        store.upsert_environment(&id, &lockfile_path, true).await?;
+        let manifest_path = environment_manifest_path(&id);
+        store.upsert_environment(&id, &manifest_path, true).await?;
         store.retire_member(&pr.key).await?;
         store.put_member(&id, &pr).await?;
 
@@ -172,7 +172,7 @@ impl EnvironmentManager {
                 store,
                 writer,
                 package_reader,
-                dev_lockfiles,
+                dev_manifests,
                 digest_resolver,
                 &id,
             )
@@ -189,7 +189,7 @@ impl EnvironmentManager {
         store: &mut S,
         writer: &mut W,
         package_reader: &R,
-        dev_lockfiles: &D,
+        dev_manifests: &D,
         digest_resolver: &impl ImageDigestResolver,
         pr: PreviewPullRequest,
     ) -> anyhow::Result<EnvironmentChange>
@@ -197,13 +197,13 @@ impl EnvironmentManager {
         S: EnvironmentStore,
         W: DeployRepoWriter,
         R: ComponentPackageReader,
-        D: DevLockfileReader,
+        D: DevManifestReader,
     {
         self.open_pr(
             store,
             writer,
             package_reader,
-            dev_lockfiles,
+            dev_manifests,
             digest_resolver,
             pr,
         )
@@ -232,7 +232,7 @@ impl EnvironmentManager {
         store: &mut S,
         writer: &mut W,
         package_reader: &R,
-        dev_lockfiles: &D,
+        dev_manifests: &D,
         digest_resolver: &impl ImageDigestResolver,
         pr: PreviewPullRequest,
         name: &str,
@@ -241,10 +241,10 @@ impl EnvironmentManager {
         S: EnvironmentStore,
         W: DeployRepoWriter,
         R: ComponentPackageReader,
-        D: DevLockfileReader,
+        D: DevManifestReader,
     {
         let target_id = shared_environment_id(name);
-        let target_path = environment_lockfile_path(&target_id);
+        let target_path = environment_manifest_path(&target_id);
         let previous = store.environment_for_pr(&pr.key).await?;
 
         store
@@ -267,7 +267,7 @@ impl EnvironmentManager {
                         store,
                         writer,
                         package_reader,
-                        dev_lockfiles,
+                        dev_manifests,
                         digest_resolver,
                         &previous.id,
                     )
@@ -281,7 +281,7 @@ impl EnvironmentManager {
                 store,
                 writer,
                 package_reader,
-                dev_lockfiles,
+                dev_manifests,
                 digest_resolver,
                 &target_id,
             )
@@ -295,7 +295,7 @@ impl EnvironmentManager {
         store: &mut S,
         writer: &mut W,
         package_reader: &R,
-        dev_lockfiles: &D,
+        dev_manifests: &D,
         digest_resolver: &impl ImageDigestResolver,
         pr: PreviewPullRequest,
     ) -> anyhow::Result<EnvironmentChange>
@@ -303,11 +303,11 @@ impl EnvironmentManager {
         S: EnvironmentStore,
         W: DeployRepoWriter,
         R: ComponentPackageReader,
-        D: DevLockfileReader,
+        D: DevManifestReader,
     {
         let previous = store.environment_for_pr(&pr.key).await?;
         let solo_id = solo_environment_id(&pr.key.repo, pr.key.number);
-        let solo_path = environment_lockfile_path(&solo_id);
+        let solo_path = environment_manifest_path(&solo_id);
 
         store.upsert_environment(&solo_id, &solo_path, true).await?;
         store.retire_member(&pr.key).await?;
@@ -327,7 +327,7 @@ impl EnvironmentManager {
                         store,
                         writer,
                         package_reader,
-                        dev_lockfiles,
+                        dev_manifests,
                         digest_resolver,
                         &previous.id,
                     )
@@ -341,7 +341,7 @@ impl EnvironmentManager {
                 store,
                 writer,
                 package_reader,
-                dev_lockfiles,
+                dev_manifests,
                 digest_resolver,
                 &solo_id,
             )
@@ -374,7 +374,7 @@ impl EnvironmentManager {
         store: &mut S,
         writer: &mut W,
         package_reader: &R,
-        dev_lockfiles: &D,
+        dev_manifests: &D,
         digest_resolver: &impl ImageDigestResolver,
         environment_id: &str,
     ) -> anyhow::Result<EnvironmentWrite>
@@ -382,7 +382,7 @@ impl EnvironmentManager {
         S: EnvironmentStore,
         W: DeployRepoWriter,
         R: ComponentPackageReader,
-        D: DevLockfileReader,
+        D: DevManifestReader,
     {
         let environment = store
             .active_members(environment_id)
@@ -392,46 +392,46 @@ impl EnvironmentManager {
             !environment.is_empty(),
             "cannot write environment `{environment_id}` with no active members"
         );
-        let lockfile = self
-            .build_lockfile(
+        let manifest = self
+            .build_manifest(
                 package_reader,
-                dev_lockfiles,
+                dev_manifests,
                 digest_resolver,
                 environment_id,
                 &environment,
             )
             .await?;
-        let contents = lockfile::to_toml(&lockfile)?;
-        let lockfile_path = environment_lockfile_path(environment_id);
-        let result = writer.write_lockfile(&lockfile_path, &contents).await?;
+        let contents = manifest::to_toml(&manifest)?;
+        let manifest_path = environment_manifest_path(environment_id);
+        let result = writer.write_manifest(&manifest_path, &contents).await?;
         store
-            .record_lockfile_revision(environment_id, &result.commit_sha)
+            .record_manifest_revision(environment_id, &result.commit_sha)
             .await?;
         let branch = environment_branch(environment_id);
         writer.create_branch(&branch).await?;
 
         Ok(EnvironmentWrite {
             id: environment_id.to_string(),
-            lockfile_path,
+            manifest_path,
             branch,
             commit_sha: result.commit_sha,
             members: environment,
         })
     }
 
-    async fn build_lockfile<R, D>(
+    async fn build_manifest<R, D>(
         &self,
         package_reader: &R,
-        dev_lockfiles: &D,
+        dev_manifests: &D,
         digest_resolver: &impl ImageDigestResolver,
         environment_id: &str,
         members: &[PreviewPullRequest],
-    ) -> anyhow::Result<Lockfile>
+    ) -> anyhow::Result<Manifest>
     where
         R: ComponentPackageReader,
-        D: DevLockfileReader,
+        D: DevManifestReader,
     {
-        let dev = dev_lockfiles.read_dev_lockfile().await?;
+        let dev = dev_manifests.read_dev_manifest().await?;
         let dev_pins = dev_pins(&dev)?;
         let members_by_component = members
             .iter()
@@ -487,7 +487,7 @@ impl EnvironmentManager {
             components.insert(component.name.clone(), entry);
         }
 
-        Ok(Lockfile {
+        Ok(Manifest {
             environment: EnvironmentSection {
                 id: environment_id.to_string(),
             },
@@ -510,7 +510,7 @@ impl EnvironmentManager {
             return Ok(EnvironmentChange::default());
         }
 
-        writer.delete_lockfile(&environment.lockfile_path).await?;
+        writer.delete_manifest(&environment.manifest_path).await?;
         let branch = environment_branch(&environment.id);
         writer.delete_branch(&branch).await?;
         store.retire_environment(&environment.id).await?;
@@ -518,7 +518,7 @@ impl EnvironmentManager {
             written: vec![],
             retired: vec![RetiredEnvironment {
                 id: environment.id.clone(),
-                lockfile_path: environment.lockfile_path.clone(),
+                manifest_path: environment.manifest_path.clone(),
                 branch,
             }],
         })
@@ -541,7 +541,7 @@ pub fn shared_environment_id(name: &str) -> String {
     slugify(name)
 }
 
-pub fn environment_lockfile_path(environment_id: &str) -> String {
+pub fn environment_manifest_path(environment_id: &str) -> String {
     format!("{environment_id}.toml")
 }
 
@@ -579,14 +579,14 @@ pub fn slugify(input: &str) -> String {
     }
 }
 
-fn dev_pins(lockfile: &Lockfile) -> anyhow::Result<BTreeMap<String, PinnedEntry>> {
-    lockfile
+fn dev_pins(manifest: &Manifest) -> anyhow::Result<BTreeMap<String, PinnedEntry>> {
+    manifest
         .components
         .iter()
         .map(|(name, entry)| match entry {
             ComponentEntry::Pinned(pin) => Ok((name.clone(), pin.clone())),
             ComponentEntry::Follower(_) => {
-                anyhow::bail!("dev lockfile contains follower entry for `{name}`")
+                anyhow::bail!("dev manifest contains follower entry for `{name}`")
             }
         })
         .collect()
@@ -603,10 +603,10 @@ mod tests {
     use crate::henosis::graph::{PackageHenosis, PackageJson};
 
     #[derive(Clone)]
-    struct StaticDevLockfile(Lockfile);
+    struct StaticDevManifest(Manifest);
 
-    impl DevLockfileReader for StaticDevLockfile {
-        async fn read_dev_lockfile(&self) -> anyhow::Result<Lockfile> {
+    impl DevManifestReader for StaticDevManifest {
+        async fn read_dev_manifest(&self) -> anyhow::Result<Manifest> {
             Ok(self.0.clone())
         }
     }
@@ -622,14 +622,14 @@ mod tests {
     #[derive(Default)]
     struct MemoryWriter {
         writes: BTreeMap<String, String>,
-        deleted_lockfiles: Vec<String>,
+        deleted_manifests: Vec<String>,
         created_branches: Vec<String>,
         deleted_branches: Vec<String>,
         commit_counter: u64,
     }
 
     impl DeployRepoWriter for MemoryWriter {
-        async fn write_lockfile(
+        async fn write_manifest(
             &mut self,
             path: &str,
             contents: &str,
@@ -641,8 +641,8 @@ mod tests {
             })
         }
 
-        async fn delete_lockfile(&mut self, path: &str) -> anyhow::Result<()> {
-            self.deleted_lockfiles.push(path.to_string());
+        async fn delete_manifest(&mut self, path: &str) -> anyhow::Result<()> {
+            self.deleted_manifests.push(path.to_string());
             self.writes.remove(path);
             Ok(())
         }
@@ -670,7 +670,7 @@ mod tests {
         async fn upsert_environment(
             &mut self,
             id: &str,
-            lockfile_path: &str,
+            manifest_path: &str,
             is_preview: bool,
         ) -> anyhow::Result<()> {
             self.retired_environments.remove(id);
@@ -678,7 +678,7 @@ mod tests {
                 id.to_string(),
                 EnvironmentState {
                     id: id.to_string(),
-                    lockfile_path: lockfile_path.to_string(),
+                    manifest_path: manifest_path.to_string(),
                     is_preview,
                 },
             );
@@ -732,7 +732,7 @@ mod tests {
             Ok(members)
         }
 
-        async fn record_lockfile_revision(
+        async fn record_manifest_revision(
             &mut self,
             environment_id: &str,
             commit_sha: &str,
@@ -756,7 +756,7 @@ mod tests {
         }
     }
 
-    fn package(name: &str, component: &str, surface: bool, deps: &[&str]) -> PackageJson {
+    fn package(name: &str, component: &str, deps: &[&str]) -> PackageJson {
         PackageJson {
             name: name.to_string(),
             dependencies: deps
@@ -765,7 +765,6 @@ mod tests {
                 .collect(),
             henosis: PackageHenosis {
                 component: Some(component.to_string()),
-                surface,
             },
         }
     }
@@ -785,8 +784,8 @@ mod tests {
         ]
     }
 
-    fn dev_lockfile() -> Lockfile {
-        Lockfile {
+    fn dev_manifest() -> Manifest {
+        Manifest {
             environment: EnvironmentSection {
                 id: "dev".to_string(),
             },
@@ -804,11 +803,10 @@ mod tests {
     }
 
     fn package_reader() -> MemoryPackageReader {
-        let service_a = package("@henosis/service-a", "service-a", false, &["@henosis/sdk"]);
+        let service_a = package("@henosis/service-a", "service-a", &["@henosis/sdk"]);
         let service_b = package(
             "@henosis/service-b",
             "service-b",
-            true,
             &["@henosis/sdk", "@henosis/service-a"],
         );
         MemoryPackageReader {
@@ -847,8 +845,8 @@ mod tests {
         }
     }
 
-    fn read_written(writer: &MemoryWriter, path: &str) -> Lockfile {
-        lockfile::parse_toml(writer.writes.get(path).unwrap()).unwrap()
+    fn read_written(writer: &MemoryWriter, path: &str) -> Manifest {
+        manifest::parse_toml(writer.writes.get(path).unwrap()).unwrap()
     }
 
     #[tokio::test]
@@ -857,7 +855,7 @@ mod tests {
         let mut store = MemoryStore::default();
         let mut writer = MemoryWriter::default();
         let packages = package_reader();
-        let dev = StaticDevLockfile(dev_lockfile());
+        let dev = StaticDevManifest(dev_manifest());
         let digest = NoDigestResolver;
 
         let change = manager
@@ -880,14 +878,14 @@ mod tests {
 
         assert_eq!(change.written[0].id, "pr-service-a-3");
         assert_eq!(writer.created_branches, vec!["env/pr-service-a-3"]);
-        let lockfile = read_written(&writer, "pr-service-a-3.toml");
+        let manifest = read_written(&writer, "pr-service-a-3.toml");
         assert!(matches!(
-            lockfile.components.get("service-a"),
+            manifest.components.get("service-a"),
             Some(ComponentEntry::Pinned(PinnedEntry { r#ref, digest, .. }))
                 if r#ref == "pr/3" && digest == "sha256:a"
         ));
         assert!(matches!(
-            lockfile.components.get("service-b"),
+            manifest.components.get("service-b"),
             Some(ComponentEntry::Pinned(PinnedEntry { r#ref, .. })) if r#ref == "b-main"
         ));
 
@@ -901,17 +899,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(close.retired[0].id, "pr-service-a-3");
-        assert_eq!(writer.deleted_lockfiles, vec!["pr-service-a-3.toml"]);
+        assert_eq!(writer.deleted_manifests, vec!["pr-service-a-3.toml"]);
         assert_eq!(writer.deleted_branches, vec!["env/pr-service-a-3"]);
     }
 
     #[tokio::test]
-    async fn join_and_leave_regenerate_affected_lockfiles() {
+    async fn join_and_leave_regenerate_affected_manifests() {
         let manager = EnvironmentManager::new(components());
         let mut store = MemoryStore::default();
         let mut writer = MemoryWriter::default();
         let packages = package_reader();
-        let dev = StaticDevLockfile(dev_lockfile());
+        let dev = StaticDevManifest(dev_manifest());
         let digest = NoDigestResolver;
         let service_a = PreviewPullRequest::new(
             "henosis-playground/service-a",
@@ -986,12 +984,12 @@ mod tests {
         ));
         assert!(
             writer
-                .deleted_lockfiles
+                .deleted_manifests
                 .contains(&"pr-service-a-3.toml".to_string())
         );
         assert!(
             writer
-                .deleted_lockfiles
+                .deleted_manifests
                 .contains(&"pr-service-b-7.toml".to_string())
         );
 

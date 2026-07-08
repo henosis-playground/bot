@@ -1,13 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
 use crate::henosis::config::RegisteredComponent;
-
-const HENOSIS_SCOPE: &str = "@henosis/";
-const HENOSIS_SDK_PACKAGE: &str = "@henosis/sdk";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentRef {
@@ -38,8 +35,6 @@ pub struct PackageJson {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct PackageHenosis {
     pub component: Option<String>,
-    #[serde(default)]
-    pub surface: bool,
 }
 
 pub trait ComponentPackageReader {
@@ -52,7 +47,6 @@ pub struct ComponentNode {
     pub package_name: String,
     pub repo: String,
     pub sha: String,
-    pub surface: bool,
     pub dependencies: BTreeSet<String>,
 }
 
@@ -83,33 +77,20 @@ impl ComponentGraph {
 
         let package_to_component = packages
             .iter()
-            .map(|(registered, package)| {
-                (
-                    package.name.clone(),
-                    package
-                        .henosis
-                        .component
-                        .clone()
-                        .unwrap_or_else(|| registered.name.clone()),
-                )
+            .map(|(component, package)| {
+                validate_component_identity(component, package)?;
+                Ok((package.name.clone(), component.name.clone()))
             })
-            .collect::<BTreeMap<_, _>>();
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
 
         let mut nodes = IndexMap::new();
         let mut reverse_edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for (registered, package) in packages {
-            let name = package
-                .henosis
-                .component
-                .clone()
-                .unwrap_or_else(|| registered.name.clone());
+        for (component, package) in packages {
+            let name = component.name.clone();
             let dependencies = package
                 .dependencies
                 .keys()
-                .filter(|package_name| is_henosis_component_dependency(package_name))
-                .filter_map(|package_name| {
-                    component_name_for_package(package_name, &package_to_component)
-                })
+                .filter_map(|package_name| package_to_component.get(package_name).cloned())
                 .collect::<BTreeSet<_>>();
 
             for dependency in &dependencies {
@@ -124,18 +105,19 @@ impl ComponentGraph {
                 ComponentNode {
                     name,
                     package_name: package.name,
-                    repo: registered.repo.clone(),
-                    sha: registered.sha.clone(),
-                    surface: package.henosis.surface,
+                    repo: component.repo.clone(),
+                    sha: component.sha.clone(),
                     dependencies,
                 },
             );
         }
 
-        Ok(Self {
+        let graph = Self {
             nodes,
             reverse_edges,
-        })
+        };
+        graph.ensure_acyclic()?;
+        Ok(graph)
     }
 
     pub fn from_registered_components(
@@ -181,15 +163,6 @@ impl ComponentGraph {
         }
 
         while let Some(component) = queue.pop_front() {
-            if self
-                .nodes
-                .get(&component)
-                .map(|node| node.surface)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-
             let Some(dependents) = self.reverse_edges.get(&component) else {
                 continue;
             };
@@ -203,20 +176,69 @@ impl ComponentGraph {
 
         closure
     }
+
+    fn ensure_acyclic(&self) -> anyhow::Result<()> {
+        let mut visiting = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        let mut stack = Vec::new();
+
+        for name in self.nodes.keys() {
+            self.visit_for_cycle(name, &mut visiting, &mut visited, &mut stack)?;
+        }
+
+        Ok(())
+    }
+
+    fn visit_for_cycle(
+        &self,
+        name: &str,
+        visiting: &mut BTreeSet<String>,
+        visited: &mut BTreeSet<String>,
+        stack: &mut Vec<String>,
+    ) -> anyhow::Result<()> {
+        if visited.contains(name) {
+            return Ok(());
+        }
+        if visiting.contains(name) {
+            let start = stack
+                .iter()
+                .position(|component| component == name)
+                .unwrap_or(0);
+            let mut cycle = stack[start..].to_vec();
+            cycle.push(name.to_string());
+            return Err(anyhow!(
+                "component dependency cycle detected: {}",
+                cycle.join(" -> ")
+            ));
+        }
+
+        visiting.insert(name.to_string());
+        stack.push(name.to_string());
+        if let Some(node) = self.nodes.get(name) {
+            for dependency in &node.dependencies {
+                self.visit_for_cycle(dependency, visiting, visited, stack)?;
+            }
+        }
+        stack.pop();
+        visiting.remove(name);
+        visited.insert(name.to_string());
+        Ok(())
+    }
 }
 
-fn is_henosis_component_dependency(package_name: &str) -> bool {
-    package_name.starts_with(HENOSIS_SCOPE) && package_name != HENOSIS_SDK_PACKAGE
-}
-
-fn component_name_for_package(
-    package_name: &str,
-    package_to_component: &BTreeMap<String, String>,
-) -> Option<String> {
-    package_to_component
-        .get(package_name)
-        .cloned()
-        .or_else(|| package_name.strip_prefix(HENOSIS_SCOPE).map(str::to_string))
+fn validate_component_identity(
+    component: &ComponentRef,
+    package: &PackageJson,
+) -> anyhow::Result<()> {
+    if let Some(declared) = &package.henosis.component {
+        anyhow::ensure!(
+            declared == &component.name,
+            "package `{}` declares Henosis component `{declared}`, but candidate manifest entry is `{}`",
+            package.name,
+            component.name
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -247,7 +269,7 @@ mod tests {
         }
     }
 
-    fn package(name: &str, component: &str, surface: bool, deps: &[&str]) -> PackageJson {
+    fn package(name: &str, component: &str, deps: &[&str]) -> PackageJson {
         PackageJson {
             name: name.to_string(),
             dependencies: deps
@@ -256,18 +278,21 @@ mod tests {
                 .collect(),
             henosis: PackageHenosis {
                 component: Some(component.to_string()),
-                surface,
             },
         }
     }
 
     #[tokio::test]
-    async fn closure_walks_reverse_edges_to_nearest_surface() {
+    async fn closure_walks_all_transitive_reverse_dependents() {
         let reader = InMemoryPackageReader::new(vec![
             (
                 "henosis-playground/service-a",
                 "a-main",
-                package("@henosis/service-a", "service-a", false, &["@henosis/sdk"]),
+                package(
+                    "@henosis/service-a",
+                    "service-a",
+                    &["@henosis/platform-mock"],
+                ),
             ),
             (
                 "henosis-playground/service-b",
@@ -275,9 +300,57 @@ mod tests {
                 package(
                     "@henosis/service-b",
                     "service-b",
-                    true,
-                    &["@henosis/sdk", "@henosis/service-a"],
+                    &["@henosis/platform-mock", "@henosis/service-a"],
                 ),
+            ),
+            (
+                "henosis-playground/service-c",
+                "c-main",
+                package(
+                    "@henosis/service-c",
+                    "service-c",
+                    &["@henosis/platform-mock", "@henosis/service-b"],
+                ),
+            ),
+        ]);
+        let components = vec![
+            ComponentRef::new("service-a", "henosis-playground/service-a", "a-main"),
+            ComponentRef::new("service-b", "henosis-playground/service-b", "b-main"),
+            ComponentRef::new("service-c", "henosis-playground/service-c", "c-main"),
+        ];
+
+        let graph = ComponentGraph::read(&components, &reader).await.unwrap();
+
+        assert_eq!(
+            graph.preview_closure(["service-a"]),
+            BTreeSet::from([
+                "service-a".to_string(),
+                "service-b".to_string(),
+                "service-c".to_string()
+            ])
+        );
+        assert_eq!(
+            graph.preview_closure(["service-b"]),
+            BTreeSet::from(["service-b".to_string(), "service-c".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_non_manifest_henosis_package_dependencies() {
+        let reader = InMemoryPackageReader::new(vec![
+            (
+                "henosis-playground/service-a",
+                "a-main",
+                package(
+                    "@henosis/service-a",
+                    "service-a",
+                    &["@henosis/platform-mock", "@henosis/test-helper"],
+                ),
+            ),
+            (
+                "henosis-playground/service-b",
+                "b-main",
+                package("@henosis/service-b", "service-b", &[]),
             ),
         ]);
         let components = vec![
@@ -288,12 +361,62 @@ mod tests {
         let graph = ComponentGraph::read(&components, &reader).await.unwrap();
 
         assert_eq!(
-            graph.preview_closure(["service-a"]),
-            BTreeSet::from(["service-a".to_string(), "service-b".to_string()])
+            graph.node("service-a").unwrap().dependencies,
+            BTreeSet::new()
         );
         assert_eq!(
             graph.preview_closure(["service-b"]),
             BTreeSet::from(["service-b".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_component_dependency_cycles() {
+        let reader = InMemoryPackageReader::new(vec![
+            (
+                "henosis-playground/service-a",
+                "a-main",
+                package("@henosis/service-a", "service-a", &["@henosis/service-b"]),
+            ),
+            (
+                "henosis-playground/service-b",
+                "b-main",
+                package("@henosis/service-b", "service-b", &["@henosis/service-a"]),
+            ),
+        ]);
+        let components = vec![
+            ComponentRef::new("service-a", "henosis-playground/service-a", "a-main"),
+            ComponentRef::new("service-b", "henosis-playground/service-b", "b-main"),
+        ];
+
+        let error = ComponentGraph::read(&components, &reader)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("component dependency cycle detected"));
+        assert!(error.contains("service-a"));
+        assert!(error.contains("service-b"));
+    }
+
+    #[tokio::test]
+    async fn rejects_package_identity_mismatches() {
+        let reader = InMemoryPackageReader::new(vec![(
+            "henosis-playground/service-a",
+            "a-main",
+            package("@henosis/service-a", "not-service-a", &[]),
+        )]);
+        let components = vec![ComponentRef::new(
+            "service-a",
+            "henosis-playground/service-a",
+            "a-main",
+        )];
+
+        let error = ComponentGraph::read(&components, &reader)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("candidate manifest entry"));
     }
 }

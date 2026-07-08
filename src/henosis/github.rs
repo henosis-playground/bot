@@ -13,12 +13,12 @@ use crate::github::api::client::{CheckRunOutput, GithubRepositoryClient};
 use crate::github::{CommitSha, GithubRepoName, PullRequestNumber};
 use crate::henosis::config::HenosisConfig;
 use crate::henosis::environment::{
-    DeployRepoWriter, DeployWriteResult, DevLockfileReader, ImageDigestResolver,
+    DeployRepoWriter, DeployWriteResult, DevManifestReader, ImageDigestResolver,
 };
 use crate::henosis::graph::{ComponentPackageReader, PackageJson};
-use crate::henosis::lockfile::{self, ComponentEntry, Lockfile, PinnedEntry};
+use crate::henosis::manifest::{self, ComponentEntry, Manifest, PinnedEntry};
 use crate::henosis::merge::{
-    DevBump, DevLockfileBumper, MergeExecutor, PullRequestMerger, StateMachineMergeExecutor,
+    DevBump, DevManifestBumper, MergeExecutor, PullRequestMerger, StateMachineMergeExecutor,
 };
 use crate::henosis::queue::{
     CheckConclusion, GateCheckReporter, GateRun, PrCommenter, QueuePullRequest,
@@ -26,20 +26,20 @@ use crate::henosis::queue::{
 
 pub struct GithubDeployRepoWriter<'a> {
     client: &'a GithubRepositoryClient,
-    lockfile_branch: String,
+    manifest_branch: String,
 }
 
 impl<'a> GithubDeployRepoWriter<'a> {
-    pub fn new(client: &'a GithubRepositoryClient, lockfile_branch: impl Into<String>) -> Self {
+    pub fn new(client: &'a GithubRepositoryClient, manifest_branch: impl Into<String>) -> Self {
         Self {
             client,
-            lockfile_branch: lockfile_branch.into(),
+            manifest_branch: manifest_branch.into(),
         }
     }
 }
 
 impl DeployRepoWriter for GithubDeployRepoWriter<'_> {
-    async fn write_lockfile(
+    async fn write_manifest(
         &mut self,
         path: &str,
         contents: &str,
@@ -48,8 +48,8 @@ impl DeployRepoWriter for GithubDeployRepoWriter<'_> {
             .client
             .write_file_to_branch(
                 path,
-                &self.lockfile_branch,
-                &format!("Update Henosis lockfile {path}"),
+                &self.manifest_branch,
+                &format!("Update Henosis manifest {path}"),
                 contents,
             )
             .await?;
@@ -58,12 +58,12 @@ impl DeployRepoWriter for GithubDeployRepoWriter<'_> {
         })
     }
 
-    async fn delete_lockfile(&mut self, path: &str) -> anyhow::Result<()> {
+    async fn delete_manifest(&mut self, path: &str) -> anyhow::Result<()> {
         self.client
             .delete_file_from_branch(
                 path,
-                &self.lockfile_branch,
-                &format!("Delete Henosis lockfile {path}"),
+                &self.manifest_branch,
+                &format!("Delete Henosis manifest {path}"),
             )
             .await?;
         Ok(())
@@ -74,7 +74,7 @@ impl DeployRepoWriter for GithubDeployRepoWriter<'_> {
             return Ok(());
         }
 
-        let base = self.client.get_branch_sha(&self.lockfile_branch).await?;
+        let base = self.client.get_branch_sha(&self.manifest_branch).await?;
         if let Err(error) = self.client.create_branch(branch, &base).await {
             if self.client.get_branch_sha(branch).await.is_ok() {
                 return Ok(());
@@ -90,33 +90,33 @@ impl DeployRepoWriter for GithubDeployRepoWriter<'_> {
     }
 }
 
-pub struct GithubDevLockfileReader<'a> {
+pub struct GithubDevManifestReader<'a> {
     client: &'a GithubRepositoryClient,
-    lockfile_branch: String,
-    dev_lockfile_path: String,
+    manifest_branch: String,
+    dev_manifest_path: String,
 }
 
-impl<'a> GithubDevLockfileReader<'a> {
+impl<'a> GithubDevManifestReader<'a> {
     pub fn new(
         client: &'a GithubRepositoryClient,
-        lockfile_branch: impl Into<String>,
-        dev_lockfile_path: impl Into<String>,
+        manifest_branch: impl Into<String>,
+        dev_manifest_path: impl Into<String>,
     ) -> Self {
         Self {
             client,
-            lockfile_branch: lockfile_branch.into(),
-            dev_lockfile_path: dev_lockfile_path.into(),
+            manifest_branch: manifest_branch.into(),
+            dev_manifest_path: dev_manifest_path.into(),
         }
     }
 }
 
-impl DevLockfileReader for GithubDevLockfileReader<'_> {
-    async fn read_dev_lockfile(&self) -> anyhow::Result<Lockfile> {
+impl DevManifestReader for GithubDevManifestReader<'_> {
+    async fn read_dev_manifest(&self) -> anyhow::Result<Manifest> {
         let file = self
             .client
-            .read_file_at_ref(&self.dev_lockfile_path, &self.lockfile_branch)
+            .read_file_at_ref(&self.dev_manifest_path, &self.manifest_branch)
             .await?;
-        lockfile::parse_toml(&file.content).context("Cannot parse dev lockfile")
+        manifest::parse_toml(&file.content).context("Cannot parse dev manifest")
     }
 }
 
@@ -413,7 +413,7 @@ impl MergeExecutor for GitHubMergeExecutor<'_> {
     async fn execute(&self, gate_run: &GateRun) -> anyhow::Result<()> {
         let store = crate::henosis::db::PgQueueStore::new(self.pool.clone());
         let merger = GithubPullRequestMerger::new(self.repositories);
-        let bumper = GithubDevLockfileBumper::new(self.repositories, self.config);
+        let bumper = GithubDevManifestBumper::new(self.repositories, self.config);
         let commenter = GithubPrCommenter::new(self.repositories, self.db);
         StateMachineMergeExecutor::new(store, merger, bumper, commenter)
             .execute(gate_run)
@@ -472,12 +472,12 @@ async fn squash_merge_pull_request(
     Ok(CommitSha(response.sha))
 }
 
-pub struct GithubDevLockfileBumper<'a> {
+pub struct GithubDevManifestBumper<'a> {
     repositories: &'a RepositoryStore,
     config: &'a HenosisConfig,
 }
 
-impl<'a> GithubDevLockfileBumper<'a> {
+impl<'a> GithubDevManifestBumper<'a> {
     pub fn new(repositories: &'a RepositoryStore, config: &'a HenosisConfig) -> Self {
         Self {
             repositories,
@@ -486,8 +486,8 @@ impl<'a> GithubDevLockfileBumper<'a> {
     }
 }
 
-impl DevLockfileBumper for GithubDevLockfileBumper<'_> {
-    async fn bump_dev_lockfile(
+impl DevManifestBumper for GithubDevManifestBumper<'_> {
+    async fn bump_dev_manifest(
         &self,
         gate_run: &GateRun,
         merge_commit_sha: &str,
@@ -502,10 +502,10 @@ impl DevLockfileBumper for GithubDevLockfileBumper<'_> {
 
         let current = deploy_repo
             .client
-            .read_file_at_ref(&self.config.dev_lockfile_path, &self.config.lockfile_branch)
+            .read_file_at_ref(&self.config.dev_manifest_path, &self.config.manifest_branch)
             .await?;
-        let mut lockfile =
-            lockfile::parse_toml(&current.content).context("Cannot parse dev lockfile")?;
+        let mut manifest =
+            manifest::parse_toml(&current.content).context("Cannot parse dev manifest")?;
         let digest = GithubImageDigestResolver::new(self.repositories);
 
         for component in gate_run
@@ -518,7 +518,7 @@ impl DevLockfileBumper for GithubDevLockfileBumper<'_> {
                 .image_digest(&component.repo, merge_commit_sha)
                 .await?
                 .unwrap_or_else(|| component.digest.clone());
-            lockfile.components.insert(
+            manifest.components.insert(
                 component.name.clone(),
                 ComponentEntry::Pinned(PinnedEntry {
                     repo: component.repo.clone(),
@@ -528,13 +528,13 @@ impl DevLockfileBumper for GithubDevLockfileBumper<'_> {
             );
         }
 
-        let serialized = lockfile::to_toml(&lockfile).context("Cannot serialize dev lockfile")?;
+        let serialized = manifest::to_toml(&manifest).context("Cannot serialize dev manifest")?;
         let commit_sha = deploy_repo
             .client
             .write_file_to_branch(
-                &self.config.dev_lockfile_path,
-                &self.config.lockfile_branch,
-                "Bump Henosis dev lockfile",
+                &self.config.dev_manifest_path,
+                &self.config.manifest_branch,
+                "Bump Henosis dev manifest",
                 &serialized,
             )
             .await?;
@@ -550,7 +550,7 @@ impl DevLockfileBumper for GithubDevLockfileBumper<'_> {
     }
 }
 
-pub fn deploy_lockfile_url(deploy_repo: &str, branch: &str, path: &str) -> String {
+pub fn deploy_manifest_url(deploy_repo: &str, branch: &str, path: &str) -> String {
     format!("https://github.com/{deploy_repo}/blob/{branch}/{path}")
 }
 

@@ -5,9 +5,9 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::henosis::config::RegisteredComponent;
-use crate::henosis::environment::{DevLockfileReader, PullRequestKey};
+use crate::henosis::environment::{DevManifestReader, PullRequestKey};
 use crate::henosis::gate::GateExecutor;
-use crate::henosis::lockfile::{ComponentEntry, PinnedEntry};
+use crate::henosis::manifest::{ComponentEntry, PinnedEntry};
 use crate::henosis::merge::MergeExecutor;
 
 pub const GLOBAL_QUEUE_LOCK_KEY: i64 = 0x4845_4e4f_5155_4555;
@@ -138,7 +138,7 @@ impl QueueManager {
     pub async fn tick<S, D, R, E, M, C>(
         &self,
         store: &mut S,
-        dev_lockfiles: &D,
+        dev_manifests: &D,
         check_reporter: &R,
         gate_executor: &E,
         merge_executor: &M,
@@ -146,7 +146,7 @@ impl QueueManager {
     ) -> anyhow::Result<Option<RecordedGateRun>>
     where
         S: QueueStore,
-        D: DevLockfileReader,
+        D: DevManifestReader,
         R: GateCheckReporter,
         E: GateExecutor,
         M: MergeExecutor,
@@ -159,7 +159,7 @@ impl QueueManager {
         let result = self
             .tick_with_lock(
                 store,
-                dev_lockfiles,
+                dev_manifests,
                 check_reporter,
                 gate_executor,
                 merge_executor,
@@ -178,7 +178,7 @@ impl QueueManager {
     async fn tick_with_lock<S, D, R, E, M, C>(
         &self,
         store: &mut S,
-        dev_lockfiles: &D,
+        dev_manifests: &D,
         check_reporter: &R,
         gate_executor: &E,
         merge_executor: &M,
@@ -186,7 +186,7 @@ impl QueueManager {
     ) -> anyhow::Result<Option<RecordedGateRun>>
     where
         S: QueueStore,
-        D: DevLockfileReader,
+        D: DevManifestReader,
         R: GateCheckReporter,
         E: GateExecutor,
         M: MergeExecutor,
@@ -202,7 +202,7 @@ impl QueueManager {
         };
 
         let world = self
-            .candidate_world(dev_lockfiles, vec![candidate.clone()])
+            .candidate_world(dev_manifests, vec![candidate.clone()])
             .await?;
         let mut gate_run = store.record_gate_run(&world).await?;
         for member in &world.members {
@@ -287,20 +287,20 @@ impl QueueManager {
 
     async fn candidate_world<D>(
         &self,
-        dev_lockfiles: &D,
+        dev_manifests: &D,
         members: Vec<QueuePullRequest>,
     ) -> anyhow::Result<CandidateWorld>
     where
-        D: DevLockfileReader,
+        D: DevManifestReader,
     {
-        let dev = dev_lockfiles.read_dev_lockfile().await?;
+        let dev = dev_manifests.read_dev_manifest().await?;
         let dev_pins = dev
             .components
             .iter()
             .map(|(name, entry)| match entry {
                 ComponentEntry::Pinned(pin) => Ok((name.clone(), pin.clone())),
                 ComponentEntry::Follower(_) => {
-                    anyhow::bail!("dev lockfile contains follower entry for `{name}`")
+                    anyhow::bail!("dev manifest contains follower entry for `{name}`")
                 }
             })
             .collect::<anyhow::Result<BTreeMap<String, PinnedEntry>>>()?;
@@ -373,18 +373,18 @@ pub fn gate_external_id(world: &CandidateWorld) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::henosis::environment::DevLockfileReader;
+    use crate::henosis::environment::DevManifestReader;
     use crate::henosis::gate::FakeGateExecutor;
     use crate::henosis::gate_report::{GateFailure, GateReport};
-    use crate::henosis::lockfile::{EnvironmentSection, Lockfile, pinned};
+    use crate::henosis::manifest::{EnvironmentSection, Manifest, pinned};
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex;
 
     #[derive(Clone)]
-    struct StaticDevLockfile(Lockfile);
+    struct StaticDevManifest(Manifest);
 
-    impl DevLockfileReader for StaticDevLockfile {
-        async fn read_dev_lockfile(&self) -> anyhow::Result<Lockfile> {
+    impl DevManifestReader for StaticDevManifest {
+        async fn read_dev_manifest(&self) -> anyhow::Result<Manifest> {
             Ok(self.0.clone())
         }
     }
@@ -616,8 +616,8 @@ mod tests {
         ]
     }
 
-    fn dev_lockfile() -> Lockfile {
-        Lockfile {
+    fn dev_manifest() -> Manifest {
+        Manifest {
             environment: EnvironmentSection {
                 id: "dev".to_string(),
             },
@@ -691,7 +691,7 @@ mod tests {
     #[tokio::test]
     async fn tick_records_gate_run_check_run_and_passes_gate() {
         let manager = QueueManager::new(components());
-        let dev = StaticDevLockfile(dev_lockfile());
+        let dev = StaticDevManifest(dev_manifest());
         let mut store = MemoryQueueStore::default();
         store.ready.push_back(QueuePullRequest::new(
             "henosis-playground/service-a",
@@ -772,7 +772,7 @@ mod tests {
     #[tokio::test]
     async fn fake_gate_executor_fail_updates_status_resolves_check_and_posts_comment() {
         let manager = QueueManager::new(components());
-        let dev = StaticDevLockfile(dev_lockfile());
+        let dev = StaticDevManifest(dev_manifest());
         let mut store = MemoryQueueStore::default();
         store.ready.push_back(ready_pr("a-pr"));
         let reporter = MemoryCheckReporter::default();

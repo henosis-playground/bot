@@ -11,8 +11,8 @@ pub const HENOSIS_CONFIG_ENV: &str = "HENOSIS_CONFIG";
 #[serde(deny_unknown_fields)]
 pub struct HenosisConfig {
     pub deploy_repo: String,
-    #[serde(default = "default_lockfile_branch")]
-    pub lockfile_branch: String,
+    #[serde(default = "default_manifest_branch")]
+    pub manifest_branch: String,
     #[serde(default = "default_gate_command")]
     pub gate_command: String,
     #[serde(default = "default_gate_check_run_name")]
@@ -25,8 +25,8 @@ pub struct HenosisConfig {
     pub components: Vec<ComponentConfig>,
     #[serde(default)]
     pub source_repos: Vec<String>,
-    #[serde(default = "default_dev_lockfile_path")]
-    pub dev_lockfile_path: String,
+    #[serde(default = "default_dev_manifest_path")]
+    pub dev_manifest_path: String,
     pub environments: Vec<EnvironmentConfig>,
 }
 
@@ -50,7 +50,7 @@ pub struct RegisteredComponent {
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentConfig {
     pub id: String,
-    pub lockfile_path: String,
+    pub manifest_path: String,
 }
 
 impl HenosisConfig {
@@ -107,16 +107,16 @@ impl HenosisConfig {
         Duration::from_secs(self.queue_tick_interval_secs.max(1))
     }
 
-    pub fn environment_lockfile_path(&self, environment_id: &str) -> String {
+    pub fn environment_manifest_path(&self, environment_id: &str) -> String {
         self.environments
             .iter()
             .find(|env| env.id == environment_id)
-            .map(|env| env.lockfile_path.clone())
+            .map(|env| env.manifest_path.clone())
             .unwrap_or_else(|| format!("{environment_id}.toml"))
     }
 }
 
-fn default_lockfile_branch() -> String {
+fn default_manifest_branch() -> String {
     "main".to_string()
 }
 
@@ -136,7 +136,7 @@ fn default_cmd_prefix() -> String {
     "@henosis-bot".to_string()
 }
 
-fn default_dev_lockfile_path() -> String {
+fn default_dev_manifest_path() -> String {
     "dev.toml".to_string()
 }
 
@@ -165,12 +165,12 @@ source_repos = ["henosis-playground/service-a", "henosis-playground/service-b"]
 
 [[environments]]
 id = "dev"
-lockfile_path = "dev.toml"
+manifest_path = "dev.toml"
 "#,
         )
         .unwrap();
 
-        assert_eq!(config.lockfile_branch, "main");
+        assert_eq!(config.manifest_branch, "main");
         assert_eq!(config.gate_command, "henosis-gate");
         assert_eq!(config.gate_check_run_name, "Henosis gate");
         assert_eq!(config.queue_tick_interval_secs, 15);
@@ -199,7 +199,7 @@ lockfile_path = "dev.toml"
         let config = parse_config(
             r#"
 deploy_repo = "henosis-playground/deploy"
-lockfile_branch = "lockfiles"
+manifest_branch = "manifests"
 gate_command = "custom-gate"
 gate_check_run_name = "Custom gate"
 queue_tick_interval_secs = 3
@@ -208,12 +208,12 @@ source_repos = ["henosis-playground/service-a"]
 
 [[environments]]
 id = "staging"
-lockfile_path = "staging.toml"
+manifest_path = "staging.toml"
 "#,
         )
         .unwrap();
 
-        assert_eq!(config.lockfile_branch, "lockfiles");
+        assert_eq!(config.manifest_branch, "manifests");
         assert_eq!(config.gate_command, "custom-gate");
         assert_eq!(config.gate_check_run_name, "Custom gate");
         assert_eq!(config.queue_tick_interval(), Duration::from_secs(3));
@@ -233,7 +233,7 @@ main_branch = "trunk"
 
 [[environments]]
 id = "dev"
-lockfile_path = "dev.toml"
+manifest_path = "dev.toml"
 "#,
         )
         .unwrap();
@@ -273,7 +273,7 @@ source_repos = []
 
 [[environments]]
 id = "dev"
-lockfile_path = "dev.toml"
+manifest_path = "dev.toml"
 unexpected = true
 "#,
         );

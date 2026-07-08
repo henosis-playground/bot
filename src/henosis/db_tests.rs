@@ -1,85 +1,85 @@
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn inserts_henosis_gate_schema_rows(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    let gate_run_id = sqlx::query_scalar!(
+    let gate_run_id: i64 = sqlx::query_scalar(
         r#"
 INSERT INTO gate_run (external_id, status)
 VALUES ($1, $2)
 RETURNING id
 "#,
-        "test-gate-run",
-        "pending"
     )
+    .bind("test-gate-run")
+    .bind("pending")
     .fetch_one(&pool)
     .await?;
 
-    let candidate_world_id = sqlx::query_scalar!(
+    let candidate_world_id: i64 = sqlx::query_scalar(
         r#"
 INSERT INTO candidate_world (gate_run_id)
 VALUES ($1)
 RETURNING id
 "#,
-        gate_run_id
     )
+    .bind(gate_run_id)
     .fetch_one(&pool)
     .await?;
 
-    sqlx::query!(
+    sqlx::query(
         r#"
 INSERT INTO candidate_world_member (candidate_world_id, repo, pr_number, head_sha)
 VALUES ($1, $2, $3, $4)
 "#,
-        candidate_world_id,
-        "henosis-playground/service-a",
-        3_i64,
-        "abc123"
     )
+    .bind(candidate_world_id)
+    .bind("henosis-playground/service-a")
+    .bind(3_i64)
+    .bind("abc123")
     .execute(&pool)
     .await?;
 
-    sqlx::query!(
+    sqlx::query(
         r#"
-INSERT INTO environment (id, lockfile_path, is_preview)
+INSERT INTO environment (id, manifest_path, is_preview)
 VALUES ($1, $2, $3)
 "#,
-        "pr-service-a-3",
-        "pr-service-a-3.toml",
-        true
     )
+    .bind("pr-service-a-3")
+    .bind("pr-service-a-3.toml")
+    .bind(true)
     .execute(&pool)
     .await?;
 
-    sqlx::query!(
+    sqlx::query(
         r#"
 INSERT INTO environment_member (environment_id, repo, pr_number)
 VALUES ($1, $2, $3)
 "#,
-        "pr-service-a-3",
-        "henosis-playground/service-a",
-        3_i64
     )
+    .bind("pr-service-a-3")
+    .bind("henosis-playground/service-a")
+    .bind(3_i64)
     .execute(&pool)
     .await?;
 
-    sqlx::query!(
+    sqlx::query(
         r#"
-INSERT INTO lockfile_revision (environment_id, gate_run_id, commit_sha)
+INSERT INTO manifest_revision (environment_id, gate_run_id, commit_sha)
 VALUES ($1, $2, $3)
 "#,
-        "pr-service-a-3",
-        gate_run_id,
-        "def456"
     )
+    .bind("pr-service-a-3")
+    .bind(gate_run_id)
+    .bind("def456")
     .execute(&pool)
     .await?;
 
-    let exists = sqlx::query_scalar!(
+    let exists: bool = sqlx::query_scalar(
         r#"
 SELECT EXISTS(
-    SELECT 1 FROM lockfile_revision WHERE commit_sha = $1
+    SELECT 1 FROM manifest_revision WHERE commit_sha = $1
 ) AS "exists!"
 "#,
-        "def456"
     )
+    .bind("def456")
     .fetch_one(&pool)
     .await?;
 
