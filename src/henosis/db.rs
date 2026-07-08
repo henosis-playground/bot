@@ -338,6 +338,35 @@ LIMIT 1
         .transpose()
     }
 
+    async fn oldest_resumable_gate(&mut self) -> anyhow::Result<Option<RecordedGateRun>> {
+        let row = sqlx::query(
+            r#"
+SELECT id, external_id, status, world::text AS world, merge_commit_sha, dev_bump_commit_sha
+FROM gate_run
+WHERE status = $1
+  AND world IS NOT NULL
+ORDER BY updated_at ASC, id ASC
+LIMIT 1
+"#,
+        )
+        .bind(RUNNING_STATUS)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| {
+            let world: String = row.try_get("world")?;
+            Ok(RecordedGateRun {
+                id: row.try_get("id")?,
+                external_id: row.try_get("external_id")?,
+                status: row.try_get("status")?,
+                world: serde_json::from_str(&world).context("Cannot parse stored gate world")?,
+                merge_commit_sha: row.try_get("merge_commit_sha")?,
+                dev_bump_commit_sha: row.try_get("dev_bump_commit_sha")?,
+            })
+        })
+        .transpose()
+    }
+
     async fn record_gate_run(&mut self, world: &CandidateWorld) -> anyhow::Result<RecordedGateRun> {
         let external_id = gate_external_id(world)?;
         let world_json = serde_json::to_string(world).context("Cannot serialize gate world")?;

@@ -96,6 +96,7 @@ pub trait QueueStore {
         &mut self,
         components: &[RegisteredComponent],
     ) -> anyhow::Result<Option<QueuePullRequest>>;
+    async fn oldest_resumable_gate(&mut self) -> anyhow::Result<Option<RecordedGateRun>>;
     async fn oldest_resumable_merge(&mut self) -> anyhow::Result<Option<RecordedGateRun>>;
     async fn record_gate_run(&mut self, world: &CandidateWorld) -> anyhow::Result<RecordedGateRun>;
     async fn mark_gate_run_status(&mut self, external_id: &str, status: &str)
@@ -197,6 +198,19 @@ impl QueueManager {
             return Ok(Some(gate_run));
         }
 
+        if let Some(mut gate_run) = store.oldest_resumable_gate().await? {
+            self.run_gate_and_finish(
+                store,
+                check_reporter,
+                gate_executor,
+                merge_executor,
+                commenter,
+                &mut gate_run,
+            )
+            .await?;
+            return Ok(Some(gate_run));
+        }
+
         let Some(candidate) = store.oldest_ready_candidate(&self.components).await? else {
             return Ok(None);
         };
@@ -221,7 +235,36 @@ impl QueueManager {
             .await?;
         gate_run.status = RUNNING_STATUS.to_string();
 
-        let report = gate_executor.execute(&gate_run).await?;
+        self.run_gate_and_finish(
+            store,
+            check_reporter,
+            gate_executor,
+            merge_executor,
+            commenter,
+            &mut gate_run,
+        )
+        .await?;
+
+        Ok(Some(gate_run))
+    }
+
+    async fn run_gate_and_finish<S, R, E, M, C>(
+        &self,
+        store: &mut S,
+        check_reporter: &R,
+        gate_executor: &E,
+        merge_executor: &M,
+        commenter: &C,
+        gate_run: &mut RecordedGateRun,
+    ) -> anyhow::Result<()>
+    where
+        S: QueueStore,
+        R: GateCheckReporter,
+        E: GateExecutor,
+        M: MergeExecutor,
+        C: PrCommenter,
+    {
+        let report = gate_executor.execute(gate_run).await?;
         if report.ok {
             store
                 .mark_gate_run_status(&gate_run.external_id, GATE_PASSED_STATUS)
@@ -253,7 +296,7 @@ impl QueueManager {
             }
         }
 
-        Ok(Some(gate_run))
+        Ok(())
     }
 
     pub async fn invalidate_pr_push<S, R>(
@@ -428,6 +471,14 @@ mod tests {
                 .iter()
                 .position(|pr| component_repos.contains(&pr.key.repo))
                 .and_then(|index| self.ready.remove(index)))
+        }
+
+        async fn oldest_resumable_gate(&mut self) -> anyhow::Result<Option<RecordedGateRun>> {
+            Ok(self
+                .recorded
+                .iter()
+                .find(|run| run.status == RUNNING_STATUS)
+                .cloned())
         }
 
         async fn oldest_resumable_merge(&mut self) -> anyhow::Result<Option<RecordedGateRun>> {
@@ -816,6 +867,50 @@ mod tests {
         assert!(comments[0].1.contains("Henosis gate failed"));
         assert!(comments[0].1.contains("service-b"));
         assert!(comments[0].1.contains("service-a"));
+    }
+
+    #[tokio::test]
+    async fn tick_resumes_running_gate_without_creating_duplicate_check() {
+        let manager = QueueManager::new(components());
+        let dev = StaticDevManifest(dev_manifest());
+        let mut store = MemoryQueueStore::default();
+        let run = recorded_run(RUNNING_STATUS);
+        let external_id = run.external_id.clone();
+        store
+            .statuses
+            .insert(external_id.clone(), RUNNING_STATUS.to_string());
+        store.recorded.push(run);
+        let reporter = MemoryCheckReporter::default();
+        let executor =
+            FakeGateExecutor::new(BTreeMap::from([(external_id.clone(), failure_report())]));
+        let merge_executor = MemoryMergeExecutor::default();
+        let commenter = MemoryCommenter::default();
+
+        let gate_run = manager
+            .tick(
+                &mut store,
+                &dev,
+                &reporter,
+                &executor,
+                &merge_executor,
+                &commenter,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(gate_run.status, GATE_FAILED_STATUS);
+        assert!(reporter.checks.lock().unwrap().is_empty());
+        assert_eq!(
+            store.statuses.get(&external_id).map(String::as_str),
+            Some(GATE_FAILED_STATUS)
+        );
+        let resolved = reporter.resolved.lock().unwrap();
+        assert_eq!(resolved[0].0, external_id);
+        assert_eq!(resolved[0].1, CheckConclusion::Failure);
+        assert!(resolved[0].2.contains("service-b"));
+        assert!(merge_executor.calls.lock().unwrap().is_empty());
+        assert_eq!(commenter.comments.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
