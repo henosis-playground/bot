@@ -1277,7 +1277,25 @@ fn is_bors_observed_branch(branch: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::{BorsTester, Comment, User, run_test};
+    use crate::henosis::config::HenosisConfig;
+    use crate::tests::{BorsBuilder, BorsTester, Comment, User, run_test};
+
+    fn henosis_config() -> HenosisConfig {
+        toml::from_str(
+            r#"
+deploy_repo = "rust-lang/borstest"
+
+[[components]]
+name = "borstest"
+repo = "rust-lang/borstest"
+
+[[environments]]
+id = "dev"
+manifest_path = "dev.toml"
+"#,
+        )
+        .unwrap()
+    }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn ignore_bot_comment(pool: sqlx::PgPool) {
@@ -1318,5 +1336,29 @@ mod tests {
             Ok(())
         })
         .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_env_command_with_config(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .henosis_config(henosis_config())
+            .run_test(async |ctx: &mut BorsTester| {
+                ctx.post_comment(Comment::from("@bors env")).await?;
+                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"This PR is not assigned to a Henosis preview environment.");
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_gate_command_with_config(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .henosis_config(henosis_config())
+            .run_test(async |ctx: &mut BorsTester| {
+                ctx.post_comment(Comment::from("@bors gate")).await?;
+                insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @"No Henosis gate run has been recorded for this PR.");
+                Ok(())
+            })
+            .await;
     }
 }

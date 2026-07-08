@@ -41,6 +41,7 @@ use crate::bors::merge_queue::merge_queue_tick;
 use crate::bors::mergeability_queue::{MergeabilityQueueReceiver, check_mergeability};
 use crate::bors::process::QueueSenders;
 use crate::github::api::client::HideCommentReason;
+use crate::henosis::config::HenosisConfig;
 use crate::server::{ServerState, create_app};
 use crate::tests::github::{
     RepoIdentifier, TestWorkflowStatus, WorkflowEventKind, WorkflowRun, default_oauth_config,
@@ -91,6 +92,7 @@ pub fn default_cmd_prefix() -> CommandPrefix {
 pub struct BorsBuilder {
     github: GitHub,
     pool: PgPool,
+    henosis_config: Option<HenosisConfig>,
 }
 
 impl BorsBuilder {
@@ -98,11 +100,19 @@ impl BorsBuilder {
         Self {
             pool,
             github: Default::default(),
+            henosis_config: None,
         }
     }
 
     pub fn github(self, github: GitHub) -> Self {
         Self { github, ..self }
+    }
+
+    pub fn henosis_config(self, henosis_config: HenosisConfig) -> Self {
+        Self {
+            henosis_config: Some(henosis_config),
+            ..self
+        }
     }
 
     /// This closure is used to ensure that the test has to return `BorsTester`
@@ -114,7 +124,8 @@ impl BorsBuilder {
     ) -> GitHub {
         // We return `ctx` and `bors` separately, so that we can finish `bors`
         // even if `f` returns an error or times out, for better error propagation.
-        let (mut ctx, mut bors) = BorsTester::new(self.pool, self.github).await;
+        let (mut ctx, mut bors) =
+            BorsTester::new(self.pool, self.github, self.henosis_config).await;
 
         tokio::select! {
             // If the service ends sooner than the test itself, then the service has panicked.
@@ -156,13 +167,18 @@ impl From<PgPool> for BorsBuilder {
         Self {
             pool,
             github: GitHub::default(),
+            henosis_config: None,
         }
     }
 }
 
 impl From<(PgPool, GitHub)> for BorsBuilder {
     fn from((pool, github): (PgPool, GitHub)) -> Self {
-        Self { pool, github }
+        Self {
+            pool,
+            github,
+            henosis_config: None,
+        }
     }
 }
 
@@ -198,7 +214,11 @@ pub struct BorsTester {
 }
 
 impl BorsTester {
-    async fn new(pool: PgPool, github: GitHub) -> (Self, JoinHandle<()>) {
+    async fn new(
+        pool: PgPool,
+        github: GitHub,
+        henosis_config: Option<HenosisConfig>,
+    ) -> (Self, JoinHandle<()>) {
         let github = Arc::new(Mutex::new(github));
         let mock = ExternalHttpMock::start(github.clone()).await;
         let db = Arc::new(PgDbClient::new(pool));
@@ -226,7 +246,7 @@ impl BorsTester {
             // local git ops, but we do not currently mock git in tests.
             Some(Git::from_path(PathBuf::from("/tmp/git"))),
             "https://bors-test.com",
-            None,
+            henosis_config,
         ));
 
         let BorsProcess {
