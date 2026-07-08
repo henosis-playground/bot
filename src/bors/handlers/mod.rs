@@ -1274,10 +1274,11 @@ fn is_bors_observed_branch(branch: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::database::WorkflowStatus;
     use crate::github::GithubRepoName;
     use crate::henosis::config::HenosisConfig;
     use crate::tests::{
-        BorsBuilder, BorsTester, Comment, GitHub, Repo, User, default_repo_name, run_test,
+        BorsBuilder, BorsTester, Comment, Commit, GitHub, Repo, User, default_repo_name, run_test,
     };
 
     fn henosis_config() -> HenosisConfig {
@@ -1395,6 +1396,14 @@ digest = "sha256:service-b"
             .to_string()
     }
 
+    fn render_commit_from_comment(comment: &str) -> String {
+        comment
+            .split_once("for commit `")
+            .and_then(|(_, rest)| rest.split_once('`'))
+            .map(|(sha, _)| sha.to_string())
+            .expect("render failure comment should include a commit sha")
+    }
+
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn ignore_bot_comment(pool: sqlx::PgPool) {
         run_test(pool, async |ctx: &mut BorsTester| {
@@ -1501,12 +1510,23 @@ digest = "sha256:service-b"
                 let pr = ctx.open_pr((), |_| {}).await?;
                 let pr_id = (default_repo_name(), pr.number().0);
                 let run_id = ctx.create_workflow(default_repo_name(), "main");
+                ctx.modify_workflow(run_id, |workflow| {
+                    workflow.add_job_with_log(
+                        WorkflowStatus::Failure,
+                        "Render dev",
+                        "2026-07-08T10:00:00.000Z setup ok\n2026-07-08T10:00:01.000Z \u{1b}[31mRender dev\u{1b}[0m\n2026-07-08T10:00:02.000Z Error: missing DATABASE_URL\n2026-07-08T10:00:03.000Z render failed",
+                    );
+                });
 
                 ctx.workflow_full_failure(run_id).await?;
 
                 let comment = ctx.get_next_comment_text(pr_id.clone()).await?;
                 assert!(comment.contains("couldn't materialise environment `preview-"));
                 assert!(comment.contains("Workflow1 failed for commit `"));
+                assert!(comment.contains("Failed job: `Job "));
+                assert!(comment.contains("Failed step: `Render dev`"));
+                assert!(comment.contains("Error: missing DATABASE_URL"));
+                assert!(comment.contains("```text\nRender dev\nError: missing DATABASE_URL\nrender failed\n```"));
                 assert!(
                     comment.contains(
                         "[render run](https://github.com/rust-lang/borstest/actions/runs/"
@@ -1516,6 +1536,54 @@ digest = "sha256:service-b"
                 let body = ctx.pr(pr_id).await.get_gh_pr().description;
                 assert!(body.contains("Latest render: `failure`"));
                 assert!(body.contains("Workflow1 failed for commit `"));
+                assert!(body.contains("Failed step: `Render dev`"));
+                assert!(body.contains("Error: missing DATABASE_URL"));
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_render_failure_comments_for_each_new_failing_commit(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .github(henosis_github())
+            .henosis_config(henosis_config())
+            .run_test(async |ctx: &mut BorsTester| {
+                let pr = ctx.open_pr((), |_| {}).await?;
+                let pr_id = (default_repo_name(), pr.number().0);
+
+                let first_run_id = ctx.create_workflow(default_repo_name(), "main");
+                ctx.modify_workflow(first_run_id, |workflow| {
+                    workflow.add_job_with_log(
+                        WorkflowStatus::Failure,
+                        "Render dev",
+                        "2026-07-08T10:00:00.000Z Render dev\n2026-07-08T10:00:01.000Z Error: first render break",
+                    );
+                });
+                ctx.workflow_full_failure(first_run_id).await?;
+                let first_comment = ctx.get_next_comment_text(pr_id.clone()).await?;
+                assert!(first_comment.contains("Error: first render break"));
+                let first_render_commit = render_commit_from_comment(&first_comment);
+
+                ctx.push_to_pr(pr_id.clone(), Commit::from_sha("pr-2-new-sha"))
+                    .await?;
+                let second_run_id = ctx.create_workflow(default_repo_name(), "main");
+                ctx.modify_workflow(second_run_id, |workflow| {
+                    workflow.add_job_with_log(
+                        WorkflowStatus::Failure,
+                        "Render dev",
+                        "2026-07-08T10:01:00.000Z Render dev\n2026-07-08T10:01:01.000Z Error: second render break",
+                    );
+                });
+                ctx.workflow_full_failure(second_run_id).await?;
+                let second_comment = ctx.get_next_comment_text(pr_id.clone()).await?;
+                assert!(second_comment.contains("Error: second render break"));
+                let second_render_commit = render_commit_from_comment(&second_comment);
+
+                assert_ne!(first_render_commit, second_render_commit);
+                let body = ctx.pr(pr_id).await.get_gh_pr().description;
+                assert!(body.contains(&second_render_commit));
+                assert!(body.contains("Error: second render break"));
                 Ok(())
             })
             .await;

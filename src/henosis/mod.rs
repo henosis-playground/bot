@@ -10,5 +10,6 @@ pub mod graph;
 pub mod manifest;
 pub mod merge;
 pub mod queue;
+pub mod render_diagnostics;
 pub mod service;
 pub mod status;

@@ -31,7 +31,8 @@ pub fn render_status_section(snapshot: &StatusSnapshot) -> String {
                 render.run_url
             );
             if let Some(excerpt) = &render.excerpt {
-                line.push_str(&format!(" - {excerpt}"));
+                line.push('\n');
+                line.push_str(excerpt);
             }
             line
         }

@@ -63,7 +63,7 @@ pub use github::PullRequest;
 pub use github::Repo;
 pub use github::User;
 pub use github::{BranchPushBehaviour, BranchPushError, MergeBehavior};
-pub use github::{WorkflowEvent, WorkflowJob};
+pub use github::{WorkflowEvent, WorkflowJob, WorkflowStep};
 pub use github::{default_branch_name, default_repo_name};
 pub use mock::ExternalHttpMock;
 pub use utils::io::{load_recorded_webhook, load_test_file};

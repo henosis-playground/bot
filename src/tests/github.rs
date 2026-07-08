@@ -584,6 +584,14 @@ impl Repo {
         self.workflow_runs.iter().find(|w| w.run_id == id).cloned()
     }
 
+    pub fn find_workflow_job(&self, id: JobId) -> Option<WorkflowJob> {
+        self.workflow_runs
+            .iter()
+            .flat_map(|workflow| workflow.jobs())
+            .find(|job| job.id == id)
+            .cloned()
+    }
+
     pub fn find_workflows_by_commit_sha(&self, sha: &str) -> Vec<WorkflowRun> {
         self.workflow_runs
             .iter()
@@ -1140,6 +1148,14 @@ pub enum WorkflowEventKind {
 pub struct WorkflowJob {
     pub id: JobId,
     pub status: WorkflowStatus,
+    pub steps: Vec<WorkflowStep>,
+    pub log: String,
+}
+
+#[derive(Clone)]
+pub struct WorkflowStep {
+    pub name: String,
+    pub status: WorkflowStatus,
 }
 
 #[derive(Copy, Clone)]
@@ -1227,9 +1243,18 @@ impl WorkflowRun {
     }
 
     pub fn add_job(&mut self, status: WorkflowStatus) {
+        self.add_job_with_log(status, "Run job", "");
+    }
+
+    pub fn add_job_with_log(&mut self, status: WorkflowStatus, step_name: &str, log: &str) {
         self.jobs.push(WorkflowJob {
             id: JobId(self.run_id.0 * 1000 + self.jobs.len() as u64),
             status,
+            steps: vec![WorkflowStep {
+                name: step_name.to_string(),
+                status,
+            }],
+            log: log.to_string(),
         });
     }
 }

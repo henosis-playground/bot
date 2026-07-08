@@ -20,6 +20,9 @@ use crate::henosis::queue::{
     GateCheckReporter, GateStatus, QueueManager, QueuePullRequest, QueueStore, RecordedGateRun,
     advisory_gate_external_id,
 };
+use crate::henosis::render_diagnostics::{
+    fallback_render_failure_diagnostic, generate_render_failure_diagnostic, render_failure_comment,
+};
 use crate::henosis::status::{StatusSnapshot, render_status_section, upsert_status_section};
 use anyhow::Context;
 use std::collections::BTreeSet;
@@ -514,7 +517,11 @@ pub async fn handle_render_workflow_completed(
         WorkflowStatus::Failure => RenderStatus::Failure,
         WorkflowStatus::Pending => return Ok(true),
     };
-    let excerpt = (status == RenderStatus::Failure).then(|| render_failure_excerpt(payload));
+    let excerpt = if status == RenderStatus::Failure {
+        Some(render_failure_diagnostic(ctx, payload).await)
+    } else {
+        None
+    };
 
     let environment_store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let environments = environment_store
@@ -666,15 +673,27 @@ fn should_post_render_failure(previous: &Option<RenderOutcome>, outcome: &Render
     outcome.status == RenderStatus::Failure
         && previous
             .as_ref()
-            .map(|previous| previous.run_url != outcome.run_url)
+            .map(|previous| {
+                previous.status != RenderStatus::Failure
+                    || previous.commit_sha != outcome.commit_sha
+            })
             .unwrap_or(true)
 }
 
-fn render_failure_excerpt(payload: &WorkflowRunCompleted) -> String {
-    format!(
-        "{} failed for commit `{}` on `{}`",
-        payload.name, payload.commit_sha, payload.branch
-    )
+async fn render_failure_diagnostic(ctx: &BorsContext, payload: &WorkflowRunCompleted) -> String {
+    let Some(repo) = ctx.repositories.get(&payload.repository) else {
+        return fallback_render_failure_diagnostic(payload);
+    };
+    match generate_render_failure_diagnostic(&repo.client, payload).await {
+        Ok(diagnostic) => diagnostic,
+        Err(error) => {
+            tracing::warn!(
+                "Could not build render failure diagnostic for workflow run {}: {error:?}",
+                payload.run_id
+            );
+            fallback_render_failure_diagnostic(payload)
+        }
+    }
 }
 
 async fn post_render_failure_comment(
@@ -690,17 +709,10 @@ async fn post_render_failure_comment(
         .repositories
         .get(&repo_name)
         .with_context(|| format!("Repository `{repo_name}` is not loaded"))?;
-    let excerpt = outcome
-        .excerpt
-        .as_deref()
-        .unwrap_or("render workflow failed");
     repo.client
         .post_comment(
             PullRequestNumber(key.number),
-            Comment::new(format!(
-                "couldn't materialise environment `{}`: {} [render run]({})",
-                outcome.environment_id, excerpt, outcome.run_url
-            )),
+            Comment::new(render_failure_comment(outcome)),
             &ctx.db,
         )
         .await?;

@@ -7,11 +7,11 @@ use crate::tests::github::{CheckRunData, Commit, GitUser, WorkflowRun};
 use crate::tests::mock::pull_request::mock_pull_requests;
 use crate::tests::mock::workflow::GitHubWorkflowRun;
 use crate::tests::mock::{GitHubUser, dynamic_mock_req};
-use crate::tests::{Branch, GitHub, Repo, WorkflowJob};
+use crate::tests::{Branch, GitHub, Repo, WorkflowJob, WorkflowStep};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use octocrab::models::repos::Object;
-use octocrab::models::workflows::{Conclusion, Status, Step};
+use octocrab::models::workflows::{Conclusion, Status};
 use octocrab::models::{JobId, RunId};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -69,6 +69,7 @@ pub async fn mock_repo(
     mock_check_runs(repo.clone(), mock_server).await;
     mock_workflow_runs(repo.clone(), mock_server).await;
     mock_workflow_jobs(repo.clone(), mock_server).await;
+    mock_workflow_job_logs(repo.clone(), mock_server).await;
     mock_contents(repo.clone(), mock_server).await;
 }
 
@@ -457,6 +458,24 @@ async fn mock_workflow_jobs(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
         },
         "GET",
         format!("^/repos/{repo_name}/actions/runs/(.*)/jobs"),
+    )
+    .mount(mock_server)
+    .await;
+}
+
+async fn mock_workflow_job_logs(repo: Arc<Mutex<Repo>>, mock_server: &MockServer) {
+    let repo_name = repo.lock().full_name();
+    dynamic_mock_req(
+        move |_req: &Request, [job_id]: [&str; 1]| {
+            let repo = repo.lock();
+            let job_id: JobId = job_id.parse::<u64>().expect("Non-integer job id").into();
+            let job = repo
+                .find_workflow_job(job_id)
+                .unwrap_or_else(|| panic!("Workflow job with ID {job_id} not found"));
+            ResponseTemplate::new(200).set_body_string(job.log)
+        },
+        "GET",
+        format!("^/repos/{repo_name}/actions/jobs/(.*)/logs$"),
     )
     .mount(mock_server)
     .await;
@@ -900,7 +919,7 @@ struct GitHubWorkflowJob {
     #[serde(skip_serializing_if = "Option::is_none")]
     completed_at: Option<DateTime<Utc>>,
     name: String,
-    steps: Vec<Step>,
+    steps: Vec<GitHubWorkflowStep>,
     check_run_url: String,
     labels: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -914,7 +933,12 @@ struct GitHubWorkflowJob {
 }
 
 fn workflow_job_to_gh(job: &WorkflowJob, run_id: RunId) -> GitHubWorkflowJob {
-    let WorkflowJob { id, status } = job;
+    let WorkflowJob {
+        id,
+        status,
+        steps,
+        log: _,
+    } = job;
     let (status, conclusion) = status_to_gh(*status);
     GitHubWorkflowJob {
         id: *id,
@@ -933,12 +957,40 @@ fn workflow_job_to_gh(job: &WorkflowJob, run_id: RunId) -> GitHubWorkflowJob {
         started_at: Default::default(),
         completed_at: None,
         name: format!("Job {id}"),
-        steps: vec![],
+        steps: steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| workflow_step_to_gh(step, index as i64 + 1))
+            .collect(),
         check_run_url: "".to_string(),
         labels: vec![],
         runner_id: None,
         runner_name: None,
         runner_group_id: None,
         runner_group_name: None,
+    }
+}
+
+#[derive(Serialize)]
+struct GitHubWorkflowStep {
+    name: String,
+    status: Status,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conclusion: Option<Conclusion>,
+    number: i64,
+    started_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at: Option<DateTime<Utc>>,
+}
+
+fn workflow_step_to_gh(step: &WorkflowStep, number: i64) -> GitHubWorkflowStep {
+    let (status, conclusion) = status_to_gh(step.status);
+    GitHubWorkflowStep {
+        name: step.name.clone(),
+        status,
+        conclusion,
+        number,
+        started_at: None,
+        completed_at: None,
     }
 }

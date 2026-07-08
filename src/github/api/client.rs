@@ -4,7 +4,7 @@ use octocrab::Octocrab;
 use octocrab::models::checks::CheckRun;
 use octocrab::models::pulls::MergeableState;
 use octocrab::models::repos::Content;
-use octocrab::models::{CheckRunId, Repository, RunId, UserId};
+use octocrab::models::{CheckRunId, JobId, Repository, RunId, UserId};
 use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -674,6 +674,18 @@ impl GithubRepositoryClient {
         )
         .await?;
         Ok(jobs)
+    }
+
+    pub async fn get_job_logs(&self, job_id: JobId) -> anyhow::Result<String> {
+        let logs = perform_retryable("get_job_logs", RetryMethod::no_retry(), || async {
+            let route = format!("/repos/{}/actions/jobs/{job_id}/logs", self.repository());
+            let response = self.client._get(route).await?;
+            let response = self.client.follow_location_to_data(response).await?;
+            let logs = self.client.body_to_string(response).await?;
+            anyhow::Ok(logs)
+        })
+        .await?;
+        Ok(logs)
     }
 
     /// Cancels Github Actions workflows.
