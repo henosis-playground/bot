@@ -16,10 +16,11 @@ use crate::bors::comment::{
     cant_find_last_parent_comment, merge_attempt_merge_conflict_comment, try_build_started_comment,
 };
 use crate::bors::{
-    BuildKind, MergeType, RepositoryState, TRY_BRANCH_NAME, bors_commit_author,
-    create_merge_commit_message, hide_tagged_comments,
+    BuildKind, MergeType, RepositoryState, TRY_BRANCH_NAME, create_merge_commit_message,
+    hide_tagged_comments,
 };
 use crate::database::{BuildModel, BuildStatus, ExclusiveOperationOutcome, PullRequestModel};
+use crate::github::api::operations::CommitAuthor;
 use crate::github::{CommitSha, GithubUser, PullRequestNumber};
 use crate::permissions::PermissionType;
 use anyhow::Context;
@@ -29,9 +30,6 @@ use anyhow::Context;
 // Because this action (reset + merge) is not atomic, this branch should not run CI checks to avoid
 // starting them twice.
 pub(super) const TRY_MERGE_BRANCH_NAME: &str = "automation/bors/try-merge";
-
-// The name of the check run seen in the GitHub UI.
-pub(super) const TRY_BUILD_CHECK_RUN_NAME: &str = "Bors try build";
 
 /// Performs a so-called try build - merges the PR branch into a special branch designed
 /// for running CI checks.
@@ -46,6 +44,9 @@ pub(super) async fn command_try_build(
     parent: Option<Parent>,
     jobs: Vec<String>,
     bot_prefix: &CommandPrefix,
+    commit_author: &CommitAuthor,
+    check_run_name: &str,
+    merge_commit_message_prefix: &str,
 ) -> anyhow::Result<()> {
     let repo = repo.as_ref();
     if !has_permission(repo, author, pr, PermissionType::Try).await? {
@@ -101,12 +102,16 @@ pub(super) async fn command_try_build(
                     build_kind: BuildKind::Try,
                 },
                 StartBuildCommit {
-                    message: create_merge_commit_message(pr, MergeType::Try { try_jobs: jobs }),
-                    author: bors_commit_author(),
+                    message: create_merge_commit_message(
+                        pr,
+                        MergeType::Try { try_jobs: jobs },
+                        merge_commit_message_prefix,
+                    ),
+                    author: commit_author.clone(),
                 },
                 StartBuildCheckRun {
-                    name: TRY_BUILD_CHECK_RUN_NAME.to_string(),
-                    title: "Bors try build".to_string(),
+                    name: check_run_name.to_string(),
+                    title: check_run_name.to_string(),
                 },
                 pr.db,
             )
@@ -265,9 +270,8 @@ fn get_pending_try_build(pr: &PullRequestModel) -> Option<&BuildModel> {
 
 #[cfg(test)]
 mod tests {
-    use crate::bors::handlers::trybuild::{
-        TRY_BRANCH_NAME, TRY_BUILD_CHECK_RUN_NAME, TRY_MERGE_BRANCH_NAME,
-    };
+    use crate::bors::DEFAULT_TRY_BUILD_CHECK_RUN_NAME as TRY_BUILD_CHECK_RUN_NAME;
+    use crate::bors::handlers::trybuild::{TRY_BRANCH_NAME, TRY_MERGE_BRANCH_NAME};
     use crate::database::WorkflowStatus;
     use crate::database::operations::get_all_workflows;
     use crate::github::CommitSha;
@@ -889,7 +893,7 @@ try_failed = ["+foo", "+bar", "-baz"]
             ctx.expect_check_run(
                 &ctx.pr(()).await.get_gh_pr().head_sha(),
                 TRY_BUILD_CHECK_RUN_NAME,
-                "Bors try build",
+                TRY_BUILD_CHECK_RUN_NAME,
                 CheckRunStatus::InProgress,
                 None,
             );
@@ -911,7 +915,7 @@ try_failed = ["+foo", "+bar", "-baz"]
             ctx.expect_check_run(
                 &ctx.pr(()).await.get_gh_pr().head_sha(),
                 TRY_BUILD_CHECK_RUN_NAME,
-                "Bors try build",
+                TRY_BUILD_CHECK_RUN_NAME,
                 CheckRunStatus::Completed,
                 Some(CheckRunConclusion::Success),
             );
@@ -933,7 +937,7 @@ try_failed = ["+foo", "+bar", "-baz"]
             ctx.expect_check_run(
                 &ctx.pr(()).await.get_gh_pr().head_sha(),
                 TRY_BUILD_CHECK_RUN_NAME,
-                "Bors try build",
+                TRY_BUILD_CHECK_RUN_NAME,
                 CheckRunStatus::Completed,
                 Some(CheckRunConclusion::Failure),
             );
@@ -955,7 +959,7 @@ try_failed = ["+foo", "+bar", "-baz"]
             ctx.expect_check_run(
                 &ctx.pr(()).await.get_gh_pr().head_sha(),
                 TRY_BUILD_CHECK_RUN_NAME,
-                "Bors try build",
+                TRY_BUILD_CHECK_RUN_NAME,
                 CheckRunStatus::Completed,
                 Some(CheckRunConclusion::Cancelled),
             );
@@ -979,14 +983,14 @@ try_failed = ["+foo", "+bar", "-baz"]
             ctx.expect_check_run(
                 &prev_sha,
                 TRY_BUILD_CHECK_RUN_NAME,
-                "Bors try build",
+                TRY_BUILD_CHECK_RUN_NAME,
                 CheckRunStatus::Completed,
                 Some(CheckRunConclusion::Cancelled),
             );
             ctx.expect_check_run(
                 &ctx.pr(()).await.get_gh_pr().head_sha(),
                 TRY_BUILD_CHECK_RUN_NAME,
-                "Bors try build",
+                TRY_BUILD_CHECK_RUN_NAME,
                 CheckRunStatus::InProgress,
                 None,
             );

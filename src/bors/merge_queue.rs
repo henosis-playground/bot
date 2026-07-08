@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::Instrument;
 
-use super::{Comment, MergeType, bors_commit_author, create_merge_commit_message};
+use super::{Comment, MergeType, create_merge_commit_message};
 use crate::bors::build::load_workflow_runs;
 use crate::bors::build::{
     StartBuildCheckRun, StartBuildCommit, StartBuildContext, StartBuildError, StartBuildOutcome,
@@ -81,9 +81,6 @@ impl MergeQueueSender {
 /// Branch used for performing merge operations.
 /// This branch should not run CI checks.
 pub(super) const AUTO_MERGE_BRANCH_NAME: &str = "automation/bors/auto-merge";
-
-// The name of the check run seen in the GitHub UI.
-pub(super) const AUTO_BUILD_CHECK_RUN_NAME: &str = "Bors auto build";
 
 /// Process the merge queue.
 /// Try to finish and merge a successful auto build, if any.
@@ -710,7 +707,8 @@ async fn start_auto_build(
         github: &gh_pr,
     };
 
-    let auto_merge_commit_message = create_merge_commit_message(pr_data, MergeType::Auto);
+    let auto_merge_commit_message =
+        create_merge_commit_message(pr_data, MergeType::Auto, &ctx.merge_commit_message_prefix);
 
     let build_commit_result = start_build(
         &ctx.db,
@@ -725,11 +723,11 @@ async fn start_auto_build(
         },
         StartBuildCommit {
             message: auto_merge_commit_message,
-            author: bors_commit_author(),
+            author: ctx.commit_author.clone(),
         },
         StartBuildCheckRun {
-            name: AUTO_BUILD_CHECK_RUN_NAME.to_string(),
-            title: AUTO_BUILD_CHECK_RUN_NAME.to_string(),
+            name: ctx.auto_build_check_run_name.clone(),
+            title: ctx.auto_build_check_run_name.clone(),
         },
         pr,
     )
@@ -867,8 +865,8 @@ mod tests {
     use crate::tests::{default_branch_name, default_repo_name};
     use crate::{
         bors::{
-            PullRequestStatus,
-            merge_queue::{AUTO_BRANCH_NAME, AUTO_BUILD_CHECK_RUN_NAME, AUTO_MERGE_BRANCH_NAME},
+            DEFAULT_AUTO_BUILD_CHECK_RUN_NAME as AUTO_BUILD_CHECK_RUN_NAME, PullRequestStatus,
+            merge_queue::{AUTO_BRANCH_NAME, AUTO_MERGE_BRANCH_NAME},
         },
         database::{BuildStatus, MergeableState, OctocrabMergeableState},
         tests::{BorsTester, BranchPushBehaviour, BranchPushError, Comment},

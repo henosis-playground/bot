@@ -289,6 +289,7 @@ async fn help_handler(State(ServerStateRef(state)): State<ServerStateRef>) -> im
         repos,
         help: help_html,
         cmd_prefix: state.get_cmd_prefix().as_ref().to_string(),
+        service_name: state.ctx.service_name.clone(),
     })
 }
 
@@ -319,10 +320,10 @@ impl<'de> Deserialize<'de> for PullRequestList {
 
 pub async fn queue_handler(
     Path(repo_name): Path<String>,
-    State(db): State<Arc<PgDbClient>>,
-    State(oauth): State<Option<OAuthClient>>,
+    State(ServerStateRef(state)): State<ServerStateRef>,
     Query(params): Query<QueueParams>,
 ) -> Result<impl IntoResponse, AppError> {
+    let db = &state.ctx.db;
     let repo = match db.repo_by_name(&repo_name).await? {
         Some(repo) => repo,
         None => {
@@ -434,7 +435,9 @@ pub async fn queue_handler(
     }
 
     Ok(HtmlTemplate(QueueTemplate {
-        oauth_client_id: oauth
+        service_name: state.ctx.service_name.clone(),
+        oauth_client_id: state
+            .oauth
             .as_ref()
             .map(|client| client.config().client_id().to_string()),
         repo_name: repo.name.name().to_string(),

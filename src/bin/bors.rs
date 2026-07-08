@@ -7,9 +7,11 @@ use anyhow::Context;
 use bors::henosis::config::{HENOSIS_CONFIG_ENV, HenosisConfig};
 use bors::server::{ServerState, create_app};
 use bors::{
-    BorsContext, BorsGlobalEvent, BorsProcess, CommandParser, Git, OAuthClient, OAuthConfig,
-    PgDbClient, RepositoryStore, TeamApiClient, TreeState, WebhookSecret, create_bors_process,
-    create_github_client, load_repositories,
+    BorsContext, BorsGlobalEvent, BorsProcess, CommandParser, CommitAuthor,
+    DEFAULT_AUTO_BUILD_CHECK_RUN_NAME, DEFAULT_MERGE_COMMIT_MESSAGE_PREFIX, DEFAULT_SERVICE_NAME,
+    DEFAULT_TRY_BUILD_CHECK_RUN_NAME, Git, OAuthClient, OAuthConfig, PgDbClient, RepositoryStore,
+    TeamApiClient, TreeState, WebhookSecret, create_bors_process, create_github_client,
+    default_bors_commit_author, load_repositories,
 };
 use clap::Parser;
 use sqlx::postgres::PgConnectOptions;
@@ -70,6 +72,30 @@ struct Opts {
     /// Prefix used for bot commands in PR comments.
     #[arg(long, env = "CMD_PREFIX", default_value = "@bors")]
     cmd_prefix: String,
+
+    /// Git author/committer name used for bot-created merge commits.
+    #[arg(long, env = "COMMIT_AUTHOR_NAME", default_value_t = default_bors_commit_author().name)]
+    commit_author_name: String,
+
+    /// Git author/committer email used for bot-created merge commits.
+    #[arg(long, env = "COMMIT_AUTHOR_EMAIL", default_value_t = default_bors_commit_author().email)]
+    commit_author_email: String,
+
+    /// Check run name used for repository-local auto builds.
+    #[arg(long, env = "AUTO_BUILD_CHECK_RUN_NAME", default_value = DEFAULT_AUTO_BUILD_CHECK_RUN_NAME)]
+    auto_build_check_run_name: String,
+
+    /// Check run name used for try builds.
+    #[arg(long, env = "TRY_BUILD_CHECK_RUN_NAME", default_value = DEFAULT_TRY_BUILD_CHECK_RUN_NAME)]
+    try_build_check_run_name: String,
+
+    /// Subject prefix used for bot-created merge-test commits.
+    #[arg(long, env = "MERGE_COMMIT_MESSAGE_PREFIX", default_value = DEFAULT_MERGE_COMMIT_MESSAGE_PREFIX)]
+    merge_commit_message_prefix: String,
+
+    /// Public service name used in bot-facing UI and diagnostics.
+    #[arg(long, env = "SERVICE_NAME", default_value = DEFAULT_SERVICE_NAME)]
+    service_name: String,
 
     /// Web URL where the bot's website is deployed.
     #[arg(long, env = "WEB_URL", default_value = "http://localhost:8080")]
@@ -188,6 +214,14 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
         git,
         &opts.web_url,
         henosis_config,
+        CommitAuthor {
+            name: opts.commit_author_name,
+            email: opts.commit_author_email,
+        },
+        opts.auto_build_check_run_name,
+        opts.try_build_check_run_name,
+        opts.merge_commit_message_prefix,
+        opts.service_name,
     ));
     let BorsProcess {
         repository_tx,

@@ -13,13 +13,15 @@ mod utils;
 
 pub use self::bors::process::{BorsProcess, create_bors_process};
 pub use bors::{
-    BorsContext, CommandParser, Git, RepositoryStore, event::BorsGlobalEvent,
+    BorsContext, CommandParser, DEFAULT_AUTO_BUILD_CHECK_RUN_NAME,
+    DEFAULT_MERGE_COMMIT_MESSAGE_PREFIX, DEFAULT_SERVICE_NAME, DEFAULT_TRY_BUILD_CHECK_RUN_NAME,
+    Git, RepositoryStore, default_bors_commit_author, event::BorsGlobalEvent,
     event::BorsRepositoryEvent,
 };
 pub use database::{PgDbClient, TreeState};
 pub use github::{
     AppError, OAuthClient, OAuthConfig, WebhookSecret, api::create_github_client,
-    api::load_repositories,
+    api::load_repositories, api::operations::CommitAuthor,
 };
 pub use permissions::TeamApiClient;
 pub use server::ServerState;

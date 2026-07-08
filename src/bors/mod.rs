@@ -51,6 +51,11 @@ pub const AUTO_BRANCH_NAME: &str = "automation/bors/auto";
 /// This branch should run CI checks.
 pub const TRY_BRANCH_NAME: &str = "automation/bors/try";
 
+pub const DEFAULT_AUTO_BUILD_CHECK_RUN_NAME: &str = "Bors auto build";
+pub const DEFAULT_TRY_BUILD_CHECK_RUN_NAME: &str = "Bors try build";
+pub const DEFAULT_MERGE_COMMIT_MESSAGE_PREFIX: &str = "Auto merge of";
+pub const DEFAULT_SERVICE_NAME: &str = "Bors";
+
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub enum BuildKind {
     Try,
@@ -311,8 +316,8 @@ pub enum MergeType {
     Auto,
 }
 
-/// Commit author used to emulate old bors (homu).
-fn bors_commit_author() -> CommitAuthor {
+/// Default commit author used to emulate old bors (homu).
+pub fn default_bors_commit_author() -> CommitAuthor {
     CommitAuthor {
         name: "bors".to_string(),
         email: "bors@rust-lang.org".to_string(),
@@ -344,7 +349,11 @@ pub fn normalize_merge_message(message: &str) -> String {
     IGNORE_REGEX.replace_all(message, "").to_string()
 }
 
-pub fn create_merge_commit_message(pr: handlers::PullRequestData, merge_type: MergeType) -> String {
+pub fn create_merge_commit_message(
+    pr: handlers::PullRequestData,
+    merge_type: MergeType,
+    message_prefix: &str,
+) -> String {
     /// Prefix used to specify custom try jobs in PR descriptions.
     const CUSTOM_TRY_JOB_PREFIX: &str = "try-job:";
 
@@ -373,7 +382,7 @@ pub fn create_merge_commit_message(pr: handlers::PullRequestData, merge_type: Me
     let pr_description = normalize_merge_message(&pr_description);
 
     let mut message = format!(
-        r#"Auto merge of #{pr_number} - {pr_label}, r={reviewer}
+        r#"{message_prefix} #{pr_number} - {pr_label}, r={reviewer}
 
 {pr_title}
 

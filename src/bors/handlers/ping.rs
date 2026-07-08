@@ -10,6 +10,7 @@ pub(super) async fn command_ping(
     repo: Arc<RepositoryState>,
     db: &PgDbClient,
     pr_number: PullRequestNumber,
+    service_name: &str,
 ) -> anyhow::Result<()> {
     let mut msg = "Pong :ping_pong:!".to_string();
 
@@ -17,7 +18,12 @@ pub(super) async fn command_ping(
     // `git-version` crate, because for production we build bors in Docker anyway, where there
     // is no git repo.
     let git_version = option_env!("GIT_VERSION").unwrap_or_else(|| "unknown");
-    writeln!(msg, "\n\nbors build: `{git_version}`").unwrap();
+    writeln!(
+        msg,
+        "\n\n{} build: `{git_version}`",
+        service_name.to_lowercase()
+    )
+    .unwrap();
     repo.client
         .post_comment(pr_number, Comment::new(msg), db)
         .await?;

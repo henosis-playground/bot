@@ -388,8 +388,9 @@ mod tests {
     use insta::assert_snapshot;
     use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
 
-    use crate::bors::PullRequestStatus;
-    use crate::bors::merge_queue::AUTO_BUILD_CHECK_RUN_NAME;
+    use crate::bors::{
+        DEFAULT_AUTO_BUILD_CHECK_RUN_NAME as AUTO_BUILD_CHECK_RUN_NAME, PullRequestStatus,
+    };
     use crate::github::api::client::HideCommentReason;
     use crate::tests::{BorsBuilder, BorsTester, GitHub};
     use crate::tests::{Commit, default_repo_name};

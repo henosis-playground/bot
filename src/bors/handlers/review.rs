@@ -582,8 +582,9 @@ fn rollup_pr_invalid_rollup_mode_comment() -> Comment {
 mod tests {
     use octocrab::params::checks::{CheckRunConclusion, CheckRunStatus};
 
-    use crate::bors::TRY_BRANCH_NAME;
-    use crate::bors::merge_queue::AUTO_BUILD_CHECK_RUN_NAME;
+    use crate::bors::{
+        DEFAULT_AUTO_BUILD_CHECK_RUN_NAME as AUTO_BUILD_CHECK_RUN_NAME, TRY_BRANCH_NAME,
+    };
     use crate::database::{
         DelegatedPermission, DelegationStatus, OctocrabMergeableState, TreeState,
     };

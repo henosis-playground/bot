@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}Help - Bors{% endblock %}
+{% block title %}Help - {{ service_name }}{% endblock %}
 
 {% block head %}
 <style>
@@ -45,7 +45,7 @@
 
 {% block body %}
 <main>
-  <h1>Bors</h1>
+  <h1>{{ service_name }}</h1>
 
   <h2>Repositories</h2>
   <ul class="repos">

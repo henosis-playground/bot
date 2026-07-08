@@ -1,7 +1,9 @@
 use crate::bors::{
-    CommandPrefix, PullRequestStatus, RollupMode, WAIT_FOR_BUILD_QUEUE, WAIT_FOR_MERGE_QUEUE,
-    WAIT_FOR_MERGE_QUEUE_MERGE_ATTEMPT, WAIT_FOR_MERGEABILITY_STATUS_REFRESH,
-    WAIT_FOR_PR_STATUS_REFRESH, WAIT_FOR_WEBHOOK_COMPLETED,
+    CommandPrefix, DEFAULT_AUTO_BUILD_CHECK_RUN_NAME, DEFAULT_MERGE_COMMIT_MESSAGE_PREFIX,
+    DEFAULT_SERVICE_NAME, DEFAULT_TRY_BUILD_CHECK_RUN_NAME, PullRequestStatus, RollupMode,
+    WAIT_FOR_BUILD_QUEUE, WAIT_FOR_MERGE_QUEUE, WAIT_FOR_MERGE_QUEUE_MERGE_ATTEMPT,
+    WAIT_FOR_MERGEABILITY_STATUS_REFRESH, WAIT_FOR_PR_STATUS_REFRESH, WAIT_FOR_WEBHOOK_COMPLETED,
+    default_bors_commit_author,
 };
 use crate::database::{
     BuildModel, BuildStatus, DelegatedPermission, DelegationStatus, MergeableState,
@@ -247,6 +249,11 @@ impl BorsTester {
             Some(Git::from_path(PathBuf::from("/tmp/git"))),
             "https://bors-test.com",
             henosis_config,
+            default_bors_commit_author(),
+            DEFAULT_AUTO_BUILD_CHECK_RUN_NAME.to_string(),
+            DEFAULT_TRY_BUILD_CHECK_RUN_NAME.to_string(),
+            DEFAULT_MERGE_COMMIT_MESSAGE_PREFIX.to_string(),
+            DEFAULT_SERVICE_NAME.to_string(),
         ));
 
         let BorsProcess {

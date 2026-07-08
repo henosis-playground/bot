@@ -48,6 +48,7 @@ pub struct HelpTemplate {
     pub repos: Vec<RepositoryView>,
     pub cmd_prefix: String,
     pub help: String,
+    pub service_name: String,
 }
 
 pub struct RepositoryView {
@@ -75,6 +76,7 @@ impl From<HashMap<PullRequestNumber, HashSet<PullRequestNumber>>> for RollupsInf
 #[derive(Template)]
 #[template(path = "queue.html", whitespace = "minimize")]
 pub struct QueueTemplate {
+    pub service_name: String,
     pub repo_name: String,
     pub repo_owner: String,
     pub repo_url: String,

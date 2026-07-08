@@ -135,8 +135,10 @@ pub async fn sync_pull_requests_state(
 
 #[cfg(test)]
 mod tests {
-    use crate::bors::handlers::trybuild::TRY_BUILD_CHECK_RUN_NAME;
-    use crate::bors::{PullRequestStatus, with_mocked_time};
+    use crate::bors::{
+        DEFAULT_TRY_BUILD_CHECK_RUN_NAME as TRY_BUILD_CHECK_RUN_NAME, PullRequestStatus,
+        with_mocked_time,
+    };
     use crate::database::{MergeableState, OctocrabMergeableState, WorkflowStatus};
     use crate::tests::{BorsTester, GitHub, run_test};
     use crate::tests::{User, default_repo_name};
@@ -247,7 +249,7 @@ auto_build_failed = ["+failed"]
             ctx.expect_check_run(
                 &ctx.pr(()).await.get_gh_pr().head_sha(),
                 TRY_BUILD_CHECK_RUN_NAME,
-                "Bors try build",
+                TRY_BUILD_CHECK_RUN_NAME,
                 CheckRunStatus::Completed,
                 Some(CheckRunConclusion::TimedOut),
             );

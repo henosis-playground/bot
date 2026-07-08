@@ -1763,6 +1763,11 @@ mod tests {
                 None,
                 "",
                 None,
+                crate::bors::default_bors_commit_author(),
+                crate::bors::DEFAULT_AUTO_BUILD_CHECK_RUN_NAME.to_string(),
+                crate::bors::DEFAULT_TRY_BUILD_CHECK_RUN_NAME.to_string(),
+                crate::bors::DEFAULT_MERGE_COMMIT_MESSAGE_PREFIX.to_string(),
+                crate::bors::DEFAULT_SERVICE_NAME.to_string(),
             )),
         )));
         GitHubWebhook::from_request(request, &server_ref).await

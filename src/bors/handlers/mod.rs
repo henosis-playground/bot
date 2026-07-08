@@ -489,7 +489,7 @@ async fn handle_comment(
                     }
                     BorsCommand::Ping => {
                         let span = tracing::info_span!("Ping");
-                        command_ping(repo, &ctx.db, pr.number())
+                        command_ping(repo, &ctx.db, pr.number(), &ctx.service_name)
                             .instrument(span)
                             .await
                     }
@@ -507,6 +507,9 @@ async fn handle_comment(
                             parent,
                             jobs,
                             &command_prefix,
+                            &ctx.commit_author,
+                            &ctx.try_build_check_run_name,
+                            &ctx.merge_commit_message_prefix,
                         )
                         .instrument(span)
                         .await

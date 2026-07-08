@@ -7,7 +7,7 @@ use crate::bors::handlers::{
     InvalidationComment, InvalidationInfo, InvalidationReason, PullRequestData, invalidate_pr,
 };
 use crate::bors::{
-    CommandPrefix, Comment, RepositoryState, bors_commit_author, hide_tagged_comments,
+    CommandPrefix, Comment, RepositoryState, default_bors_commit_author, hide_tagged_comments,
 };
 use crate::database::BuildStatus;
 use crate::github::api::CommitAuthor;
@@ -136,7 +136,7 @@ pub(super) async fn command_squash(
             .author
             .email_probably_missing()
             .map(|s| s.to_string())
-            .unwrap_or_else(|| bors_commit_author().email),
+            .unwrap_or_else(|| default_bors_commit_author().email),
     });
 
     // Create the squashed commit on the source repository.
