@@ -399,10 +399,10 @@ impl EnvironmentManager {
     {
         let requested = name.trim();
         anyhow::ensure!(!requested.is_empty(), "Environment name must be specified");
-        let target = if let Some(target) = store.active_environment(requested).await? {
+        let target_id = shared_environment_id(requested);
+        let target = if let Some(target) = store.active_environment(&target_id).await? {
             target
         } else {
-            let target_id = shared_environment_id(requested);
             let manifest_path = environment_manifest_path(&target_id);
             store
                 .upsert_environment(&target_id, &manifest_path, true)
@@ -874,10 +874,13 @@ mod tests {
             manifest_path: &str,
             is_preview: bool,
         ) -> anyhow::Result<()> {
-            anyhow::ensure!(
-                !self.retired_environments.contains(id),
-                "Cannot reuse retired environment id `{id}`"
-            );
+            if self.retired_environments.contains(id) {
+                anyhow::ensure!(
+                    !is_preview_environment_id(id),
+                    "Cannot reuse retired environment id `{id}`"
+                );
+                self.retired_environments.remove(id);
+            }
             self.environments.insert(
                 id.to_string(),
                 EnvironmentState {
@@ -1167,11 +1170,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_and_leave_regenerate_affected_manifests() {
+    async fn named_existing_join_regenerates_affected_manifests() {
         let manager = manager_with_ids(&[
             "preview-00000000-0000-4000-8000-000000000001",
             "preview-00000000-0000-4000-8000-000000000002",
-            "preview-00000000-0000-4000-8000-000000000003",
         ]);
         let mut store = MemoryStore::default();
         let mut writer = MemoryWriter::default();
@@ -1223,7 +1225,7 @@ mod tests {
                 &dev,
                 &digest,
                 service_a.clone(),
-                "preview-00000000-0000-4000-8000-000000000001",
+                "shared-demo",
             )
             .await
             .unwrap();
@@ -1235,12 +1237,12 @@ mod tests {
                 &dev,
                 &digest,
                 service_b.clone(),
-                "preview-00000000-0000-4000-8000-000000000001",
+                "shared-demo",
             )
             .await
             .unwrap();
 
-        let shared = read_written(&writer, "preview-00000000-0000-4000-8000-000000000001.toml");
+        let shared = read_written(&writer, "preview-shared-demo.toml");
         assert!(matches!(
             shared.components.get("service-a"),
             Some(ComponentEntry::Pinned(PinnedEntry { r#ref, .. })) if r#ref == "pr/3"
@@ -1252,6 +1254,11 @@ mod tests {
         assert!(
             writer
                 .deleted_manifests
+                .contains(&"preview-00000000-0000-4000-8000-000000000001.toml".to_string())
+        );
+        assert!(
+            writer
+                .deleted_manifests
                 .contains(&"preview-00000000-0000-4000-8000-000000000002.toml".to_string())
         );
 
@@ -1260,7 +1267,7 @@ mod tests {
             .await
             .unwrap();
 
-        let shared = read_written(&writer, "preview-00000000-0000-4000-8000-000000000001.toml");
+        let shared = read_written(&writer, "preview-shared-demo.toml");
         assert!(matches!(
             shared.components.get("service-a"),
             Some(ComponentEntry::Follower(_))
@@ -1272,7 +1279,7 @@ mod tests {
         assert!(
             !writer
                 .writes
-                .contains_key("preview-00000000-0000-4000-8000-000000000003.toml")
+                .contains_key("preview-00000000-0000-4000-8000-000000000001.toml")
         );
     }
 
@@ -1325,6 +1332,116 @@ mod tests {
             writer
                 .deleted_branches
                 .contains(&"env/preview-shared-demo".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn p_plus_other_name_moves_member_and_retires_old_named_environment() {
+        let manager = manager_with_ids(&[]);
+        let mut store = MemoryStore::default();
+        let mut writer = MemoryWriter::default();
+        let packages = package_reader();
+        let dev = StaticDevManifest(dev_manifest());
+        let digest = NoDigestResolver;
+        let service_a = PreviewPullRequest::new(
+            "henosis-playground/service-a",
+            3,
+            "service-a",
+            "pr/3",
+            "a-pr",
+        );
+
+        manager
+            .join(
+                &mut store,
+                &mut writer,
+                &packages,
+                &dev,
+                &digest,
+                service_a.clone(),
+                "shared-demo",
+            )
+            .await
+            .unwrap();
+        let moved = manager
+            .join(
+                &mut store,
+                &mut writer,
+                &packages,
+                &dev,
+                &digest,
+                service_a.clone(),
+                "other-demo",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(moved.retired[0].id, "preview-shared-demo");
+        assert_eq!(moved.written[0].id, "preview-other-demo");
+        assert!(writer.writes.contains_key("preview-other-demo.toml"));
+        assert!(
+            writer
+                .deleted_manifests
+                .contains(&"preview-shared-demo.toml".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn named_environment_can_be_recreated_after_retirement() {
+        let manager = manager_with_ids(&[]);
+        let mut store = MemoryStore::default();
+        let mut writer = MemoryWriter::default();
+        let packages = package_reader();
+        let dev = StaticDevManifest(dev_manifest());
+        let digest = NoDigestResolver;
+        let service_a = PreviewPullRequest::new(
+            "henosis-playground/service-a",
+            3,
+            "service-a",
+            "pr/3",
+            "a-pr",
+        );
+
+        manager
+            .join(
+                &mut store,
+                &mut writer,
+                &packages,
+                &dev,
+                &digest,
+                service_a.clone(),
+                "shared-demo",
+            )
+            .await
+            .unwrap();
+        manager
+            .leave(
+                &mut store,
+                &mut writer,
+                &packages,
+                &dev,
+                &digest,
+                service_a.clone(),
+            )
+            .await
+            .unwrap();
+        let recreated = manager
+            .join(
+                &mut store,
+                &mut writer,
+                &packages,
+                &dev,
+                &digest,
+                service_a,
+                "shared-demo",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(recreated.written[0].id, "preview-shared-demo");
+        assert_eq!(
+            writer.created_branches,
+            vec!["env/preview-shared-demo", "env/preview-shared-demo"]
         );
     }
 
@@ -1384,7 +1501,7 @@ mod tests {
                 &dev,
                 &digest,
                 service_a,
-                "preview-00000000-0000-4000-8000-000000000001",
+                "shared-demo",
             )
             .await
             .unwrap();
@@ -1396,7 +1513,7 @@ mod tests {
                 &dev,
                 &digest,
                 service_b,
-                "preview-00000000-0000-4000-8000-000000000001",
+                "shared-demo",
             )
             .await
             .unwrap();
@@ -1419,11 +1536,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            change.written[0].id,
-            "preview-00000000-0000-4000-8000-000000000001"
-        );
-        let shared = read_written(&writer, "preview-00000000-0000-4000-8000-000000000001.toml");
+        assert_eq!(change.written[0].id, "preview-shared-demo");
+        let shared = read_written(&writer, "preview-shared-demo.toml");
         assert!(matches!(
             shared.components.get("service-a"),
             Some(ComponentEntry::Pinned(PinnedEntry { r#ref, digest, .. }))

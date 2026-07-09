@@ -2005,6 +2005,21 @@ I am markdown HTML comment
         assert!(cmds.is_empty());
     }
 
+    #[test]
+    fn legacy_henosis_env_and_gate_commands_are_removed() {
+        let cmds = parse_commands("@bors env join shared-demo");
+        assert_eq!(
+            cmds[0],
+            Err(CommandParseError::UnknownCommand("env".to_string()))
+        );
+
+        let cmds = parse_commands("@bors gate");
+        assert_eq!(
+            cmds[0],
+            Err(CommandParseError::UnknownCommand("gate".to_string()))
+        );
+    }
+
     fn parse_commands(text: &str) -> Vec<Result<BorsCommand, CommandParseError>> {
         CommandParser::new("@bors".to_string().into()).parse_commands(text)
     }

@@ -1441,7 +1441,7 @@ digest = "sha256:service-b"
 
                 assert!(body.contains("<!-- henosis:status -->"));
                 assert!(body.contains("<!-- /henosis:status -->"));
-                assert!(body.contains("| Environment | `preview-"));
+                assert!(body.contains("**Environment** `preview-"));
                 assert!(body.contains(
                     "[manifest](https://github.com/rust-lang/borstest/blob/main/preview-"
                 ));
@@ -1453,8 +1453,8 @@ digest = "sha256:service-b"
                 assert!(body.contains(
                     "[rust-lang/borstest#2](https://github.com/rust-lang/borstest/pull/2) (this PR)"
                 ));
-                assert!(body.contains("| Merge gate | :grey_question: none |"));
-                assert!(body.contains("| Render | :grey_question: none |"));
+                assert!(body.contains("**Merge gate** :grey_question: none"));
+                assert!(body.contains("**Render** :grey_question: none"));
                 Ok(())
             })
             .await;
@@ -1478,8 +1478,8 @@ digest = "sha256:service-b"
 
                 let body = ctx.pr(pr_id.clone()).await.get_gh_pr().description;
                 assert!(body.contains("<!-- henosis:status -->"));
-                assert!(body.contains("| Environment | `preview-"));
-                assert!(body.contains("| Render | :grey_question: none |"));
+                assert!(body.contains("**Environment** `preview-"));
+                assert!(body.contains("**Render** :grey_question: none"));
 
                 ctx.post_comment(Comment::new(pr_id.clone(), "@bors p-"))
                     .await?;
@@ -1551,7 +1551,8 @@ digest = "sha256:service-b"
                 let comment = ctx.get_next_comment_text(pr_id.clone()).await?;
                 assert!(comment.contains("couldn't materialise environment `preview-"));
                 assert!(comment.contains("<details><summary>render log</summary>"));
-                assert!(comment.contains("```text\nrendering manifest\n##[error]missing DATABASE_URL\nPost job cleanup.\n```"));
+                assert!(comment.contains("```text\nrendering manifest\n##[error]missing DATABASE_URL\n```"));
+                assert!(!comment.contains("Post job cleanup."));
                 assert!(
                     comment.contains(
                         "[render run](https://github.com/rust-lang/borstest/actions/runs/"
@@ -1559,7 +1560,7 @@ digest = "sha256:service-b"
                 );
 
                 let body = ctx.pr(pr_id).await.get_gh_pr().description;
-                assert!(body.contains("| Render | :x: failed ([run](https://github.com/rust-lang/borstest/actions/runs/"));
+                assert!(body.contains("**Render** :x: failed ([run](https://github.com/rust-lang/borstest/actions/runs/"));
                 assert!(!body.contains("##[error]missing DATABASE_URL"));
                 Ok(())
             })
@@ -1632,8 +1633,8 @@ digest = "sha256:service-b"
 
                 let service_a_body = ctx.pr(service_a_id).await.get_gh_pr().description;
                 let service_b_body = ctx.pr(service_b_id).await.get_gh_pr().description;
-                assert!(service_a_body.contains(&format!("| Environment | `{environment_id}`")));
-                assert!(service_b_body.contains(&format!("| Environment | `{environment_id}`")));
+                assert!(service_a_body.contains(&format!("**Environment** `{environment_id}`")));
+                assert!(service_b_body.contains(&format!("**Environment** `{environment_id}`")));
                 assert!(
                     service_a_body
                         .contains("[rust-lang/borstest#2](https://github.com/rust-lang/borstest/pull/2) (this PR), [rust-lang/service-b#1](https://github.com/rust-lang/service-b/pull/1)")

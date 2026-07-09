@@ -5,7 +5,7 @@ use sqlx::{PgPool, Postgres, Row};
 use crate::henosis::config::{ComponentMode, RegisteredComponent};
 use crate::henosis::environment::{
     EnvironmentState, EnvironmentStore, PreviewPullRequest, PullRequestKey, RenderOutcome,
-    RenderStatus,
+    RenderStatus, is_preview_environment_id,
 };
 use crate::henosis::merge::MergeStore;
 use crate::henosis::queue::{
@@ -115,6 +115,7 @@ impl EnvironmentStore for PgEnvironmentStore {
         manifest_path: &str,
         is_preview: bool,
     ) -> anyhow::Result<()> {
+        let can_reuse_retired = can_reuse_retired_environment_id(id, is_preview);
         sqlx::query(
             r#"
 INSERT INTO environment (id, manifest_path, is_preview, retired_at, updated_at)
@@ -123,17 +124,29 @@ ON CONFLICT (id)
 DO UPDATE SET
     manifest_path = EXCLUDED.manifest_path,
     is_preview = EXCLUDED.is_preview,
+    retired_at = NULL,
     updated_at = NOW()
-WHERE environment.retired_at IS NULL
+WHERE environment.retired_at IS NULL OR $4
 RETURNING id
 "#,
         )
         .bind(id)
         .bind(manifest_path)
         .bind(is_preview)
+        .bind(can_reuse_retired)
         .fetch_optional(&self.pool)
         .await?
         .with_context(|| format!("Cannot reuse retired environment id `{id}`"))?;
+        if can_reuse_retired {
+            sqlx::query("DELETE FROM manifest_revision WHERE environment_id = $1")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("DELETE FROM environment_render WHERE environment_id = $1")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        }
         Ok(())
     }
 
@@ -311,6 +324,10 @@ VALUES ($1, $2)
         .await?;
         Ok(())
     }
+}
+
+fn can_reuse_retired_environment_id(id: &str, is_preview: bool) -> bool {
+    is_preview && id.starts_with("preview-") && !is_preview_environment_id(id)
 }
 
 pub struct PgQueueStore {

@@ -176,13 +176,13 @@ fn help_line(failure: &GateFailure, analyses: &[PathAnalysis]) -> String {
 
     if paths.is_empty() {
         return format!(
-            "update your usage, or update your pin: pnpm update @henosis/{}",
+            "update your usage, or update your pin: `pnpm update @henosis/{}`",
             failure.producer
         );
     }
 
     format!(
-        "you depended on outputs [{}] which no longer exist or changed type; update your usage, or update your pin: pnpm update @henosis/{}",
+        "you depended on outputs [{}] which no longer exist or changed type; update your usage, or update your pin: `pnpm update @henosis/{}`",
         paths
             .iter()
             .map(|path| format!("`{path}`"))
@@ -534,7 +534,7 @@ note: you pinned service-a @ 1111111; this environment resolved service-a @ 2222
  }
 ```
 
-help: you depended on outputs [`api`, `port`] which no longer exist or changed type; update your usage, or update your pin: pnpm update @henosis/service-a
+help: you depended on outputs [`api`, `port`] which no longer exist or changed type; update your usage, or update your pin: `pnpm update @henosis/service-a`
 "###);
     }
 }

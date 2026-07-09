@@ -18,7 +18,7 @@ pub struct StatusSnapshot {
 
 pub fn render_status_section(snapshot: &StatusSnapshot) -> String {
     format!(
-        "{STATUS_START}\n### Henosis status\n\n|  |  |\n| --- | --- |\n| Environment | `{}` [manifest]({}) · [branch]({}) |\n| Members | {} |\n| Merge gate | {} |\n| Render | {} |\n{STATUS_END}",
+        "{STATUS_START}\n### Henosis status\n\n**Environment** `{}` · [manifest]({}) · [branch]({})\n**Members** {}\n**Merge gate** {}\n**Render** {}\n{STATUS_END}",
         snapshot.environment.environment.id,
         snapshot.manifest_url,
         snapshot.branch_url,
@@ -187,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_ratified_status_table() {
+    fn renders_ratified_status_block() {
         let section = render_status_section(&StatusSnapshot {
             environment: EnvironmentStatus {
                 environment: EnvironmentState {
@@ -242,12 +242,10 @@ mod tests {
 <!-- henosis:status -->
 ### Henosis status
 
-|  |  |
-| --- | --- |
-| Environment | `preview-00000000-0000-4000-8000-000000000001` [manifest](https://github.com/henosis-playground/deploy/blob/main/preview.toml) · [branch](https://github.com/henosis-playground/deploy/tree/env/preview) |
-| Members | [henosis-playground/service-a#12](https://github.com/henosis-playground/service-a/pull/12) (this PR), [henosis-playground/service-b#34](https://github.com/henosis-playground/service-b/pull/34) |
-| Merge gate | final: :x: failed ([details](https://github.com/henosis-playground/service-a/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/checks))<br>advisory: :white_check_mark: passed ([details](https://github.com/henosis-playground/service-a/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/checks)) |
-| Render | :x: failed ([run](https://github.com/henosis-playground/deploy/actions/runs/1)) |
+**Environment** `preview-00000000-0000-4000-8000-000000000001` · [manifest](https://github.com/henosis-playground/deploy/blob/main/preview.toml) · [branch](https://github.com/henosis-playground/deploy/tree/env/preview)
+**Members** [henosis-playground/service-a#12](https://github.com/henosis-playground/service-a/pull/12) (this PR), [henosis-playground/service-b#34](https://github.com/henosis-playground/service-b/pull/34)
+**Merge gate** final: :x: failed ([details](https://github.com/henosis-playground/service-a/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/checks))<br>advisory: :white_check_mark: passed ([details](https://github.com/henosis-playground/service-a/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/checks))
+**Render** :x: failed ([run](https://github.com/henosis-playground/deploy/actions/runs/1))
 <!-- /henosis:status -->
 "#);
     }

@@ -1,12 +1,13 @@
 use octocrab::models::workflows::{Conclusion, Job, Status, Step};
 use regex::Regex;
+use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
 use crate::bors::event::WorkflowRunCompleted;
 use crate::github::api::client::GithubRepositoryClient;
 use crate::henosis::environment::RenderOutcome;
 
-const LOG_CONTEXT_LINES: usize = 1;
+const LOG_CONTEXT_BEFORE_LINES: usize = 1;
 const LOG_LINE_LIMIT: usize = 600;
 
 static ANSI_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").unwrap());
@@ -119,17 +120,20 @@ fn log_excerpt(logs: &str, step_name: Option<&str>) -> Option<String> {
         return None;
     }
 
-    let mut selected = Vec::new();
-    let mut last = None;
+    let mut selected_indices = BTreeSet::new();
     for index in error_indices {
-        let start = index.saturating_sub(LOG_CONTEXT_LINES);
-        let end = (index + LOG_CONTEXT_LINES + 1).min(relevant.len());
+        let start = index.saturating_sub(LOG_CONTEXT_BEFORE_LINES);
+        let end = index + 1;
         for line_index in start..end {
-            if last != Some(line_index) {
-                selected.push(relevant[line_index].replace("```", "'''"));
-                last = Some(line_index);
-            }
+            selected_indices.insert(line_index);
         }
+    }
+    let selected = selected_indices
+        .into_iter()
+        .filter_map(|line_index| excerpt_line(&relevant[line_index]))
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return None;
     }
     Some(selected.join("\n"))
 }
@@ -151,6 +155,22 @@ fn clean_log_line(line: &str) -> String {
     }
 }
 
+fn excerpt_line(line: &str) -> Option<String> {
+    if runner_housekeeping_line(line) {
+        return None;
+    }
+    Some(line.replace("```", "'''"))
+}
+
+fn runner_housekeeping_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("##[group]")
+        || trimmed.starts_with("##[endgroup]")
+        || trimmed.starts_with("(node:")
+        || trimmed.contains("DeprecationWarning")
+        || trimmed.contains("node --trace-deprecation")
+}
+
 #[cfg(test)]
 mod tests {
     use super::log_excerpt;
@@ -167,7 +187,7 @@ mod tests {
 
         assert_eq!(
             log_excerpt(logs, Some("Render dev")).unwrap(),
-            "compiling manifest\n##[error]missing DATABASE_URL\nPost job cleanup."
+            "compiling manifest\n##[error]missing DATABASE_URL"
         );
     }
 
@@ -193,8 +213,27 @@ mod tests {
 
         assert!(excerpt.contains("##[error]Process completed with exit code 1."));
         assert!(excerpt.contains("[ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL]"));
-        assert!(excerpt.contains("Post job cleanup."));
+        assert!(!excerpt.contains("Post job cleanup."));
         assert!(!excerpt.contains("live render failure first 2026-07-08"));
         assert!(!excerpt.contains("cleanup line 39"));
+    }
+
+    #[test]
+    fn drops_runner_housekeeping_around_errors() {
+        let logs = "\
+2026-07-08T10:00:00.000Z ##[group]Setup Node
+2026-07-08T10:00:01.000Z (node:123) [DEP0040] DeprecationWarning: punycode is deprecated
+2026-07-08T10:00:02.000Z Use `node --trace-deprecation ...` to show where the warning was created
+2026-07-08T10:00:03.000Z ##[endgroup]
+2026-07-08T10:00:04.000Z ##[group]Render preview
+2026-07-08T10:00:05.000Z compiling preview
+2026-07-08T10:00:06.000Z ##[error]render failed
+2026-07-08T10:00:07.000Z ##[endgroup]
+";
+
+        assert_eq!(
+            log_excerpt(logs, Some("Render preview")).unwrap(),
+            "compiling preview\n##[error]render failed"
+        );
     }
 }
