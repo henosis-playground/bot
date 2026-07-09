@@ -134,6 +134,7 @@ pub type GateRun = RecordedGateRun;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateStatus {
     pub external_id: String,
+    pub head_sha: String,
     pub status: String,
     pub diagnostic: Option<String>,
 }
@@ -424,7 +425,7 @@ impl QueueManager {
                 .resolve_check_run(
                     &gate.external_id,
                     CheckConclusion::Neutral,
-                    "Henosis gate cancelled because a new commit was pushed.",
+                    "Henosis merge gate cancelled because a new commit was pushed.",
                 )
                 .await?;
         }
@@ -665,8 +666,16 @@ mod tests {
             else {
                 return Ok(None);
             };
+            let head_sha = run
+                .world
+                .members
+                .iter()
+                .find(|member| member.key == *key)
+                .map(|member| member.head_sha.clone())
+                .unwrap_or_default();
             Ok(Some(GateStatus {
                 external_id: run.external_id.clone(),
+                head_sha,
                 status: self
                     .statuses
                     .get(&run.external_id)
@@ -682,14 +691,19 @@ mod tests {
         ) -> anyhow::Result<Vec<GateStatus>> {
             let mut invalidated = Vec::new();
             let active = [PENDING_STATUS, PENDING_EXECUTOR_STATUS, RUNNING_STATUS];
-            let external_ids = self
+            let runs = self
                 .recorded
                 .iter()
-                .filter(|run| run.world.members.iter().any(|member| member.key == *key))
-                .map(|run| run.external_id.clone())
+                .filter_map(|run| {
+                    run.world
+                        .members
+                        .iter()
+                        .find(|member| member.key == *key)
+                        .map(|member| (run.external_id.clone(), member.head_sha.clone()))
+                })
                 .collect::<Vec<_>>();
 
-            for external_id in external_ids {
+            for (external_id, head_sha) in runs {
                 let status = self
                     .statuses
                     .get(&external_id)
@@ -700,6 +714,7 @@ mod tests {
                         .await?;
                     invalidated.push(GateStatus {
                         external_id,
+                        head_sha,
                         status: INVALIDATED_STATUS.to_string(),
                         diagnostic: None,
                     });
@@ -972,7 +987,7 @@ mod tests {
             [(
                 external_id.clone(),
                 CheckConclusion::Success,
-                "Henosis gate passed. The candidate world compiled and rendered.".to_string()
+                "Henosis merge gate passed. The candidate world compiled and rendered.".to_string()
             )]
         );
         assert_eq!(
@@ -1022,11 +1037,11 @@ mod tests {
         assert_eq!(resolved[0].0, external_id);
         assert_eq!(resolved[0].1, CheckConclusion::Failure);
         assert!(resolved[0].2.contains("service-b"));
-        assert!(resolved[0].2.contains("service-a.databaseUrl"));
+        assert!(resolved[0].2.contains("databaseUrl (removed)"));
         assert!(merge_executor.calls.lock().unwrap().is_empty());
         let comments = commenter.comments.lock().unwrap();
         assert_eq!(comments.len(), 1);
-        assert!(comments[0].1.contains("Henosis gate failed"));
+        assert!(comments[0].1.contains("Henosis merge gate failed"));
         assert!(comments[0].1.contains("service-b"));
         assert!(comments[0].1.contains("service-a"));
     }

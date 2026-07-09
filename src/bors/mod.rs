@@ -80,10 +80,9 @@ pub fn format_help() -> &'static str {
         BorsCommand::TryCancel => {}
         BorsCommand::SetPriority(_) => {}
         BorsCommand::Info => {}
-        BorsCommand::Env => {}
+        BorsCommand::EnvCreate => {}
         BorsCommand::EnvJoin { name: _ } => {}
         BorsCommand::EnvLeave => {}
-        BorsCommand::GateStatus => {}
         BorsCommand::Delegate(_) => {}
         BorsCommand::Undelegate => {}
         BorsCommand::SetRollupMode(_) => {}
@@ -130,10 +129,9 @@ You can use the following commands:
 - `info`: Get information about the current PR
 
 ## Henosis commands
-- `env`: Show this PR's environment assignment
-- `env join <name>`: Join a named preview environment
-- `env leave`: Leave the current environment
-- `gate`: Show gate status for this PR
+- `p+`: Create a fresh preview environment for this PR
+- `p+ <name>`: Join a named preview environment, creating it if needed
+- `p-`: Leave the current environment
 
 ## Repository management
 - `treeclosed=<priority> [reason]`: Close the tree for PRs with priority less than `<priority>`. Optionally, you can specify a `<reason>`.

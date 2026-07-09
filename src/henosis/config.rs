@@ -19,6 +19,8 @@ pub struct HenosisConfig {
     pub gate_check_run_name: String,
     #[serde(default = "default_advisory_gate_check_run_name")]
     pub advisory_gate_check_run_name: String,
+    #[serde(default)]
+    pub preview_mode: PreviewMode,
     #[serde(default = "default_render_workflow_name")]
     pub render_workflow_name: String,
     #[serde(default = "default_queue_tick_interval_secs")]
@@ -44,6 +46,19 @@ pub enum ComponentMode {
 impl Default for ComponentMode {
     fn default() -> Self {
         Self::GateOnly
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreviewMode {
+    Auto,
+    OnDemand,
+}
+
+impl Default for PreviewMode {
+    fn default() -> Self {
+        Self::OnDemand
     }
 }
 
@@ -156,11 +171,11 @@ fn default_gate_command() -> String {
 }
 
 fn default_gate_check_run_name() -> String {
-    "Henosis gate".to_string()
+    "Henosis merge gate".to_string()
 }
 
 fn default_advisory_gate_check_run_name() -> String {
-    "Henosis advisory gate".to_string()
+    "Henosis advisory merge gate".to_string()
 }
 
 fn default_render_workflow_name() -> String {
@@ -211,8 +226,12 @@ manifest_path = "dev.toml"
 
         assert_eq!(config.manifest_branch, "main");
         assert_eq!(config.gate_command, "henosis-gate");
-        assert_eq!(config.gate_check_run_name, "Henosis gate");
-        assert_eq!(config.advisory_gate_check_run_name, "Henosis advisory gate");
+        assert_eq!(config.gate_check_run_name, "Henosis merge gate");
+        assert_eq!(
+            config.advisory_gate_check_run_name,
+            "Henosis advisory merge gate"
+        );
+        assert_eq!(config.preview_mode, PreviewMode::OnDemand);
         assert_eq!(config.render_workflow_name, "Render environments");
         assert_eq!(config.queue_tick_interval_secs, 15);
         assert_eq!(config.queue_tick_interval(), Duration::from_secs(15));
@@ -247,6 +266,7 @@ gate_command = "custom-gate"
 gate_check_run_name = "Custom gate"
 advisory_gate_check_run_name = "Custom advisory"
 render_workflow_name = "Custom render"
+preview_mode = "on-demand"
 queue_tick_interval_secs = 3
 cmd_prefix = "@custom-bot"
 source_repos = ["henosis-playground/service-a"]
@@ -262,6 +282,7 @@ manifest_path = "staging.toml"
         assert_eq!(config.gate_command, "custom-gate");
         assert_eq!(config.gate_check_run_name, "Custom gate");
         assert_eq!(config.advisory_gate_check_run_name, "Custom advisory");
+        assert_eq!(config.preview_mode, PreviewMode::OnDemand);
         assert_eq!(config.render_workflow_name, "Custom render");
         assert_eq!(config.queue_tick_interval(), Duration::from_secs(3));
         assert_eq!(config.cmd_prefix, "@custom-bot");

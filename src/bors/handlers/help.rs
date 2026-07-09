@@ -62,10 +62,9 @@ mod tests {
             - `info`: Get information about the current PR
 
             ## Henosis commands
-            - `env`: Show this PR's environment assignment
-            - `env join <name>`: Join a named preview environment
-            - `env leave`: Leave the current environment
-            - `gate`: Show gate status for this PR
+            - `p+`: Create a fresh preview environment for this PR
+            - `p+ <name>`: Join a named preview environment, creating it if needed
+            - `p-`: Leave the current environment
 
             ## Repository management
             - `treeclosed=<priority> [reason]`: Close the tree for PRs with priority less than `<priority>`. Optionally, you can specify a `<reason>`.

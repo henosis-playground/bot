@@ -302,6 +302,10 @@ impl BorsTester {
         self.db.clone()
     }
 
+    pub fn context(&self) -> Arc<BorsContext> {
+        self.ctx.clone()
+    }
+
     /// Return the default repo
     pub fn repo(&self) -> Arc<Mutex<Repo>> {
         self.get_repo(())

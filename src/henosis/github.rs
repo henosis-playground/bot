@@ -9,6 +9,7 @@ use sqlx::PgPool;
 
 use crate::PgDbClient;
 use crate::bors::RepositoryStore;
+use crate::bors::comment::CommentTag;
 use crate::bors::{Comment, PullRequestStatus};
 use crate::github::api::client::{CheckRunOutput, GithubRepositoryClient};
 use crate::github::api::operations::{BranchUpdateError, ForcePush};
@@ -244,7 +245,7 @@ impl GateCheckReporter for GithubGateCheckReporter<'_> {
                 CheckRunStatus::InProgress,
                 CheckRunOutput {
                     title: self.check_name.clone(),
-                    summary: "Gate run created; waiting for executor.".to_string(),
+                    summary: "Merge gate run created; waiting for executor.".to_string(),
                 },
                 external_id,
             )
@@ -397,15 +398,56 @@ impl PrCommenter for GithubPrCommenter<'_> {
             .repositories
             .get(&repo_name)
             .with_context(|| format!("Repository `{repo_name}` is not loaded"))?;
+        for comment in self
+            .db
+            .get_tagged_bot_comments(
+                &repo_name,
+                PullRequestNumber(pr.key.number),
+                CommentTag::HenosisGateFailure,
+            )
+            .await?
+        {
+            match repo.client.get_comment_content(&comment.node_id).await {
+                Ok(existing)
+                    if existing == body
+                        || canonical_gate_failure_comment(&existing)
+                            == canonical_gate_failure_comment(body) =>
+                {
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        node_id = comment.node_id,
+                        "Could not inspect prior Henosis merge gate comment: {error:?}"
+                    );
+                }
+            }
+        }
         repo.client
             .post_comment(
                 PullRequestNumber(pr.key.number),
-                Comment::new(body.to_string()),
+                Comment::new(body.to_string()).with_tag(CommentTag::HenosisGateFailure),
                 self.db,
             )
             .await?;
         Ok(())
     }
+}
+
+fn canonical_gate_failure_comment(body: &str) -> String {
+    body.lines()
+        .map(|line| {
+            if line.starts_with("note: you pinned ") {
+                line.rsplit_once(" @ ")
+                    .map(|(prefix, _)| format!("{prefix} @ <resolved>"))
+                    .unwrap_or_else(|| line.to_string())
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub struct GitHubMergeExecutor<'a> {

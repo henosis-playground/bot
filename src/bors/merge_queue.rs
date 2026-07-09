@@ -1052,7 +1052,10 @@ report_merge_conflicts = true
                 let main_before = branch_sha(ctx, &service_repo, "main");
 
                 ctx.approve(()).await?;
-                assert_eq!(check_count(ctx, &service_repo, "Henosis advisory gate"), 1);
+                assert_eq!(
+                    check_count(ctx, &service_repo, "Henosis advisory merge gate"),
+                    1
+                );
 
                 ctx.start_auto_build(()).await?;
                 let tested_auto_commit = ctx.auto_branch().sha();
@@ -1068,7 +1071,7 @@ report_merge_conflicts = true
 
                 assert_eq!(branch_sha(ctx, &service_repo, "main"), tested_auto_commit);
                 assert!(deploy_manifest(ctx).contains(&format!(r#"ref = "{tested_auto_commit}""#)));
-                assert_eq!(check_count(ctx, &service_repo, "Henosis gate"), 1);
+                assert_eq!(check_count(ctx, &service_repo, "Henosis merge gate"), 1);
                 ctx.pr(()).await.expect_status(PullRequestStatus::Merged);
                 let landed = ctx.get_next_comment_text(()).await?;
                 assert!(landed.contains(&format!("Landed as {tested_auto_commit}")));
@@ -1094,6 +1097,9 @@ report_merge_conflicts = true
                 let deploy_before = branch_sha(ctx, &deploy_repo_name(), "main");
 
                 ctx.approve(()).await?;
+                let failure = ctx.get_next_comment_text(()).await?;
+                assert!(failure.contains("Henosis merge gate failed"));
+                assert!(failure.contains("service-b"));
                 ctx.start_auto_build(()).await?;
                 ctx.workflow_full_success(ctx.auto_workflow()).await?;
                 ctx.run_merge_queue_until_merge_attempt().await;
@@ -1103,9 +1109,6 @@ report_merge_conflicts = true
                 assert_eq!(branch_sha(ctx, &deploy_repo_name(), "main"), deploy_before);
                 assert!(deploy_manifest(ctx).contains(r#"ref = "main-sha1""#));
                 ctx.pr(()).await.expect_status(PullRequestStatus::Open);
-                let failure = ctx.get_next_comment_text(()).await?;
-                assert!(failure.contains("Henosis gate failed"));
-                assert!(failure.contains("service-b"));
                 Ok(())
             })
             .await;
@@ -1174,7 +1177,10 @@ report_merge_conflicts = true
                 ctx.run_merge_queue_now().await;
                 assert!(ctx.db().get_pending_builds(&service_repo).await?.is_empty());
                 assert_eq!(branch_sha(ctx, &service_repo, "main"), main_before);
-                assert_eq!(check_count(ctx, &service_repo, "Henosis advisory gate"), 0);
+                assert_eq!(
+                    check_count(ctx, &service_repo, "Henosis advisory merge gate"),
+                    0
+                );
 
                 ctx.run_henosis_queue_now().await?.unwrap();
                 let main_after = branch_sha(ctx, &service_repo, "main");
@@ -1197,7 +1203,7 @@ report_merge_conflicts = true
                 ctx.start_and_finish_auto_build(()).await?;
                 ctx.pr(()).await.expect_status(PullRequestStatus::Merged);
                 assert_eq!(
-                    check_count(ctx, &default_repo_name(), "Henosis advisory gate"),
+                    check_count(ctx, &default_repo_name(), "Henosis advisory merge gate"),
                     0
                 );
                 Ok(())

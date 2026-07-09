@@ -397,22 +397,31 @@ impl EnvironmentManager {
         R: ComponentPackageReader,
         D: DevManifestReader,
     {
-        let target_id = name.trim();
-        anyhow::ensure!(
-            is_preview_environment_id(target_id),
-            "`{target_id}` is not a preview environment id"
-        );
-        let Some(target) = store.active_environment(target_id).await? else {
-            anyhow::bail!("preview environment `{target_id}` is not active");
+        let requested = name.trim();
+        anyhow::ensure!(!requested.is_empty(), "Environment name must be specified");
+        let target = if let Some(target) = store.active_environment(requested).await? {
+            target
+        } else {
+            let target_id = shared_environment_id(requested);
+            let manifest_path = environment_manifest_path(&target_id);
+            store
+                .upsert_environment(&target_id, &manifest_path, true)
+                .await?;
+            EnvironmentState {
+                id: target_id.clone(),
+                manifest_path,
+                is_preview: true,
+            }
         };
         anyhow::ensure!(
             target.is_preview,
-            "environment `{target_id}` is not a preview environment"
+            "environment `{}` is not a preview environment",
+            target.id
         );
         let previous = store.environment_for_pr(&pr.key).await?;
 
         store.retire_member(&pr.key).await?;
-        store.put_member(target_id, &pr).await?;
+        store.put_member(&target.id, &pr).await?;
 
         let mut change = EnvironmentChange::default();
         if let Some(previous) = previous.filter(|previous| previous.id != target.id) {
@@ -467,47 +476,31 @@ impl EnvironmentManager {
         D: DevManifestReader,
     {
         let previous = store.environment_for_pr(&pr.key).await?;
-        let solo_id = self.id_generator.new_preview_environment_id();
-        let solo_path = environment_manifest_path(&solo_id);
-
-        store.upsert_environment(&solo_id, &solo_path, true).await?;
+        let Some(previous) = previous else {
+            return Ok(EnvironmentChange::default());
+        };
         store.retire_member(&pr.key).await?;
-        store.put_member(&solo_id, &pr).await?;
 
         let mut change = EnvironmentChange::default();
-        if let Some(previous) = previous.filter(|previous| previous.id != solo_id) {
-            change.extend(self.retire_if_empty(store, writer, &previous).await?);
-            if store
-                .active_members(&previous.id)
-                .await
-                .map(|members| !members.is_empty())
-                .unwrap_or(false)
-            {
-                change.written.push(
-                    self.write_environment(
-                        store,
-                        writer,
-                        package_reader,
-                        dev_manifests,
-                        digest_resolver,
-                        &previous.id,
-                    )
-                    .await?,
-                );
-            }
+        change.extend(self.retire_if_empty(store, writer, &previous).await?);
+        if store
+            .active_members(&previous.id)
+            .await
+            .map(|members| !members.is_empty())
+            .unwrap_or(false)
+        {
+            change.written.push(
+                self.write_environment(
+                    store,
+                    writer,
+                    package_reader,
+                    dev_manifests,
+                    digest_resolver,
+                    &previous.id,
+                )
+                .await?,
+            );
         }
-
-        change.written.push(
-            self.write_environment(
-                store,
-                writer,
-                package_reader,
-                dev_manifests,
-                digest_resolver,
-                &solo_id,
-            )
-            .await?,
-        );
         Ok(change)
     }
 
@@ -699,7 +692,7 @@ pub fn solo_environment_id(repo: &str, number: u64) -> String {
 }
 
 pub fn shared_environment_id(name: &str) -> String {
-    slugify(name)
+    format!("preview-{}", slugify(name))
 }
 
 pub fn preview_environment_id(mut bytes: [u8; 16]) -> String {
@@ -1276,11 +1269,63 @@ mod tests {
             shared.components.get("service-b"),
             Some(ComponentEntry::Pinned(PinnedEntry { r#ref, .. })) if r#ref == "pr/7"
         ));
-        let solo = read_written(&writer, "preview-00000000-0000-4000-8000-000000000003.toml");
-        assert!(matches!(
-            solo.components.get("service-a"),
-            Some(ComponentEntry::Pinned(PinnedEntry { r#ref, .. })) if r#ref == "pr/3"
-        ));
+        assert!(
+            !writer
+                .writes
+                .contains_key("preview-00000000-0000-4000-8000-000000000003.toml")
+        );
+    }
+
+    #[tokio::test]
+    async fn join_missing_named_environment_creates_and_leave_retires_solo() {
+        let manager = manager_with_ids(&[]);
+        let mut store = MemoryStore::default();
+        let mut writer = MemoryWriter::default();
+        let packages = package_reader();
+        let dev = StaticDevManifest(dev_manifest());
+        let digest = NoDigestResolver;
+        let service_a = PreviewPullRequest::new(
+            "henosis-playground/service-a",
+            3,
+            "service-a",
+            "pr/3",
+            "a-pr",
+        );
+
+        let joined = manager
+            .join(
+                &mut store,
+                &mut writer,
+                &packages,
+                &dev,
+                &digest,
+                service_a.clone(),
+                "shared-demo",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(joined.written[0].id, "preview-shared-demo");
+        assert!(writer.writes.contains_key("preview-shared-demo.toml"));
+        assert_eq!(writer.created_branches, vec!["env/preview-shared-demo"]);
+
+        let left = manager
+            .leave(&mut store, &mut writer, &packages, &dev, &digest, service_a)
+            .await
+            .unwrap();
+
+        assert_eq!(left.retired[0].id, "preview-shared-demo");
+        assert!(left.written.is_empty());
+        assert!(
+            writer
+                .deleted_manifests
+                .contains(&"preview-shared-demo.toml".to_string())
+        );
+        assert!(
+            writer
+                .deleted_branches
+                .contains(&"env/preview-shared-demo".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1400,7 +1445,7 @@ mod tests {
             "preview-00000000-0000-5000-8000-000000000000"
         ));
         assert_eq!(solo_environment_id("Org/Service_A", 42), "pr-service-a-42");
-        assert_eq!(shared_environment_id("Demo Stack!!"), "demo-stack");
+        assert_eq!(shared_environment_id("Demo Stack!!"), "preview-demo-stack");
         assert_eq!(slugify("----"), "env");
         assert_eq!(slugify(&"a".repeat(100)).len(), 63);
     }

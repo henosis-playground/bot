@@ -646,7 +646,7 @@ WHERE external_id = $1
     async fn latest_gate_status(&self, key: &PullRequestKey) -> anyhow::Result<Option<GateStatus>> {
         let row = sqlx::query(
             r#"
-SELECT gr.external_id, gr.status, gr.diagnostic
+SELECT gr.external_id, cwm.head_sha, gr.status, gr.diagnostic
 FROM gate_run AS gr
 JOIN candidate_world AS cw ON cw.gate_run_id = gr.id
 JOIN candidate_world_member AS cwm ON cwm.candidate_world_id = cw.id
@@ -664,6 +664,7 @@ LIMIT 1
         row.map(|row| {
             Ok(GateStatus {
                 external_id: row.try_get("external_id")?,
+                head_sha: row.try_get("head_sha")?,
                 status: row.try_get("status")?,
                 diagnostic: row.try_get("diagnostic")?,
             })
@@ -686,7 +687,7 @@ WHERE cw.gate_run_id = gr.id
   AND cwm.repo = $1
   AND cwm.pr_number = $2
   AND gr.status = ANY($4)
-RETURNING gr.external_id, gr.status, gr.diagnostic
+RETURNING gr.external_id, cwm.head_sha, gr.status, gr.diagnostic
 "#,
         )
         .bind(&key.repo)
@@ -700,6 +701,7 @@ RETURNING gr.external_id, gr.status, gr.diagnostic
             .map(|row| {
                 Ok(GateStatus {
                     external_id: row.try_get("external_id")?,
+                    head_sha: row.try_get("head_sha")?,
                     status: row.try_get("status")?,
                     diagnostic: row.try_get("diagnostic")?,
                 })
@@ -779,7 +781,7 @@ DO UPDATE SET status = EXCLUDED.status, diagnostic = EXCLUDED.diagnostic, update
     ) -> anyhow::Result<Option<GateStatus>> {
         let row = sqlx::query(
             r#"
-SELECT external_id, status, diagnostic
+SELECT external_id, head_sha, status, diagnostic
 FROM advisory_gate_run
 WHERE repo = $1
   AND pr_number = $2
@@ -795,6 +797,7 @@ LIMIT 1
         row.map(|row| {
             Ok(GateStatus {
                 external_id: row.try_get("external_id")?,
+                head_sha: row.try_get("head_sha")?,
                 status: row.try_get("status")?,
                 diagnostic: row.try_get("diagnostic")?,
             })

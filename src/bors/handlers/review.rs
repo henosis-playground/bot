@@ -99,20 +99,6 @@ pub(super) async fn command_approve(
 
     merge_queue_tx.notify().await?;
 
-    if let Err(error) = crate::henosis::service::run_advisory_gate_on_approval(
-        &ctx,
-        repo_state.repository(),
-        pr.github,
-    )
-    .await
-    {
-        tracing::warn!(
-            "Henosis advisory gate failed for {}#{}: {error:#}",
-            repo_state.repository(),
-            pr.number()
-        );
-    }
-
     let mut tree_state = ctx
         .db
         .repo_db(repo_state.repository())
@@ -147,6 +133,20 @@ pub(super) async fn command_approve(
             &db,
         )
         .await?;
+
+    if let Err(error) = crate::henosis::service::run_advisory_gate_on_approval(
+        &ctx,
+        repo_state.repository(),
+        pr.github,
+    )
+    .await
+    {
+        tracing::warn!(
+            "Henosis advisory merge gate failed for {}#{}: {error:#}",
+            repo_state.repository(),
+            pr.number()
+        );
+    }
 
     handle_label_trigger(
         &repo_state,

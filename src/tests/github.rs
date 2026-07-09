@@ -838,6 +838,10 @@ impl PullRequest {
         self.comment_history.push(comment);
     }
 
+    pub fn comment_history_len(&self) -> usize {
+        self.comment_history.len()
+    }
+
     pub fn labels_added_by_bors(&self) -> &[String] {
         &self.labels_added_by_bors
     }

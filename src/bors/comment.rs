@@ -32,6 +32,8 @@ pub enum CommentTag {
     MergeConflict,
     /// A squash operation was started on a PR.
     SquashStarted,
+    /// A Henosis merge gate diagnostic was posted on a PR.
+    HenosisGateFailure,
 }
 
 impl Comment {

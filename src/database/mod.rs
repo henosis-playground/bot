@@ -819,6 +819,7 @@ impl sqlx::Encode<'_, sqlx::Postgres> for CommentTag {
             CommentTag::AutoBuildStarted => "AutoBuildStarted",
             CommentTag::MergeConflict => "MergeConflict",
             CommentTag::SquashStarted => "SquashStarted",
+            CommentTag::HenosisGateFailure => "HenosisGateFailure",
         };
         <&str as sqlx::Encode<sqlx::Postgres>>::encode(tag, buf)
     }
@@ -831,6 +832,7 @@ impl sqlx::Decode<'_, sqlx::Postgres> for CommentTag {
             "AutoBuildStarted" => Ok(CommentTag::AutoBuildStarted),
             "MergeConflict" => Ok(CommentTag::MergeConflict),
             "SquashStarted" => Ok(CommentTag::SquashStarted),
+            "HenosisGateFailure" => Ok(CommentTag::HenosisGateFailure),
             tag => Err(format!("Unknown comment tag: {tag}").into()),
         }
     }

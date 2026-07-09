@@ -3,7 +3,7 @@ use crate::bors::Comment;
 use crate::bors::event::WorkflowRunCompleted;
 use crate::database::WorkflowStatus;
 use crate::github::{GithubRepoName, PullRequest, PullRequestNumber};
-use crate::henosis::config::HenosisConfig;
+use crate::henosis::config::{HenosisConfig, PreviewMode};
 use crate::henosis::db::{PgEnvironmentStore, PgQueueStore};
 use crate::henosis::environment::{
     EnvironmentChange, EnvironmentManager, EnvironmentStatus, EnvironmentStore, PreviewPullRequest,
@@ -17,13 +17,15 @@ use crate::henosis::github::{
 };
 use crate::henosis::queue::{
     ADVISORY_FAILED_STATUS, ADVISORY_PASSED_STATUS, AdvisoryGateStore, CheckConclusion,
-    GateCheckReporter, GateStatus, QueueManager, QueuePullRequest, QueueStore, RecordedGateRun,
+    GateCheckReporter, PrCommenter, QueueManager, QueuePullRequest, QueueStore, RecordedGateRun,
     advisory_gate_external_id,
 };
 use crate::henosis::render_diagnostics::{
     fallback_render_failure_diagnostic, generate_render_failure_diagnostic, render_failure_comment,
 };
-use crate::henosis::status::{StatusSnapshot, render_status_section, upsert_status_section};
+use crate::henosis::status::{
+    StatusSnapshot, remove_status_section, render_status_section, upsert_status_section,
+};
 use anyhow::Context;
 use std::collections::BTreeSet;
 
@@ -49,10 +51,23 @@ pub async fn open_preview_environment(
     let Some(config) = ctx.henosis_config.as_ref() else {
         return Ok(None);
     };
+    if config.preview_mode == PreviewMode::OnDemand {
+        return Ok(None);
+    }
+    create_preview_environment(ctx, repo, pr).await
+}
+
+pub async fn create_preview_environment(
+    ctx: &BorsContext,
+    repo: &GithubRepoName,
+    pr: &PullRequest,
+) -> anyhow::Result<Option<EnvironmentChange>> {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return Ok(None);
+    };
     let Some(pr) = preview_pull_request(config, repo, pr) else {
         return Ok(None);
     };
-
     let manager = EnvironmentManager::new(config.registered_components());
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
@@ -83,6 +98,9 @@ pub async fn reopen_preview_environment(
     let Some(pr) = preview_pull_request(config, repo, pr) else {
         return Ok(None);
     };
+    if config.preview_mode == PreviewMode::OnDemand {
+        return Ok(None);
+    }
 
     let manager = EnvironmentManager::new(config.registered_components());
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
@@ -117,6 +135,20 @@ pub async fn refresh_preview_environment(
 
     let manager = EnvironmentManager::new(config.registered_components());
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
+    if config.preview_mode == PreviewMode::OnDemand
+        && store
+            .environment_for_pr(&pr.key)
+            .await
+            .with_context(|| {
+                format!(
+                    "Cannot load environment for `{}`#{}",
+                    pr.key.repo, pr.key.number
+                )
+            })?
+            .is_none()
+    {
+        return Ok(None);
+    }
     let deploy_repo = deploy_repo(ctx, config)?;
     let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.manifest_branch);
     let dev = GithubDevManifestReader::new(
@@ -211,6 +243,7 @@ pub async fn leave_environment(
     let Some(config) = ctx.henosis_config.as_ref() else {
         return Ok(None);
     };
+    let pr_number = pr.number;
     let Some(pr) = preview_pull_request(config, repo, pr) else {
         return Ok(None);
     };
@@ -231,42 +264,8 @@ pub async fn leave_environment(
         .leave(&mut store, &mut writer, &packages, &dev, &digest, pr)
         .await?;
     reconcile_status_for_change(ctx, &change).await?;
+    clear_status_for_pr(ctx, repo, pr_number).await?;
     Ok(Some(change))
-}
-
-pub async fn environment_status(
-    ctx: &BorsContext,
-    repo: &GithubRepoName,
-    pr_number: PullRequestNumber,
-) -> anyhow::Result<Option<EnvironmentStatus>> {
-    let Some(config) = ctx.henosis_config.as_ref() else {
-        return Ok(None);
-    };
-    if !config.is_component_repo(&repo.to_string()) {
-        return Ok(None);
-    }
-    let manager = EnvironmentManager::new(config.registered_components());
-    let store = PgEnvironmentStore::new(ctx.db.pool().clone());
-    manager
-        .status(&store, &PullRequestKey::new(repo.to_string(), pr_number.0))
-        .await
-}
-
-pub async fn latest_gate_status(
-    ctx: &BorsContext,
-    repo: &GithubRepoName,
-    pr_number: PullRequestNumber,
-) -> anyhow::Result<Option<GateStatus>> {
-    let Some(config) = ctx.henosis_config.as_ref() else {
-        return Ok(None);
-    };
-    if !config.is_component_repo(&repo.to_string()) {
-        return Ok(None);
-    }
-    let store = PgQueueStore::new(ctx.db.pool().clone());
-    store
-        .latest_gate_status(&PullRequestKey::new(repo.to_string(), pr_number.0))
-        .await
 }
 
 pub async fn tick_queue(ctx: &BorsContext) -> anyhow::Result<Option<RecordedGateRun>> {
@@ -378,6 +377,7 @@ pub async fn run_advisory_gate_on_approval(
     );
     let gate_executor = CliGateExecutor::new(&config.gate_command, gate_dev);
     let mut store = PgQueueStore::new(ctx.db.pool().clone());
+    let commenter = GithubPrCommenter::new(ctx.repositories.as_ref(), ctx.db.as_ref());
     match gate_executor.execute(&gate_run).await {
         Ok(report) if report.ok => {
             store
@@ -398,6 +398,7 @@ pub async fn run_advisory_gate_on_approval(
         }
         Ok(report) => {
             let diagnostic = report.status_diagnostic();
+            let comment = report.pr_comment();
             store
                 .record_advisory_gate_status(
                     &advisory_pr,
@@ -413,6 +414,7 @@ pub async fn run_advisory_gate_on_approval(
                     &report.check_run_summary(),
                 )
                 .await?;
+            commenter.post_comment(&advisory_pr, &comment).await?;
         }
         Err(error) => {
             store
@@ -427,7 +429,7 @@ pub async fn run_advisory_gate_on_approval(
                 .resolve_check_run(
                     &external_id,
                     CheckConclusion::Failure,
-                    &format!("Advisory gate could not run: {error:#}"),
+                    &format!("Advisory merge gate could not run: {error:#}"),
                 )
                 .await?;
             return Err(error);
@@ -625,6 +627,25 @@ async fn reconcile_status_for_keys(
     Ok(true)
 }
 
+async fn clear_status_for_pr(
+    ctx: &BorsContext,
+    repo_name: &GithubRepoName,
+    pr_number: PullRequestNumber,
+) -> anyhow::Result<()> {
+    let repo = ctx
+        .repositories
+        .get(repo_name)
+        .with_context(|| format!("Repository `{repo_name}` is not loaded"))?;
+    let pr = repo.client.get_pull_request(pr_number).await?;
+    let body = remove_status_section(&pr.message);
+    if body != pr.message {
+        repo.client
+            .update_pull_request_body(pr_number, &body)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn reconcile_environment_status(
     ctx: &BorsContext,
     environment_id: &str,
@@ -660,6 +681,7 @@ async fn reconcile_environment_status(
                 branch: environment_branch(&environment.id),
                 members: members.clone(),
             },
+            current_pr: member.key.clone(),
             manifest_url: deploy_manifest_url(
                 &config.deploy_repo,
                 &config.manifest_branch,
@@ -735,74 +757,6 @@ async fn post_render_failure_comment(
     Ok(())
 }
 
-pub fn environment_change_comment(
-    config: &HenosisConfig,
-    change: &EnvironmentChange,
-) -> Option<String> {
-    let mut lines = Vec::new();
-    for write in &change.written {
-        lines.push(format!(
-            "Preview environment `{}` is ready.\nManifest: <{}>\nBranch: <{}>\nMembers: {}",
-            write.id,
-            deploy_manifest_url(
-                &config.deploy_repo,
-                &config.manifest_branch,
-                &write.manifest_path
-            ),
-            deploy_branch_url(&config.deploy_repo, &write.branch),
-            member_list(&write.members),
-        ));
-    }
-    for retired in &change.retired {
-        lines.push(format!(
-            "Preview environment `{}` was retired.\nManifest removed: `{}`\nBranch removed: `{}`",
-            retired.id, retired.manifest_path, retired.branch
-        ));
-    }
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n\n"))
-    }
-}
-
-pub fn environment_status_comment(
-    config: &HenosisConfig,
-    status: Option<EnvironmentStatus>,
-) -> String {
-    match status {
-        Some(status) => format!(
-            "Current preview environment: `{}`\nManifest: <{}>\nBranch: <{}>\nMembers: {}",
-            status.environment.id,
-            deploy_manifest_url(
-                &config.deploy_repo,
-                &config.manifest_branch,
-                &status.environment.manifest_path
-            ),
-            deploy_branch_url(&config.deploy_repo, &status.branch),
-            member_list(&status.members),
-        ),
-        None => "This PR is not assigned to a Henosis preview environment.".to_string(),
-    }
-}
-
-pub fn gate_status_comment(status: Option<GateStatus>) -> String {
-    match status {
-        Some(status) => {
-            let mut body = format!(
-                "Latest Henosis gate: `{}` is `{}`.",
-                status.external_id, status.status
-            );
-            if let Some(diagnostic) = status.diagnostic {
-                body.push_str("\n\n");
-                body.push_str(&diagnostic);
-            }
-            body
-        }
-        None => "No Henosis gate run has been recorded for this PR.".to_string(),
-    }
-}
-
 fn preview_pull_request(
     config: &HenosisConfig,
     repo: &GithubRepoName,
@@ -826,17 +780,6 @@ fn deploy_repo(
         anyhow::anyhow!("Invalid deploy repo `{}`: {error}", config.deploy_repo)
     })?;
     ctx.get_repo(&deploy_repo)
-}
-
-fn member_list(members: &[PreviewPullRequest]) -> String {
-    if members.is_empty() {
-        return "none".to_string();
-    }
-    members
-        .iter()
-        .map(|member| format!("{}#{}", member.key.repo, member.key.number))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 pub fn preview_branch_for_environment(environment_id: &str) -> String {

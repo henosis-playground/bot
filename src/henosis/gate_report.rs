@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use serde::Deserialize;
@@ -35,7 +36,8 @@ impl GateReport {
     /// Format a legible check-run summary naming the failing consumer + contract break.
     pub fn check_run_summary(&self) -> String {
         if self.ok {
-            return "Henosis gate passed. The candidate world compiled and rendered.".to_string();
+            return "Henosis merge gate passed. The candidate world compiled and rendered."
+                .to_string();
         }
 
         self.failure_presentation()
@@ -44,7 +46,7 @@ impl GateReport {
     /// Format a PR comment body for gate failure.
     pub fn pr_comment(&self) -> String {
         if self.ok {
-            return "Henosis gate passed.".to_string();
+            return "Henosis merge gate passed.".to_string();
         }
 
         self.failure_presentation()
@@ -60,16 +62,15 @@ impl GateReport {
 
     fn failure_presentation(&self) -> String {
         if self.failures.is_empty() {
-            return "Henosis gate failed, but the gate runner did not report a structured failure."
+            return "Henosis merge gate failed, but the gate runner did not report a structured failure."
                 .to_string();
         }
 
-        let mut body = "Henosis gate failed.\n\nThe candidate cannot land because it breaks a consumer contract.".to_string();
-        for failure in &self.failures {
-            write!(body, "\n\n{}", render_failure(failure)).unwrap();
-        }
-
-        body
+        self.failures
+            .iter()
+            .map(render_failure)
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n")
     }
 }
 
@@ -79,38 +80,53 @@ fn render_failure(failure: &GateFailure) -> String {
 
     writeln!(
         body,
-        "### `{}` consuming `{}`\n",
-        failure.consumer, failure.producer
+        "**Henosis merge gate failed — this change breaks `{}`.**\n",
+        failure.consumer
     )
     .unwrap();
+    writeln!(body, "```text").unwrap();
     writeln!(body, "error: {}", error_line(failure, &analyses)).unwrap();
+    writeln!(body, "--> {}", consumed_span_line(failure, &analyses)).unwrap();
     writeln!(body, "note: {}", version_note(failure)).unwrap();
+    writeln!(body, "```").unwrap();
 
     if let Some(diff) = schema_diff(failure) {
         writeln!(body, "\n```diff\n{diff}```").unwrap();
-    } else if !failure.excerpt.trim().is_empty() {
-        writeln!(
-            body,
-            "\nnote: gate runner excerpt\n\n```text\n{}\n```",
-            failure.excerpt.trim()
-        )
-        .unwrap();
     }
 
-    for analysis in &analyses {
-        writeln!(body, "note: {}", analysis.note(&failure.consumer)).unwrap();
-    }
-
-    writeln!(body, "help: {}", help_line(failure, &analyses)).unwrap();
+    writeln!(body, "\nhelp: {}", help_line(failure, &analyses)).unwrap();
     body.trim_end().to_string()
 }
 
 fn error_line(failure: &GateFailure, analyses: &[PathAnalysis]) -> String {
-    if let Some(analysis) = analyses.iter().find(|analysis| analysis.is_breaking()) {
-        return analysis.error(&failure.consumer, &failure.producer);
+    if analyses.iter().any(PathAnalysis::is_breaking) {
+        return format!(
+            "{} consumes outputs from {} that are incompatible with the resolved producer version.",
+            failure.consumer, failure.producer
+        );
     }
 
-    failure.message.clone()
+    sentence(&failure.message)
+}
+
+fn consumed_span_line(failure: &GateFailure, analyses: &[PathAnalysis]) -> String {
+    if analyses.is_empty() {
+        return format!(
+            "{} outputs consumed by {}: no consumed paths were reported",
+            failure.producer, failure.consumer
+        );
+    }
+
+    format!(
+        "{} outputs consumed by {}: {}",
+        failure.producer,
+        failure.consumer,
+        analyses
+            .iter()
+            .map(PathAnalysis::fate)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn version_note(failure: &GateFailure) -> String {
@@ -160,7 +176,7 @@ fn help_line(failure: &GateFailure, analyses: &[PathAnalysis]) -> String {
 
     if paths.is_empty() {
         return format!(
-            "update the consumer contract usage, or update your pin: pnpm update @henosis/{}",
+            "update your usage, or update your pin: pnpm update @henosis/{}",
             failure.producer
         );
     }
@@ -210,40 +226,22 @@ impl PathAnalysis {
         matches!(self, Self::Removed { .. } | Self::TypeChanged { .. })
     }
 
-    fn error(&self, consumer: &str, producer: &str) -> String {
+    fn fate(&self) -> String {
         match self {
             Self::Removed { path, .. } => {
-                format!(
-                    "{consumer} relies on {producer}.{path}, which no longer exists in the resolved version"
-                )
+                format!("{path} (removed)")
             }
             Self::TypeChanged {
                 path,
                 pinned_type,
                 resolved_type,
-            } => format!(
-                "{consumer} relies on {producer}.{path}, whose type changed: {pinned_type} → {resolved_type}"
-            ),
-            Self::Unchanged { .. } | Self::Unknown { .. } => unreachable!(),
-        }
-    }
-
-    fn note(&self, consumer: &str) -> String {
-        match self {
-            Self::Removed { path, pinned_type } => format!(
-                "{consumer} relies on `{path}` ({pinned_type}) - removed in the resolved version"
-            ),
-            Self::TypeChanged {
-                path,
-                pinned_type,
-                resolved_type,
-            } => format!("`{path}` changed type: {pinned_type} → {resolved_type}"),
+            } => format!("{path} ({pinned_type} → {resolved_type})"),
             Self::Unchanged {
                 path,
                 resolved_type,
-            } => format!("`{path}` still exists as {resolved_type}"),
+            } => format!("{path} (unchanged {resolved_type})"),
             Self::Unknown { path } => {
-                format!("`{path}` could not be compared in the reported output schemas")
+                format!("{path} (unknown)")
             }
         }
     }
@@ -289,8 +287,8 @@ fn schema_kind_at_path(schema: Option<&Value>, path: &str) -> Option<String> {
 }
 
 fn schema_diff(failure: &GateFailure) -> Option<String> {
-    let pinned = sorted_json_string(failure.outputs_schema_at_pinned.as_ref()?);
-    let resolved = sorted_json_string(failure.outputs_schema_at_resolved.as_ref()?);
+    let pinned = human_schema_string(failure.outputs_schema_at_pinned.as_ref()?);
+    let resolved = human_schema_string(failure.outputs_schema_at_resolved.as_ref()?);
     if pinned == resolved {
         return None;
     }
@@ -308,7 +306,7 @@ fn relevant_diff_lines(diff: &TextDiff<'_, '_, '_, str>, consumed_paths: &[Strin
     let fragments = consumed_paths
         .iter()
         .flat_map(|path| path.split('.').last())
-        .map(|path| format!("\"{path}\""))
+        .map(|path| path.to_string())
         .collect::<Vec<_>>();
 
     let mut selected_groups = Vec::new();
@@ -347,23 +345,45 @@ fn relevant_diff_lines(diff: &TextDiff<'_, '_, '_, str>, consumed_paths: &[Strin
     groups.join("@@\n")
 }
 
-fn sorted_json_string(value: &Value) -> String {
-    serde_json::to_string_pretty(&sort_json(value)).unwrap_or_else(|_| value.to_string())
+fn human_schema_string(value: &Value) -> String {
+    let mut out = String::new();
+    write_schema_object(&mut out, "outputs", value, 0);
+    out
 }
 
-fn sort_json(value: &Value) -> Value {
-    match value {
-        Value::Array(items) => Value::Array(items.iter().map(sort_json).collect()),
-        Value::Object(map) => {
-            let mut sorted = serde_json::Map::new();
-            let mut entries = map.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-            for (key, child) in entries {
-                sorted.insert(key.clone(), sort_json(child));
-            }
-            Value::Object(sorted)
+fn write_schema_object(out: &mut String, label: &str, value: &Value, indent: usize) {
+    let prefix = "  ".repeat(indent);
+    let Some(shape) = value.get("shape").and_then(Value::as_object) else {
+        let kind = value
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        writeln!(out, "{prefix}{label}: {kind}").unwrap();
+        return;
+    };
+
+    writeln!(out, "{prefix}{label} {{").unwrap();
+    let fields = shape.iter().collect::<BTreeMap<_, _>>();
+    for (field, child) in fields {
+        let kind = child
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if kind == "object" {
+            write_schema_object(out, field, child, indent + 1);
+        } else {
+            writeln!(out, "{}{}: {}", "  ".repeat(indent + 1), field, kind).unwrap();
         }
-        _ => value.clone(),
+    }
+    writeln!(out, "{prefix}}}").unwrap();
+}
+
+fn sentence(message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.ends_with('.') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.")
     }
 }
 
@@ -494,35 +514,26 @@ mod tests {
             }],
         };
 
-        let summary = report.check_run_summary();
+        let comment = report.pr_comment();
 
-        insta::assert_snapshot!(summary, @r###"
-Henosis gate failed.
+        insta::assert_snapshot!(comment, @r###"
+**Henosis merge gate failed — this change breaks `service-b`.**
 
-The candidate cannot land because it breaks a consumer contract.
-
-### `service-b` consuming `service-a`
-
-error: service-b relies on service-a.api, which no longer exists in the resolved version
+```text
+error: service-b consumes outputs from service-a that are incompatible with the resolved producer version.
+--> service-a outputs consumed by service-b: api (removed), port (number → string)
 note: you pinned service-a @ 1111111; this environment resolved service-a @ 2222222
+```
 
 ```diff
- {
-   "kind": "object",
-   "shape": {
--    "api": {
-+    "apiUrl": {
-       "kind": "url"
-     },
-     "port": {
--      "kind": "number"
-+      "kind": "string"
-     }
-   }
+ outputs {
+-  api: url
+-  port: number
++  apiUrl: url
++  port: string
  }
 ```
-note: service-b relies on `api` (url) - removed in the resolved version
-note: `port` changed type: number → string
+
 help: you depended on outputs [`api`, `port`] which no longer exist or changed type; update your usage, or update your pin: pnpm update @henosis/service-a
 "###);
     }

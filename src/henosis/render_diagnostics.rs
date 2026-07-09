@@ -6,7 +6,7 @@ use crate::bors::event::WorkflowRunCompleted;
 use crate::github::api::client::GithubRepositoryClient;
 use crate::henosis::environment::RenderOutcome;
 
-const LOG_EXCERPT_LINES: usize = 30;
+const LOG_CONTEXT_LINES: usize = 1;
 const LOG_LINE_LIMIT: usize = 600;
 
 static ANSI_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").unwrap());
@@ -39,9 +39,9 @@ pub fn render_failure_comment(outcome: &RenderOutcome) -> String {
     let diagnostic = outcome
         .excerpt
         .as_deref()
-        .unwrap_or("Render workflow failed, but no diagnostic details were available.");
+        .unwrap_or("No render log excerpt was available.");
     format!(
-        "couldn't materialise environment `{}` for commit `{}`.\n\n{}\n\n[render run]({})",
+        "couldn't materialise environment `{}` for commit `{}`.\n\n<details><summary>render log</summary>\n\n```text\n{}\n```\n\n</details>\n\n[render run]({})",
         outcome.environment_id, outcome.commit_sha, diagnostic, outcome.run_url
     )
 }
@@ -52,31 +52,16 @@ fn render_failure_diagnostic(
     step: Option<&Step>,
     logs: Option<&str>,
 ) -> String {
-    let mut diagnostic = format!(
-        "{} failed for commit `{}` on `{}`.",
-        payload.name, payload.commit_sha, payload.branch
-    );
-
-    if let Some(job) = job {
-        diagnostic.push_str(&format!("\nFailed job: `{}`", job.name));
-    }
-    if let Some(step) = step {
-        diagnostic.push_str(&format!("\nFailed step: `{}`", step.name));
-    }
-
     match logs.and_then(|logs| log_excerpt(logs, step.map(|step| step.name.as_str()))) {
-        Some(excerpt) => {
-            diagnostic.push_str("\n\n```text\n");
-            diagnostic.push_str(&excerpt);
-            diagnostic.push_str("\n```");
-        }
+        Some(excerpt) => excerpt,
         None if job.is_some() => {
-            diagnostic.push_str("\n\nNo log excerpt was available for the failed job.");
+            "No ##[error] lines were available for the failed job.".to_string()
         }
-        None => {}
+        None => format!(
+            "{} failed for commit `{}` on `{}`, but no failed job logs were available.",
+            payload.name, payload.commit_sha, payload.branch
+        ),
     }
-
-    diagnostic
 }
 
 fn job_failed(job: &Job) -> bool {
@@ -125,30 +110,32 @@ fn log_excerpt(logs: &str, step_name: Option<&str>) -> Option<String> {
         relevant
     };
 
-    let end = relevant
+    let error_indices = relevant
         .iter()
-        .rposition(|line| diagnostic_log_line(line))
-        .map(|index| index + 1)
-        .unwrap_or(relevant.len());
-    let from = end.saturating_sub(LOG_EXCERPT_LINES);
-    Some(
-        relevant[from..end]
-            .iter()
-            .map(|line| line.replace("```", "'''"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+        .enumerate()
+        .filter_map(|(index, line)| diagnostic_log_line(line).then_some(index))
+        .collect::<Vec<_>>();
+    if error_indices.is_empty() {
+        return None;
+    }
+
+    let mut selected = Vec::new();
+    let mut last = None;
+    for index in error_indices {
+        let start = index.saturating_sub(LOG_CONTEXT_LINES);
+        let end = (index + LOG_CONTEXT_LINES + 1).min(relevant.len());
+        for line_index in start..end {
+            if last != Some(line_index) {
+                selected.push(relevant[line_index].replace("```", "'''"));
+                last = Some(line_index);
+            }
+        }
+    }
+    Some(selected.join("\n"))
 }
 
 fn diagnostic_log_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
     line.contains("##[error]")
-        || line.contains("[ERR_")
-        || lower.contains("error:")
-        || lower.contains("failed")
-        || lower.contains("exception")
-        || lower.contains("panic")
-        || lower.contains("exit code")
 }
 
 fn clean_log_line(line: &str) -> String {
@@ -169,17 +156,18 @@ mod tests {
     use super::log_excerpt;
 
     #[test]
-    fn strips_timestamps_ansi_and_takes_failing_step_tail() {
+    fn strips_timestamps_ansi_and_keeps_error_context() {
         let logs = "\
 2026-07-08T10:00:00.000Z setup ok
 2026-07-08T10:00:01.000Z \u{1b}[31mRender dev\u{1b}[0m
-2026-07-08T10:00:02.000Z line 1
-2026-07-08T10:00:03.000Z line 2
+2026-07-08T10:00:02.000Z compiling manifest
+2026-07-08T10:00:03.000Z ##[error]missing DATABASE_URL
+2026-07-08T10:00:04.000Z Post job cleanup.
 ";
 
         assert_eq!(
             log_excerpt(logs, Some("Render dev")).unwrap(),
-            "Render dev\nline 1\nline 2"
+            "compiling manifest\n##[error]missing DATABASE_URL\nPost job cleanup."
         );
     }
 
@@ -203,8 +191,10 @@ mod tests {
 
         let excerpt = log_excerpt(&logs, Some("Render changed manifests")).unwrap();
 
-        assert!(excerpt.contains("live render failure first 2026-07-08"));
         assert!(excerpt.contains("##[error]Process completed with exit code 1."));
+        assert!(excerpt.contains("[ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL]"));
+        assert!(excerpt.contains("Post job cleanup."));
+        assert!(!excerpt.contains("live render failure first 2026-07-08"));
         assert!(!excerpt.contains("cleanup line 39"));
     }
 }
