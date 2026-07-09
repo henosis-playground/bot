@@ -347,40 +347,6 @@ impl EnvironmentManager {
         })
     }
 
-    pub async fn retire_pr<S, W>(
-        &self,
-        store: &mut S,
-        writer: &mut W,
-        package_reader: &impl ComponentPackageReader,
-        dev_manifests: &impl DevManifestReader,
-        digest_resolver: &impl ImageDigestResolver,
-        key: PullRequestKey,
-    ) -> anyhow::Result<EnvironmentChange>
-    where
-        S: EnvironmentStore,
-        W: DeployRepoWriter,
-    {
-        let Some(environment) = store.environment_for_pr(&key).await? else {
-            return Ok(EnvironmentChange::default());
-        };
-        store.retire_member(&key).await?;
-        let mut change = self.retire_if_empty(store, writer, &environment).await?;
-        if change.retired.is_empty() {
-            change.written.push(
-                self.write_environment(
-                    store,
-                    writer,
-                    package_reader,
-                    dev_manifests,
-                    digest_resolver,
-                    &environment.id,
-                )
-                .await?,
-            );
-        }
-        Ok(change)
-    }
-
     pub async fn join<S, W, R, D>(
         &self,
         store: &mut S,
@@ -1105,6 +1071,13 @@ mod tests {
         let packages = package_reader();
         let dev = StaticDevManifest(dev_manifest());
         let digest = NoDigestResolver;
+        let service_a = PreviewPullRequest::new(
+            "henosis-playground/service-a",
+            3,
+            "service-a",
+            "pr/3",
+            "a-pr",
+        );
 
         let change = manager
             .open_pr(
@@ -1113,13 +1086,7 @@ mod tests {
                 &packages,
                 &dev,
                 &digest,
-                PreviewPullRequest::new(
-                    "henosis-playground/service-a",
-                    3,
-                    "service-a",
-                    "pr/3",
-                    "a-pr",
-                ),
+                service_a.clone(),
             )
             .await
             .unwrap();
@@ -1144,14 +1111,7 @@ mod tests {
         ));
 
         let close = manager
-            .retire_pr(
-                &mut store,
-                &mut writer,
-                &packages,
-                &dev,
-                &digest,
-                PullRequestKey::new("henosis-playground/service-a", 3),
-            )
+            .leave(&mut store, &mut writer, &packages, &dev, &digest, service_a)
             .await
             .unwrap();
 

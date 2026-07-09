@@ -17,8 +17,8 @@ use crate::henosis::github::{
 };
 use crate::henosis::queue::{
     ADVISORY_FAILED_STATUS, ADVISORY_PASSED_STATUS, AdvisoryGateStore, CheckConclusion,
-    GateCheckReporter, PrCommenter, QueueManager, QueuePullRequest, QueueStore, RecordedGateRun,
-    advisory_gate_external_id,
+    GateCheckReporter, MERGED_STATUS, PrCommenter, QueueManager, QueuePullRequest, QueueStore,
+    RecordedGateRun, advisory_gate_external_id,
 };
 use crate::henosis::render_diagnostics::{
     fallback_render_failure_diagnostic, generate_render_failure_diagnostic, render_failure_comment,
@@ -166,43 +166,6 @@ pub async fn refresh_preview_environment(
     Ok(Some(change))
 }
 
-pub async fn retire_preview_environment(
-    ctx: &BorsContext,
-    repo: &GithubRepoName,
-    pr_number: PullRequestNumber,
-) -> anyhow::Result<Option<EnvironmentChange>> {
-    let Some(config) = ctx.henosis_config.as_ref() else {
-        return Ok(None);
-    };
-    if !config.is_component_repo(&repo.to_string()) {
-        return Ok(None);
-    }
-
-    let manager = EnvironmentManager::new(config.registered_components());
-    let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
-    let deploy_repo = deploy_repo(ctx, config)?;
-    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.manifest_branch);
-    let dev = GithubDevManifestReader::new(
-        &deploy_repo.client,
-        &config.manifest_branch,
-        &config.dev_manifest_path,
-    );
-    let packages = GithubComponentPackageReader::new(&ctx.repositories);
-    let digest = GithubImageDigestResolver::new(&ctx.repositories);
-    let change = manager
-        .retire_pr(
-            &mut store,
-            &mut writer,
-            &packages,
-            &dev,
-            &digest,
-            PullRequestKey::new(repo.to_string(), pr_number.0),
-        )
-        .await?;
-    reconcile_status_for_change(ctx, &change).await?;
-    Ok(Some(change))
-}
-
 pub async fn join_environment(
     ctx: &BorsContext,
     repo: &GithubRepoName,
@@ -307,18 +270,54 @@ pub async fn tick_queue(ctx: &BorsContext) -> anyhow::Result<Option<RecordedGate
         )
         .await?;
     if let Some(gate_run) = &result {
-        reconcile_status_for_keys(
-            ctx,
-            gate_run
-                .world
-                .members
-                .iter()
-                .map(|member| member.key.clone())
-                .collect(),
-        )
-        .await?;
+        if gate_run_merged(&store, gate_run).await? {
+            leave_environment_for_gate_members(ctx, &gate_run.world.members).await?;
+        } else {
+            reconcile_status_for_keys(
+                ctx,
+                gate_run
+                    .world
+                    .members
+                    .iter()
+                    .map(|member| member.key.clone())
+                    .collect(),
+            )
+            .await?;
+        }
     }
     Ok(result)
+}
+
+async fn gate_run_merged(store: &PgQueueStore, gate_run: &RecordedGateRun) -> anyhow::Result<bool> {
+    let Some(member) = gate_run.world.members.first() else {
+        return Ok(false);
+    };
+    Ok(store
+        .latest_gate_status(&member.key)
+        .await?
+        .map(|status| status.status == MERGED_STATUS)
+        .unwrap_or(false))
+}
+
+async fn leave_environment_for_gate_members(
+    ctx: &BorsContext,
+    members: &[QueuePullRequest],
+) -> anyhow::Result<()> {
+    for member in members {
+        let repo_name: GithubRepoName = member.key.repo.parse().map_err(|error| {
+            anyhow::anyhow!("Invalid GitHub repo `{}`: {error}", member.key.repo)
+        })?;
+        let repo = ctx
+            .repositories
+            .get(&repo_name)
+            .with_context(|| format!("Repository `{repo_name}` is not loaded"))?;
+        let pr = repo
+            .client
+            .get_pull_request(PullRequestNumber(member.key.number))
+            .await?;
+        leave_environment(ctx, &repo_name, &pr).await?;
+    }
+    Ok(())
 }
 
 pub async fn run_advisory_gate_on_approval(

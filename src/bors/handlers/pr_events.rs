@@ -160,7 +160,7 @@ pub(super) async fn handle_pull_request_closed(
         None,
     )
     .await?;
-    retire_henosis_preview_for_pr(&repo_state, &db, &ctx, payload.pull_request.number).await?;
+    leave_henosis_preview_for_pr(&repo_state, &db, &ctx, &payload.pull_request).await?;
     Ok(())
 }
 
@@ -176,7 +176,7 @@ pub(super) async fn handle_pull_request_merged(
         PullRequestStatus::Merged,
     )
     .await?;
-    retire_henosis_preview_for_pr(&repo_state, &db, &ctx, payload.pull_request.number).await
+    leave_henosis_preview_for_pr(&repo_state, &db, &ctx, &payload.pull_request).await
 }
 
 pub(super) async fn handle_pull_request_reopened(
@@ -371,15 +371,14 @@ async fn refresh_henosis_preview_for_pr(
     Ok(())
 }
 
-async fn retire_henosis_preview_for_pr(
+async fn leave_henosis_preview_for_pr(
     repo_state: &RepositoryState,
     db: &PgDbClient,
     ctx: &BorsContext,
-    pr_number: crate::github::PullRequestNumber,
+    pr: &crate::github::PullRequest,
 ) -> anyhow::Result<()> {
     let _ = db;
-    crate::henosis::service::retire_preview_environment(ctx, repo_state.repository(), pr_number)
-        .await?;
+    crate::henosis::service::leave_environment(ctx, repo_state.repository(), pr).await?;
     Ok(())
 }
 

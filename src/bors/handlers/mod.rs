@@ -1252,6 +1252,11 @@ fn is_bors_observed_branch(branch: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use crate::bors::PullRequestStatus;
     use crate::database::WorkflowStatus;
     use crate::github::GithubRepoName;
     use crate::henosis::config::HenosisConfig;
@@ -1299,6 +1304,63 @@ manifest_path = "dev.toml"
         .unwrap()
     }
 
+    fn henosis_config_with_gate(gate_command: &str) -> HenosisConfig {
+        let gate_command = gate_command.replace('\\', "\\\\").replace('"', "\\\"");
+        toml::from_str(&format!(
+            r#"
+deploy_repo = "rust-lang/borstest"
+render_workflow_name = "Workflow1"
+preview_mode = "auto"
+gate_command = "{gate_command}"
+
+[[components]]
+name = "borstest"
+repo = "rust-lang/borstest"
+
+[[environments]]
+id = "dev"
+manifest_path = "dev.toml"
+"#,
+        ))
+        .unwrap()
+    }
+
+    fn passing_gate_script() -> (TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gate.sh");
+        fs::write(
+            &path,
+            r#"#!/bin/sh
+set -eu
+output=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output)
+      output="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+test -n "$output"
+printf '{"ok":true,"failures":[]}\n' > "$output/report.json"
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).unwrap();
+        }
+        let path = path.to_string_lossy().to_string();
+        (dir, path)
+    }
+
     fn henosis_github() -> GitHub {
         let github = GitHub::default();
         {
@@ -1322,6 +1384,135 @@ digest = "sha256:dev"
             );
         }
         github
+    }
+
+    fn environment_id_from_body(body: &str) -> String {
+        body.split_once("**Environment** `")
+            .and_then(|(_, rest)| rest.split_once('`'))
+            .map(|(id, _)| id.to_string())
+            .expect("status body should include an environment id")
+    }
+
+    fn assert_no_status_section(body: &str) {
+        assert!(!body.contains("<!-- henosis:status -->"));
+        assert!(!body.contains("<!-- /henosis:status -->"));
+    }
+
+    fn preview_manifest_path(environment_id: &str) -> String {
+        format!("{environment_id}.toml")
+    }
+
+    fn preview_branch_name(environment_id: &str) -> String {
+        format!("env/{environment_id}")
+    }
+
+    fn deploy_has_manifest(ctx: &mut BorsTester, path: &str) -> bool {
+        ctx.modify_repo(default_repo_name(), |repo| repo.get_file(path).is_some())
+    }
+
+    fn deploy_has_branch(ctx: &mut BorsTester, branch: &str) -> bool {
+        ctx.modify_repo(default_repo_name(), |repo| {
+            repo.get_branch_by_name(branch).is_some()
+        })
+    }
+
+    async fn active_environment_for_pr(
+        ctx: &BorsTester,
+        repo: &GithubRepoName,
+        pr_number: u64,
+    ) -> anyhow::Result<Option<String>> {
+        sqlx::query_scalar(
+            r#"
+SELECT e.id
+FROM environment_member AS m
+JOIN environment AS e ON e.id = m.environment_id
+WHERE m.repo = $1
+  AND m.pr_number = $2
+  AND m.retired_at IS NULL
+  AND e.retired_at IS NULL
+ORDER BY m.created_at DESC, m.id DESC
+LIMIT 1
+"#,
+        )
+        .bind(repo.to_string())
+        .bind(pr_number as i64)
+        .fetch_optional(ctx.db().pool())
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn assert_pr_has_no_active_environment(
+        ctx: &BorsTester,
+        repo: &GithubRepoName,
+        pr_number: u64,
+    ) -> anyhow::Result<()> {
+        assert_eq!(active_environment_for_pr(ctx, repo, pr_number).await?, None);
+        Ok(())
+    }
+
+    async fn active_member_count(ctx: &BorsTester, environment_id: &str) -> anyhow::Result<i64> {
+        sqlx::query_scalar(
+            r#"
+SELECT COUNT(*)
+FROM environment_member
+WHERE environment_id = $1
+  AND retired_at IS NULL
+"#,
+        )
+        .bind(environment_id)
+        .fetch_one(ctx.db().pool())
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn assert_preview_retired(
+        ctx: &mut BorsTester,
+        environment_id: &str,
+    ) -> anyhow::Result<()> {
+        let retired: Option<bool> = sqlx::query_scalar(
+            r#"
+SELECT retired_at IS NOT NULL
+FROM environment
+WHERE id = $1
+"#,
+        )
+        .bind(environment_id)
+        .fetch_optional(ctx.db().pool())
+        .await?;
+        assert_eq!(retired, Some(true));
+        assert_eq!(active_member_count(ctx, environment_id).await?, 0);
+        assert!(!deploy_has_manifest(
+            ctx,
+            &preview_manifest_path(environment_id)
+        ));
+        assert!(!deploy_has_branch(
+            ctx,
+            &preview_branch_name(environment_id)
+        ));
+        Ok(())
+    }
+
+    async fn assert_preview_active(
+        ctx: &mut BorsTester,
+        environment_id: &str,
+    ) -> anyhow::Result<()> {
+        let retired: Option<bool> = sqlx::query_scalar(
+            r#"
+SELECT retired_at IS NOT NULL
+FROM environment
+WHERE id = $1
+"#,
+        )
+        .bind(environment_id)
+        .fetch_optional(ctx.db().pool())
+        .await?;
+        assert_eq!(retired, Some(false));
+        assert!(deploy_has_manifest(
+            ctx,
+            &preview_manifest_path(environment_id)
+        ));
+        assert!(deploy_has_branch(ctx, &preview_branch_name(environment_id)));
+        Ok(())
     }
 
     fn multi_henosis_config() -> HenosisConfig {
@@ -1480,12 +1671,74 @@ digest = "sha256:service-b"
                 assert!(body.contains("<!-- henosis:status -->"));
                 assert!(body.contains("**Environment** `preview-"));
                 assert!(body.contains("**Render** :grey_question: none"));
+                let environment_id = environment_id_from_body(&body);
+                assert_preview_active(ctx, &environment_id).await?;
 
                 ctx.post_comment(Comment::new(pr_id.clone(), "@bors p-"))
                     .await?;
 
                 let body = ctx.pr(pr_id).await.get_gh_pr().description;
                 assert_eq!(body, "Description of PR 2");
+                assert_no_status_section(&body);
+                assert_preview_retired(ctx, &environment_id).await?;
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_close_leaves_and_retires_solo_preview(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .github(henosis_github())
+            .henosis_config(henosis_config_on_demand())
+            .run_test(async |ctx: &mut BorsTester| {
+                let pr = ctx.open_pr((), |_| {}).await?;
+                let pr_id = (default_repo_name(), pr.number().0);
+
+                ctx.post_comment(Comment::new(pr_id.clone(), "@bors p+"))
+                    .await?;
+                let body = ctx.pr(pr_id.clone()).await.get_gh_pr().description;
+                let environment_id = environment_id_from_body(&body);
+                assert_preview_active(ctx, &environment_id).await?;
+
+                ctx.set_pr_status_closed(pr_id.clone()).await?;
+
+                let body = ctx.pr(pr_id.clone()).await.get_gh_pr().description;
+                assert_eq!(body, "Description of PR 2");
+                assert_no_status_section(&body);
+                assert_preview_retired(ctx, &environment_id).await?;
+                assert_pr_has_no_active_environment(ctx, &default_repo_name(), pr.number().0)
+                    .await?;
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_merge_gate_merge_leaves_and_retires_preview(pool: sqlx::PgPool) {
+        let (_gate_dir, gate_command) = passing_gate_script();
+        BorsBuilder::new(pool)
+            .github(henosis_github())
+            .henosis_config(henosis_config_with_gate(&gate_command))
+            .run_test(async |ctx: &mut BorsTester| {
+                let pr = ctx.open_pr((), |_| {}).await?;
+                let pr_id = (default_repo_name(), pr.number().0);
+                let body = ctx.pr(pr_id.clone()).await.get_gh_pr().description;
+                let environment_id = environment_id_from_body(&body);
+                assert_preview_active(ctx, &environment_id).await?;
+
+                ctx.approve(pr_id.clone()).await?;
+                ctx.run_henosis_queue_now().await?.unwrap();
+                let landed = ctx.get_next_comment_text(pr_id.clone()).await?;
+                assert!(landed.contains("Landed as squash-pr-"));
+
+                let body = ctx.pr(pr_id.clone()).await.get_gh_pr().description;
+                assert_eq!(body, "Description of PR 2");
+                assert_no_status_section(&body);
+                assert_preview_retired(ctx, &environment_id).await?;
+                assert_pr_has_no_active_environment(ctx, &default_repo_name(), pr.number().0)
+                    .await?;
+                ctx.pr(pr_id).await.expect_status(PullRequestStatus::Merged);
                 Ok(())
             })
             .await;
@@ -1643,6 +1896,51 @@ digest = "sha256:service-b"
                     service_b_body
                         .contains("[rust-lang/borstest#2](https://github.com/rust-lang/borstest/pull/2), [rust-lang/service-b#1](https://github.com/rust-lang/service-b/pull/1) (this PR)")
                 );
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_shared_close_removes_member_and_updates_remaining_status(pool: sqlx::PgPool) {
+        let service_b = GithubRepoName::new("rust-lang", "service-b");
+        BorsBuilder::new(pool)
+            .github(multi_henosis_github())
+            .henosis_config(multi_henosis_config())
+            .run_test(async |ctx: &mut BorsTester| {
+                let service_a_pr = ctx.open_pr(default_repo_name(), |_| {}).await?;
+                let service_b_pr = ctx.open_pr(service_b.clone(), |_| {}).await?;
+                let service_a_id = (default_repo_name(), service_a_pr.number().0);
+                let service_b_id = (service_b.clone(), service_b_pr.number().0);
+                let environment_id = "preview-shared-demo";
+
+                ctx.post_comment(Comment::new(service_a_id.clone(), "@bors p+ shared-demo"))
+                    .await?;
+                ctx.post_comment(Comment::new(service_b_id.clone(), "@bors p+ shared-demo"))
+                    .await?;
+                assert_preview_active(ctx, environment_id).await?;
+                assert_eq!(active_member_count(ctx, environment_id).await?, 2);
+
+                ctx.set_pr_status_closed(service_a_id.clone()).await?;
+
+                let service_a_body = ctx.pr(service_a_id.clone()).await.get_gh_pr().description;
+                assert_eq!(service_a_body, "Description of PR 2");
+                assert_no_status_section(&service_a_body);
+                assert_pr_has_no_active_environment(
+                    ctx,
+                    &default_repo_name(),
+                    service_a_pr.number().0,
+                )
+                .await?;
+
+                assert_preview_active(ctx, environment_id).await?;
+                assert_eq!(active_member_count(ctx, environment_id).await?, 1);
+                let service_b_body = ctx.pr(service_b_id).await.get_gh_pr().description;
+                assert!(service_b_body.contains(&format!("**Environment** `{environment_id}`")));
+                assert!(service_b_body.contains(
+                    "[rust-lang/service-b#1](https://github.com/rust-lang/service-b/pull/1) (this PR)"
+                ));
+                assert!(!service_b_body.contains("rust-lang/borstest#2"));
                 Ok(())
             })
             .await;
