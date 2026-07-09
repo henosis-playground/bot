@@ -75,6 +75,10 @@ impl GateReport {
 }
 
 fn render_failure(failure: &GateFailure) -> String {
+    if is_self_mismatch(failure) {
+        return render_self_mismatch(failure);
+    }
+
     let analyses = analyze_consumed_paths(failure);
     let mut body = String::new();
 
@@ -98,6 +102,40 @@ fn render_failure(failure: &GateFailure) -> String {
     body.trim_end().to_string()
 }
 
+fn is_self_mismatch(failure: &GateFailure) -> bool {
+    failure.kind == "validate" && failure.consumer == failure.producer
+}
+
+fn render_self_mismatch(failure: &GateFailure) -> String {
+    let analyses = analyze_self_paths(failure);
+    let mut body = String::new();
+
+    writeln!(
+        body,
+        "**Henosis merge gate failed — `{}` violates its own output contract.**\n",
+        failure.consumer
+    )
+    .unwrap();
+    writeln!(body, "```text").unwrap();
+    writeln!(
+        body,
+        "error: {}'s build does not return what its outputs schema declares.",
+        failure.consumer
+    )
+    .unwrap();
+    writeln!(body, "--> {}", self_span_line(&analyses)).unwrap();
+    writeln!(body, "```").unwrap();
+
+    if analyses.iter().any(SelfPathAnalysis::is_type_mismatch) {
+        if let Some(diff) = schema_diff(failure) {
+            writeln!(body, "\n```diff\n{diff}```").unwrap();
+        }
+    }
+
+    writeln!(body, "\nhelp: {}", self_help_line(&analyses)).unwrap();
+    body.trim_end().to_string()
+}
+
 fn error_line(failure: &GateFailure, analyses: &[PathAnalysis]) -> String {
     if analyses.iter().any(PathAnalysis::is_breaking) {
         return format!(
@@ -107,6 +145,149 @@ fn error_line(failure: &GateFailure, analyses: &[PathAnalysis]) -> String {
     }
 
     sentence(&failure.message)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelfPathAnalysis {
+    Missing {
+        path: String,
+        expected_type: String,
+    },
+    TypeMismatch {
+        path: String,
+        expected_type: String,
+        actual_type: String,
+    },
+    Unknown {
+        path: String,
+        expected_type: String,
+    },
+}
+
+impl SelfPathAnalysis {
+    fn is_type_mismatch(&self) -> bool {
+        matches!(self, Self::TypeMismatch { .. })
+    }
+
+    fn path(&self) -> &str {
+        match self {
+            Self::Missing { path, .. }
+            | Self::TypeMismatch { path, .. }
+            | Self::Unknown { path, .. } => path,
+        }
+    }
+
+    fn expected_type(&self) -> &str {
+        match self {
+            Self::Missing { expected_type, .. }
+            | Self::TypeMismatch { expected_type, .. }
+            | Self::Unknown { expected_type, .. } => expected_type,
+        }
+    }
+}
+
+fn analyze_self_paths(failure: &GateFailure) -> Vec<SelfPathAnalysis> {
+    failure
+        .consumed_paths
+        .iter()
+        .map(|path| {
+            let expected_type =
+                schema_kind_at_path(failure.outputs_schema_at_resolved.as_ref(), path)
+                    .unwrap_or_else(|| "unknown".to_string());
+            match validation_actual_type(failure, path).as_deref() {
+                Some("missing") => SelfPathAnalysis::Missing {
+                    path: path.clone(),
+                    expected_type,
+                },
+                Some(actual_type) => SelfPathAnalysis::TypeMismatch {
+                    path: path.clone(),
+                    expected_type,
+                    actual_type: actual_type.to_string(),
+                },
+                None => SelfPathAnalysis::Unknown {
+                    path: path.clone(),
+                    expected_type,
+                },
+            }
+        })
+        .collect()
+}
+
+fn validation_actual_type(failure: &GateFailure, path: &str) -> Option<String> {
+    let prefix = format!("{}.{} expected ", failure.consumer, path);
+    let rest = failure.message.strip_prefix(&prefix)?;
+    let (_, actual) = rest.rsplit_once(", got ")?;
+    Some(actual.trim_end_matches('.').to_string())
+}
+
+fn self_span_line(analyses: &[SelfPathAnalysis]) -> String {
+    if analyses.is_empty() {
+        return "declared output contract was not satisfied".to_string();
+    }
+
+    let missing = analyses
+        .iter()
+        .filter_map(|analysis| match analysis {
+            SelfPathAnalysis::Missing {
+                path,
+                expected_type,
+            } => Some(format!("{path} ({expected_type})")),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mismatched = analyses
+        .iter()
+        .filter_map(|analysis| match analysis {
+            SelfPathAnalysis::TypeMismatch {
+                path,
+                expected_type,
+                actual_type,
+            } => Some(format!(
+                "{path} (declared {expected_type}, returned {actual_type})"
+            )),
+            SelfPathAnalysis::Unknown {
+                path,
+                expected_type,
+            } => Some(format!("{path} (declared {expected_type})")),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    let mut parts = Vec::new();
+    if !missing.is_empty() {
+        parts.push(format!("declared but not returned: {}", missing.join(", ")));
+    }
+    if !mismatched.is_empty() {
+        parts.push(format!(
+            "returned with wrong type: {}",
+            mismatched.join(", ")
+        ));
+    }
+    parts.join("; ")
+}
+
+fn self_help_line(analyses: &[SelfPathAnalysis]) -> String {
+    let paths = analyses
+        .iter()
+        .map(|analysis| format!("`{}`", analysis.path()))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return "return the declared outputs from build, or update `outputs`".to_string();
+    }
+
+    if analyses.iter().all(SelfPathAnalysis::is_type_mismatch) && analyses.len() == 1 {
+        return format!(
+            "return {} as `{}`, or change its `outputs` declaration",
+            paths[0],
+            analyses[0].expected_type()
+        );
+    }
+
+    format!(
+        "return {} from build, or remove {} from `outputs`",
+        paths.join(", "),
+        if analyses.len() == 1 { "it" } else { "them" }
+    )
 }
 
 fn consumed_span_line(failure: &GateFailure, analyses: &[PathAnalysis]) -> String {
@@ -535,6 +716,93 @@ note: you pinned service-a @ 1111111; this environment resolved service-a @ 2222
 ```
 
 help: you depended on outputs [`api`, `port`] which no longer exist or changed type; update your usage, or update your pin: `pnpm update @henosis/service-a`
+"###);
+    }
+
+    #[test]
+    fn renders_self_mismatch_missing_output_diagnostic() {
+        let report = GateReport {
+            ok: false,
+            failures: vec![GateFailure {
+                consumer: "service-a".to_string(),
+                producer: "service-a".to_string(),
+                pinned_sha: None,
+                resolved_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                outputs_schema_at_pinned: None,
+                outputs_schema_at_resolved: Some(serde_json::json!({
+                    "kind": "object",
+                    "shape": {
+                        "api": { "kind": "url" },
+                        "test": { "kind": "string" }
+                    }
+                })),
+                consumed_paths: vec!["test".to_string()],
+                kind: "validate".to_string(),
+                message: "service-a.test expected string, got missing".to_string(),
+                excerpt: "service-a.test expected string, got missing".to_string(),
+            }],
+        };
+
+        let comment = report.pr_comment();
+
+        insta::assert_snapshot!(comment, @r###"
+**Henosis merge gate failed — `service-a` violates its own output contract.**
+
+```text
+error: service-a's build does not return what its outputs schema declares.
+--> declared but not returned: test (string)
+```
+
+help: return `test` from build, or remove it from `outputs`
+"###);
+    }
+
+    #[test]
+    fn renders_self_mismatch_type_change_diagnostic() {
+        let report = GateReport {
+            ok: false,
+            failures: vec![GateFailure {
+                consumer: "service-a".to_string(),
+                producer: "service-a".to_string(),
+                pinned_sha: None,
+                resolved_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                outputs_schema_at_pinned: Some(serde_json::json!({
+                    "kind": "object",
+                    "shape": {
+                        "port": { "kind": "number" }
+                    }
+                })),
+                outputs_schema_at_resolved: Some(serde_json::json!({
+                    "kind": "object",
+                    "shape": {
+                        "port": { "kind": "string" }
+                    }
+                })),
+                consumed_paths: vec!["port".to_string()],
+                kind: "validate".to_string(),
+                message: "service-a.port expected string, got number".to_string(),
+                excerpt: "service-a.port expected string, got number".to_string(),
+            }],
+        };
+
+        let comment = report.pr_comment();
+
+        insta::assert_snapshot!(comment, @r###"
+**Henosis merge gate failed — `service-a` violates its own output contract.**
+
+```text
+error: service-a's build does not return what its outputs schema declares.
+--> returned with wrong type: port (declared string, returned number)
+```
+
+```diff
+ outputs {
+-  port: number
++  port: string
+ }
+```
+
+help: return `port` as `string`, or change its `outputs` declaration
 "###);
     }
 }

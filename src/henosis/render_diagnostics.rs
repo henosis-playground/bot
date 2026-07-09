@@ -6,9 +6,11 @@ use std::sync::LazyLock;
 use crate::bors::event::WorkflowRunCompleted;
 use crate::github::api::client::GithubRepositoryClient;
 use crate::henosis::environment::RenderOutcome;
+use crate::henosis::gate_report::GateReport;
 
 const LOG_CONTEXT_BEFORE_LINES: usize = 1;
 const LOG_LINE_LIMIT: usize = 600;
+const STRUCTURED_RENDER_FAILURE_PREFIX: &str = "HENOSIS_GATE_REPORT:";
 
 static ANSI_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").unwrap());
 static TIMESTAMP_RE: LazyLock<Regex> =
@@ -41,6 +43,13 @@ pub fn render_failure_comment(outcome: &RenderOutcome) -> String {
         .excerpt
         .as_deref()
         .unwrap_or("No render log excerpt was available.");
+    if diagnostic.starts_with("**Henosis merge gate failed") {
+        return format!(
+            "couldn't materialise environment `{}` for commit `{}`.\n\n{}\n\n[render run]({})",
+            outcome.environment_id, outcome.commit_sha, diagnostic, outcome.run_url
+        );
+    }
+
     format!(
         "couldn't materialise environment `{}` for commit `{}`.\n\n<details><summary>render log</summary>\n\n```text\n{}\n```\n\n</details>\n\n[render run]({})",
         outcome.environment_id, outcome.commit_sha, diagnostic, outcome.run_url
@@ -53,6 +62,10 @@ fn render_failure_diagnostic(
     step: Option<&Step>,
     logs: Option<&str>,
 ) -> String {
+    if let Some(report) = logs.and_then(structured_gate_report) {
+        return report.pr_comment();
+    }
+
     match logs.and_then(|logs| log_excerpt(logs, step.map(|step| step.name.as_str()))) {
         Some(excerpt) => excerpt,
         None if job.is_some() => {
@@ -85,6 +98,13 @@ fn conclusion_failed(conclusion: Option<&Conclusion>) -> bool {
                 | Conclusion::TimedOut
         )
     )
+}
+
+fn structured_gate_report(logs: &str) -> Option<GateReport> {
+    logs.lines().find_map(|line| {
+        let (_, json) = line.split_once(STRUCTURED_RENDER_FAILURE_PREFIX)?;
+        GateReport::parse(json.trim()).ok()
+    })
 }
 
 fn log_excerpt(logs: &str, step_name: Option<&str>) -> Option<String> {
@@ -173,7 +193,8 @@ fn runner_housekeeping_line(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::log_excerpt;
+    use super::{log_excerpt, render_failure_comment, structured_gate_report};
+    use crate::henosis::environment::{RenderOutcome, RenderStatus};
 
     #[test]
     fn strips_timestamps_ansi_and_keeps_error_context() {
@@ -235,5 +256,56 @@ mod tests {
             log_excerpt(logs, Some("Render preview")).unwrap(),
             "compiling preview\n##[error]render failed"
         );
+    }
+
+    #[test]
+    fn parses_structured_gate_report_from_render_logs() {
+        let report_json = serde_json::json!({
+            "ok": false,
+            "failures": [{
+                "consumer": "service-a",
+                "producer": "service-a",
+                "pinnedSha": null,
+                "resolvedSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "outputsSchemaAtPinned": null,
+                "outputsSchemaAtResolved": {
+                    "kind": "object",
+                    "shape": {
+                        "test": { "kind": "string" }
+                    }
+                },
+                "consumedPaths": ["test"],
+                "kind": "validate",
+                "message": "service-a.test expected string, got missing",
+                "excerpt": "service-a.test expected string, got missing"
+            }]
+        })
+        .to_string();
+        let logs = format!("2026-07-09T00:00:00Z ##[error]HENOSIS_GATE_REPORT:{report_json}");
+
+        let comment = structured_gate_report(&logs).unwrap().pr_comment();
+
+        assert!(comment.contains(
+            "**Henosis merge gate failed — `service-a` violates its own output contract.**"
+        ));
+        assert!(comment.contains("--> declared but not returned: test (string)"));
+        assert!(!comment.contains("note:"));
+    }
+
+    #[test]
+    fn rich_render_failure_comment_is_not_wrapped_as_raw_log() {
+        let diagnostic =
+            "**Henosis merge gate failed — `service-a` violates its own output contract.**";
+        let body = render_failure_comment(&RenderOutcome {
+            environment_id: "dev".to_string(),
+            commit_sha: "aaaaaaaa".to_string(),
+            status: RenderStatus::Failure,
+            run_url: "https://github.com/henosis-playground/deploy/actions/runs/1".to_string(),
+            excerpt: Some(diagnostic.to_string()),
+        });
+
+        assert!(body.contains(diagnostic));
+        assert!(!body.contains("<details><summary>render log</summary>"));
+        assert!(!body.contains("```text"));
     }
 }
