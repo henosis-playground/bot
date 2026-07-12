@@ -1252,10 +1252,12 @@ fn is_bors_observed_branch(branch: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::sync::{Arc, Mutex};
 
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -1374,6 +1376,7 @@ digest = "sha256:{}"
     #[derive(Debug, Default)]
     struct MockCoreState {
         graph: Option<Value>,
+        specs: BTreeMap<String, Value>,
         retired: bool,
         report: MockCoreReport,
         calls: Vec<String>,
@@ -1413,17 +1416,17 @@ digest = "sha256:{}"
                 return Vec::new();
             }
             let graph = self.graph.as_ref().expect("mock graph exists");
-            let components = graph["components"].as_array().expect("mock components");
-            let failed_id = components
-                .first()
-                .and_then(|component| component["id"].as_str());
-            let dispositions = components
+            let hashes = graph["componentSpecHashes"]
+                .as_array()
+                .expect("mock component spec hashes");
+            let failed_hash = hashes.first().and_then(Value::as_str);
+            let dispositions = hashes
                 .iter()
-                .map(|component| {
-                    let id = component["id"].as_str().expect("component id");
+                .map(|hash| {
+                    let hash = hash.as_str().expect("component spec hash");
                     json!({
-                        "componentId": id,
-                        "kind": if self.report == MockCoreReport::Failed && Some(id) == failed_id {
+                        "componentSpecHash": hash,
+                        "kind": if self.report == MockCoreReport::Failed && Some(hash) == failed_hash {
                             "COMPONENT_DISPOSITION_KIND_FAILED"
                         } else {
                             "COMPONENT_DISPOSITION_KIND_READY"
@@ -1447,7 +1450,8 @@ digest = "sha256:{}"
                 "generation": graph["generation"],
                 "connector": "k8s",
                 "dispositions": dispositions,
-                "diagnostics": diagnostics
+                "diagnostics": diagnostics,
+                "sequence": graph["generation"]
             })]
         }
 
@@ -1496,6 +1500,20 @@ digest = "sha256:{}"
                 state.requests.push(body.clone());
 
                 match method.as_str() {
+                    "RegisterComponentSpec" => {
+                        let spec = body["spec"].clone();
+                        let hash = base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            Sha256::digest(serde_json::to_vec(&spec).unwrap()),
+                        );
+                        state.specs.insert(hash.clone(), spec.clone());
+                        ResponseTemplate::new(200).set_body_json(json!({
+                            "component": {
+                                "hash": hash,
+                                "spec": spec
+                            }
+                        }))
+                    }
                     "GetGraph" => {
                         if state.retired
                             || state.graph.is_none()
@@ -1515,7 +1533,7 @@ digest = "sha256:{}"
                         state.graph = Some(json!({
                             "id": body["graphId"],
                             "generation": "1",
-                            "components": body["components"]
+                            "componentSpecHashes": body["componentSpecHashes"]
                         }));
                         ResponseTemplate::new(200).set_body_json(json!({
                             "graph": state.graph
@@ -1525,25 +1543,26 @@ digest = "sha256:{}"
                         let generation = state.generation() + 1;
                         let graph = state.graph.as_mut().expect("mock graph exists");
                         graph["generation"] = Value::String(generation.to_string());
-                        graph["components"]
-                            .as_array_mut()
-                            .unwrap()
-                            .extend(body["components"].as_array().unwrap().iter().cloned());
+                        graph["componentSpecHashes"].as_array_mut().unwrap().extend(
+                            body["componentSpecHashes"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .cloned(),
+                        );
                         ResponseTemplate::new(200).set_body_json(json!({"graph": graph}))
                     }
                     "UpdateComponents" => {
                         let generation = state.generation() + 1;
                         let graph = state.graph.as_mut().expect("mock graph exists");
                         graph["generation"] = Value::String(generation.to_string());
-                        let components = graph["components"].as_array_mut().unwrap();
-                        for update in body["updates"].as_array().unwrap() {
-                            let desired = &update["component"];
-                            let id = desired["id"].as_str();
-                            if let Some(existing) = components
-                                .iter_mut()
-                                .find(|component| component["id"].as_str() == id)
+                        let hashes = graph["componentSpecHashes"].as_array_mut().unwrap();
+                        for replacement in body["replacements"].as_array().unwrap() {
+                            let current = replacement["currentSpecHash"].as_str();
+                            if let Some(existing) =
+                                hashes.iter_mut().find(|hash| hash.as_str() == current)
                             {
-                                *existing = desired.clone();
+                                *existing = replacement["replacementSpecHash"].clone();
                             }
                         }
                         ResponseTemplate::new(200).set_body_json(json!({"graph": graph}))
@@ -1552,11 +1571,11 @@ digest = "sha256:{}"
                         let generation = state.generation() + 1;
                         let graph = state.graph.as_mut().expect("mock graph exists");
                         graph["generation"] = Value::String(generation.to_string());
-                        let removed = body["componentIds"].as_array().unwrap();
-                        graph["components"]
+                        let removed = body["componentSpecHashes"].as_array().unwrap();
+                        graph["componentSpecHashes"]
                             .as_array_mut()
                             .unwrap()
-                            .retain(|component| !removed.iter().any(|id| id == &component["id"]));
+                            .retain(|hash| !removed.iter().any(|removed| removed == hash));
                         ResponseTemplate::new(200).set_body_json(json!({"graph": graph}))
                     }
                     "RetireGraph" => {
@@ -2018,17 +2037,17 @@ digest = "sha256:service-b"
 
                 {
                     let state = core_state.lock().unwrap();
-                    let create = state
+                    let registration = state
                         .calls
                         .iter()
                         .zip(&state.requests)
-                        .find(|(method, _)| method.as_str() == "CreateGraph")
+                        .find(|(method, _)| method.as_str() == "RegisterComponentSpec")
                         .map(|(_, request)| request)
-                        .expect("CreateGraph request");
-                    let component = &create["components"][0];
+                        .expect("RegisterComponentSpec request");
+                    let spec = &registration["spec"];
                     let context = base64::Engine::decode(
                         &base64::engine::general_purpose::STANDARD,
-                        component["context"].as_str().unwrap(),
+                        spec["connectorContext"].as_str().unwrap(),
                     )?;
                     let context: Value = serde_json::from_slice(&context)?;
                     assert_eq!(
@@ -2038,8 +2057,25 @@ digest = "sha256:service-b"
                     assert_eq!(context["environment"]["id"], first_environment_id);
                     assert_eq!(context["source"]["repository"], "rust-lang/borstest");
                     assert_eq!(context["source"]["revision"], CORE_PR_SHA);
-                    assert_eq!(component["revision"]["revision"], CORE_PR_SHA);
-                    assert_eq!(component["connector"], "k8s");
+                    assert_eq!(spec["connector"], "k8s");
+                    assert!(spec.get("revision").is_none());
+
+                    let create = state
+                        .calls
+                        .iter()
+                        .zip(&state.requests)
+                        .find(|(method, _)| method.as_str() == "CreateGraph")
+                        .map(|(_, request)| request)
+                        .expect("CreateGraph request");
+                    assert_eq!(create["componentSpecHashes"].as_array().unwrap().len(), 1);
+                    assert_eq!(
+                        base64::Engine::decode(
+                            &base64::engine::general_purpose::STANDARD,
+                            create["requestId"].as_str().unwrap(),
+                        )?
+                        .len(),
+                        16
+                    );
                 }
 
                 ctx.push_to_pr(pr_id.clone(), Commit::from_sha(CORE_PUSH_SHA))
@@ -2054,10 +2090,21 @@ digest = "sha256:service-b"
                         .find(|(method, _)| method.as_str() == "UpdateComponents")
                         .map(|(_, request)| request)
                         .expect("UpdateComponents request");
-                    assert_eq!(
-                        update["updates"][0]["component"]["revision"]["revision"],
-                        CORE_PUSH_SHA
-                    );
+                    assert_eq!(update["replacements"].as_array().unwrap().len(), 1);
+                    let registration = state
+                        .calls
+                        .iter()
+                        .zip(&state.requests)
+                        .rev()
+                        .find(|(method, _)| method.as_str() == "RegisterComponentSpec")
+                        .map(|(_, request)| request)
+                        .expect("latest RegisterComponentSpec request");
+                    let context = base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        registration["spec"]["connectorContext"].as_str().unwrap(),
+                    )?;
+                    let context: Value = serde_json::from_slice(&context)?;
+                    assert_eq!(context["source"]["revision"], CORE_PUSH_SHA);
                 }
 
                 core_state.lock().unwrap().report = MockCoreReport::Ready;
@@ -2115,9 +2162,11 @@ digest = "sha256:service-b"
                 assert_eq!(
                     calls,
                     vec![
+                        "RegisterComponentSpec",
                         "GetGraph",
                         "CreateGraph",
                         "GetGraph",
+                        "RegisterComponentSpec",
                         "GetGraph",
                         "UpdateComponents",
                         "GetGraph",
@@ -2129,6 +2178,7 @@ digest = "sha256:service-b"
                         "GetGraph",
                         "GetGraph",
                         "RetireGraph",
+                        "RegisterComponentSpec",
                         "GetGraph",
                         "CreateGraph",
                         "GetGraph",

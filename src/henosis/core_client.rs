@@ -5,18 +5,17 @@ use anyhow::{Context, anyhow};
 use futures::StreamExt;
 use henosis_proto::proto::henosis::v1::__buffa::oneof::watch_graph_response::Item as WatchItem;
 use henosis_proto::proto::henosis::v1::{
-    AddComponentsRequest, AddComponentsResponse, Component, ComponentDispositionKind,
-    ComponentRevision, ComponentUpdate, CreateGraphRequest, CreateGraphResponse, Diagnostic,
-    DiagnosticSeverity, GetGraphRequest, GetGraphResponse, Graph, GraphState,
-    RemoveComponentsRequest, RemoveComponentsResponse, RetireGraphRequest, RetireGraphResponse,
-    SliceReport, UpdateComponentsRequest, UpdateComponentsResponse, WatchGraphRequest,
-    WatchGraphResponse,
+    AddComponentsRequest, AddComponentsResponse, ComponentDispositionKind, ComponentReplacement,
+    ComponentSpec, CreateGraphRequest, CreateGraphResponse, Diagnostic, DiagnosticSeverity,
+    GetGraphRequest, GetGraphResponse, Graph, GraphLifecycle, GraphState,
+    RegisterComponentSpecRequest, RegisterComponentSpecResponse, RemoveComponentsRequest,
+    RemoveComponentsResponse, RetireGraphRequest, RetireGraphResponse, SliceReport,
+    UpdateComponentsRequest, UpdateComponentsResponse, WatchGraphRequest, WatchGraphResponse,
 };
 use newtype_uuid::{GenericUuid, TypedUuid, TypedUuidKind, TypedUuidTag};
 use reqwest::{Client, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use sha2::{Digest, Sha256};
 
 use crate::henosis::config::{CoreApiConfig, RegisteredComponent};
 use crate::henosis::environment::{
@@ -38,33 +37,29 @@ impl TypedUuidKind for PreviewEnvironmentKind {
     }
 }
 
-type PreviewEnvironmentId = TypedUuid<PreviewEnvironmentKind>;
-
-pub enum RequestKind {}
-
-impl TypedUuidKind for RequestKind {
-    fn tag() -> TypedUuidTag {
-        const TAG: TypedUuidTag = TypedUuidTag::new("request");
-        TAG
-    }
-}
-
-type RequestId = TypedUuid<RequestKind>;
-
 #[derive(Default)]
 pub struct CoreEnvironmentIdGenerator;
 
 impl EnvironmentIdGenerator for CoreEnvironmentIdGenerator {
     fn new_preview_environment_id(&self) -> String {
-        PreviewEnvironmentId::from_untyped_uuid(uuid::Uuid::now_v7()).to_string()
+        TypedUuid::<PreviewEnvironmentKind>::from_untyped_uuid(uuid::Uuid::now_v7()).to_string()
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreGraphStatus {
     pub generation: u64,
+    pub sequence: Option<u64>,
+    pub lifecycle: GraphLifecycle,
     pub status: RenderStatus,
     pub diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedComponentSpec {
+    name: String,
+    dependencies: Vec<String>,
+    connector_context: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -98,16 +93,17 @@ impl CoreClient {
         format!("{}/graphs/{environment_id}", self.endpoint)
     }
 
-    pub async fn apply_graph(
+    async fn apply_graph(
         &self,
         environment_id: &str,
-        components: Vec<Component>,
+        specs: Vec<PlannedComponentSpec>,
     ) -> anyhow::Result<u64> {
         let graph_id = graph_id_bytes(environment_id)?;
+        let component_spec_hashes = self.register_component_specs(specs).await?;
         let Some(state) = self.get_graph_by_id(&graph_id).await? else {
             let request = CreateGraphRequest {
                 graph_id: Some(graph_id),
-                components,
+                component_spec_hashes,
                 request_id: Some(new_request_id()),
                 ..Default::default()
             };
@@ -119,7 +115,8 @@ impl CoreClient {
                 .context("CreateGraph response omitted the accepted graph generation");
         };
 
-        self.edit_graph(graph_id, state, components).await
+        self.edit_graph(graph_id, state, component_spec_hashes)
+            .await
     }
 
     pub async fn retire_graph(&self, environment_id: &str) -> anyhow::Result<()> {
@@ -185,13 +182,46 @@ impl CoreClient {
                 let response: WatchGraphResponse = serde_json::from_slice(&payload)
                     .context("Cannot decode WatchGraph response envelope")?;
                 match response.item {
-                    Some(WatchItem::Snapshot(snapshot)) => durable = snapshot.state.into_option(),
-                    Some(WatchItem::Change(change)) => durable = change.state.into_option(),
+                    Some(WatchItem::Snapshot(snapshot)) => {
+                        durable = Some((
+                            snapshot
+                                .sequence
+                                .context("WatchGraph snapshot omitted durable sequence")?,
+                            snapshot
+                                .state
+                                .into_option()
+                                .context("WatchGraph snapshot omitted durable state")?,
+                        ));
+                    }
+                    Some(WatchItem::Change(change)) => {
+                        durable = Some((
+                            change
+                                .sequence
+                                .context("WatchGraph change omitted durable sequence")?,
+                            change
+                                .state
+                                .into_option()
+                                .context("WatchGraph change omitted durable state")?,
+                        ));
+                    }
                     Some(WatchItem::VolatileStatus(status)) => {
-                        let durable = durable
+                        let delivered_sequence = status.delivered_sequence.context(
+                            "WatchGraph volatile status omitted delivered durable sequence",
+                        )?;
+                        let (durable_sequence, durable_state) = durable
+                            .as_ref()
                             .context("WatchGraph returned volatile status before durable state")?;
-                        return Ok(watched_state(Some(durable), status.reports)
+                        anyhow::ensure!(
+                            delivered_sequence <= *durable_sequence,
+                            "WatchGraph volatile status is ahead of its durable state"
+                        );
+                        if delivered_sequence == *durable_sequence {
+                            return Ok(watched_state(
+                                Some((*durable_sequence, durable_state.clone())),
+                                status.reports,
+                            )
                             .expect("durable state is present"));
+                        }
                     }
                     Some(WatchItem::Progress(_)) | None => {}
                 }
@@ -219,41 +249,52 @@ impl CoreClient {
         &self,
         graph_id: Vec<u8>,
         state: GraphState,
-        desired: Vec<Component>,
+        desired: Vec<Vec<u8>>,
     ) -> anyhow::Result<u64> {
         let graph = current_graph(&state)?;
         let mut generation = graph
             .generation
             .context("GetGraph response omitted graph generation")?;
-        let existing_by_id = graph
-            .components
+        let existing = graph
+            .component_spec_hashes
             .iter()
-            .filter_map(|component| component.id.clone().map(|id| (id, component)))
-            .collect::<BTreeMap<_, _>>();
-        let desired_ids = desired
-            .iter()
-            .filter_map(|component| component.id.clone())
+            .cloned()
             .collect::<BTreeSet<_>>();
+        let desired = desired.into_iter().collect::<BTreeSet<_>>();
+        let additions = desired.difference(&existing).cloned().collect::<Vec<_>>();
+        let removals = existing.difference(&desired).cloned().collect::<Vec<_>>();
 
-        let additions = desired
-            .iter()
-            .filter(|component| {
-                component
-                    .id
-                    .as_ref()
-                    .is_some_and(|id| !existing_by_id.contains_key(id))
-            })
-            .map(|component| {
-                let mut component = component.clone();
-                component.depends_on.clear();
-                component
-            })
-            .collect::<Vec<_>>();
+        if additions.len() == removals.len() && !additions.is_empty() {
+            let replacements = removals
+                .into_iter()
+                .zip(additions)
+                .map(
+                    |(current_spec_hash, replacement_spec_hash)| ComponentReplacement {
+                        current_spec_hash: Some(current_spec_hash),
+                        replacement_spec_hash: Some(replacement_spec_hash),
+                        ..Default::default()
+                    },
+                )
+                .collect();
+            let request = UpdateComponentsRequest {
+                graph_id: Some(graph_id),
+                expected_generation: Some(generation),
+                replacements,
+                request_id: Some(new_request_id()),
+                ..Default::default()
+            };
+            let _: UpdateComponentsResponse = self
+                .unary("UpdateComponents", &request)
+                .await
+                .context("Cannot replace Henosis core graph component specs")?;
+            return Ok(generation + 1);
+        }
+
         if !additions.is_empty() {
             let request = AddComponentsRequest {
                 graph_id: Some(graph_id.clone()),
                 expected_generation: Some(generation),
-                components: additions,
+                component_spec_hashes: additions,
                 request_id: Some(new_request_id()),
                 ..Default::default()
             };
@@ -263,50 +304,11 @@ impl CoreClient {
                 .context("Cannot add Henosis core graph components")?;
             generation += 1;
         }
-
-        let updates = desired
-            .into_iter()
-            .map(|component| {
-                let mut update = ComponentUpdate {
-                    component: component.into(),
-                    ..Default::default()
-                };
-                update.update_mask.get_or_insert_default().paths = vec![
-                    "name".to_string(),
-                    "revision".to_string(),
-                    "connector".to_string(),
-                    "outputs_schema".to_string(),
-                    "depends_on".to_string(),
-                    "context".to_string(),
-                ];
-                update
-            })
-            .collect::<Vec<_>>();
-        if !updates.is_empty() {
-            let request = UpdateComponentsRequest {
-                graph_id: Some(graph_id.clone()),
-                expected_generation: Some(generation),
-                updates,
-                request_id: Some(new_request_id()),
-                ..Default::default()
-            };
-            let _: UpdateComponentsResponse = self
-                .unary("UpdateComponents", &request)
-                .await
-                .context("Cannot update Henosis core graph components")?;
-            generation += 1;
-        }
-
-        let removals = existing_by_id
-            .keys()
-            .filter(|id| !desired_ids.contains(*id))
-            .cloned()
-            .collect::<Vec<_>>();
         if !removals.is_empty() {
             let request = RemoveComponentsRequest {
                 graph_id: Some(graph_id),
                 expected_generation: Some(generation),
-                component_ids: removals,
+                component_spec_hashes: removals,
                 request_id: Some(new_request_id()),
                 ..Default::default()
             };
@@ -318,6 +320,80 @@ impl CoreClient {
         }
 
         Ok(generation)
+    }
+
+    async fn register_component_specs(
+        &self,
+        mut pending: Vec<PlannedComponentSpec>,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        let mut hashes = BTreeMap::new();
+        while !pending.is_empty() {
+            let index = pending
+                .iter()
+                .position(|spec| {
+                    spec.dependencies
+                        .iter()
+                        .all(|dependency| hashes.contains_key(dependency))
+                })
+                .context("Component specs could not be ordered by their dependencies")?;
+            let planned = pending.remove(index);
+            let mut depends_on = planned
+                .dependencies
+                .iter()
+                .map(|dependency| {
+                    hashes.get(dependency).cloned().with_context(|| {
+                        format!("Component spec dependency `{dependency}` was not registered")
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            depends_on.sort_unstable();
+            let spec = ComponentSpec {
+                name: Some(planned.name.clone()),
+                connector: Some(K8S_CONNECTOR.to_string()),
+                outputs_schema: Some(Vec::new()),
+                depends_on,
+                connector_context: Some(planned.connector_context),
+                ..Default::default()
+            };
+            let request = RegisterComponentSpecRequest {
+                spec: spec.clone().into(),
+                ..Default::default()
+            };
+            let response: RegisterComponentSpecResponse = self
+                .unary("RegisterComponentSpec", &request)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Cannot register Henosis core component spec `{}`",
+                        planned.name
+                    )
+                })?;
+            let registered = response
+                .component
+                .into_option()
+                .context("RegisterComponentSpec response omitted registered component")?;
+            let returned_spec = registered
+                .spec
+                .into_option()
+                .context("RegisterComponentSpec response omitted immutable spec body")?;
+            anyhow::ensure!(
+                returned_spec == spec,
+                "RegisterComponentSpec returned a different immutable spec body"
+            );
+            let hash = registered
+                .hash
+                .context("RegisterComponentSpec response omitted content hash")?;
+            anyhow::ensure!(
+                hash.len() == 32,
+                "RegisterComponentSpec returned a non-BLAKE3 content hash"
+            );
+            anyhow::ensure!(
+                hashes.insert(planned.name.clone(), hash).is_none(),
+                "Component spec name `{}` was planned more than once",
+                planned.name
+            );
+        }
+        Ok(hashes.into_values().collect())
     }
 
     async fn get_graph_by_id(&self, graph_id: &[u8]) -> anyhow::Result<Option<GraphState>> {
@@ -408,10 +484,10 @@ impl<R: ComponentPackageReader> DeployRepoWriter for CoreGraphWriter<'_, R> {
     ) -> anyhow::Result<DeployWriteResult> {
         let manifest = manifest::parse_toml(contents)
             .context("Cannot parse resolved preview world at core boundary")?;
-        let components = graph_components(&manifest, &self.components, self.package_reader).await?;
+        let specs = graph_component_specs(&manifest, &self.components, self.package_reader).await?;
         let generation = self
             .client
-            .apply_graph(&manifest.environment.id, components)
+            .apply_graph(&manifest.environment.id, specs)
             .await?;
         Ok(DeployWriteResult {
             commit_sha: generation.to_string(),
@@ -434,12 +510,11 @@ impl<R: ComponentPackageReader> DeployRepoWriter for CoreGraphWriter<'_, R> {
     }
 }
 
-pub async fn graph_components<R: ComponentPackageReader>(
+async fn graph_component_specs<R: ComponentPackageReader>(
     manifest: &Manifest,
     registered: &[RegisteredComponent],
     package_reader: &R,
-) -> anyhow::Result<Vec<Component>> {
-    let graph_id = graph_id_bytes(&manifest.environment.id)?;
+) -> anyhow::Result<Vec<PlannedComponentSpec>> {
     let pins = resolved_pins(manifest)?;
     let refs = registered
         .iter()
@@ -455,15 +530,6 @@ pub async fn graph_components<R: ComponentPackageReader>(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let package_graph = ComponentGraph::read(&refs, package_reader).await?;
-    let ids = registered
-        .iter()
-        .map(|component| {
-            (
-                component.name.clone(),
-                component_id_bytes(&graph_id, &component.name),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
 
     registered
         .iter()
@@ -475,28 +541,10 @@ pub async fn graph_components<R: ComponentPackageReader>(
                 format!("Package graph omitted component `{}`", registered.name)
             })?;
             let context = component_context(&manifest.environment.id, pin)?;
-            Ok(Component {
-                id: Some(ids[&registered.name].clone()),
-                name: Some(registered.name.clone()),
-                revision: ComponentRevision {
-                    source: Some(pin.repo.clone()),
-                    revision: Some(pin.r#ref.clone()),
-                    ..Default::default()
-                }
-                .into(),
-                connector: Some(K8S_CONNECTOR.to_string()),
-                outputs_schema: Some(Vec::new()),
-                depends_on: node
-                    .dependencies
-                    .iter()
-                    .map(|dependency| {
-                        ids.get(dependency).cloned().with_context(|| {
-                            format!("Unknown package-graph dependency `{dependency}`")
-                        })
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?,
-                context: Some(context),
-                ..Default::default()
+            Ok(PlannedComponentSpec {
+                name: registered.name.clone(),
+                dependencies: node.dependencies.iter().cloned().collect(),
+                connector_context: context,
             })
         })
         .collect()
@@ -600,32 +648,28 @@ fn validate_component_name(name: &str) -> anyhow::Result<()> {
 }
 
 fn graph_id_bytes(environment_id: &str) -> anyhow::Result<Vec<u8>> {
-    let id: PreviewEnvironmentId = environment_id
+    let id: TypedUuid<PreviewEnvironmentKind> = environment_id
         .parse()
         .with_context(|| format!("Invalid core preview environment id `{environment_id}`"))?;
     Ok(id.into_bytes().to_vec())
 }
 
-fn component_id_bytes(graph_id: &[u8], component_name: &str) -> Vec<u8> {
-    let mut digest = Sha256::new();
-    digest.update(b"henosis-component-v1\0");
-    digest.update(graph_id);
-    digest.update(b"\0");
-    digest.update(component_name.as_bytes());
-    let mut bytes: [u8; 16] = digest.finalize()[..16].try_into().expect("fixed length");
-    bytes[6] = (bytes[6] & 0x0f) | 0x50;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    bytes.to_vec()
-}
-
 fn new_request_id() -> Vec<u8> {
-    RequestId::from_untyped_uuid(uuid::Uuid::new_v4())
-        .into_bytes()
-        .to_vec()
+    uuid::Uuid::new_v4().into_bytes().to_vec()
 }
 
 fn current_graph(state: &GraphState) -> anyhow::Result<&Graph> {
     anyhow::ensure!(state.durable.is_set(), "Graph state omitted durable state");
+    let lifecycle = state
+        .durable
+        .lifecycle
+        .as_ref()
+        .and_then(|lifecycle| lifecycle.as_known())
+        .context("Graph state omitted a known lifecycle")?;
+    anyhow::ensure!(
+        lifecycle == GraphLifecycle::Active,
+        "Graph state is not active"
+    );
     anyhow::ensure!(state.durable.graph.is_set(), "Graph state omitted graph");
     Ok(&state.durable.graph)
 }
@@ -636,16 +680,36 @@ fn graph_generation(graph: &impl std::ops::Deref<Target = Graph>) -> Option<u64>
 
 fn graph_status(state: &GraphState) -> anyhow::Result<CoreGraphStatus> {
     let graph = current_graph(state)?;
+    let lifecycle = state
+        .durable
+        .lifecycle
+        .as_ref()
+        .and_then(|lifecycle| lifecycle.as_known())
+        .expect("current_graph checked lifecycle");
     let generation = graph
         .generation
         .context("Graph state omitted graph generation")?;
-    let reports = state
+    let current_reports = state
         .reports
         .iter()
         .filter(|report| {
             report.connector.as_deref() == Some(K8S_CONNECTOR)
                 && report.generation == Some(generation)
         })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        current_reports
+            .iter()
+            .all(|report| report.sequence.is_some()),
+        "Current-generation k8s report omitted durable sequence"
+    );
+    let sequence = current_reports
+        .iter()
+        .filter_map(|report| report.sequence)
+        .max();
+    let reports = current_reports
+        .into_iter()
+        .filter(|report| report.sequence == sequence)
         .collect::<Vec<_>>();
     let diagnostic = format_diagnostics(&reports);
     let failed = reports.iter().any(|report| {
@@ -663,7 +727,7 @@ fn graph_status(state: &GraphState) -> anyhow::Result<CoreGraphStatus> {
     let reported_ids = reports
         .iter()
         .flat_map(|report| report.dispositions.iter())
-        .filter_map(|disposition| disposition.component_id.as_deref())
+        .filter_map(|disposition| disposition.component_spec_hash.as_deref())
         .collect::<BTreeSet<_>>();
     let ready_ids = reports
         .iter()
@@ -672,12 +736,12 @@ fn graph_status(state: &GraphState) -> anyhow::Result<CoreGraphStatus> {
             disposition.kind.as_ref().and_then(|kind| kind.as_known())
                 == Some(ComponentDispositionKind::Ready)
         })
-        .filter_map(|disposition| disposition.component_id.as_deref())
+        .filter_map(|disposition| disposition.component_spec_hash.as_deref())
         .collect::<BTreeSet<_>>();
     let expected_ids = graph
-        .components
+        .component_spec_hashes
         .iter()
-        .filter_map(|component| component.id.as_deref())
+        .map(Vec::as_slice)
         .collect::<BTreeSet<_>>();
 
     let status = if failed {
@@ -690,6 +754,8 @@ fn graph_status(state: &GraphState) -> anyhow::Result<CoreGraphStatus> {
     };
     Ok(CoreGraphStatus {
         generation,
+        sequence,
+        lifecycle,
         status,
         diagnostic,
     })
@@ -743,12 +809,15 @@ fn take_connect_envelope(buffer: &mut Vec<u8>) -> anyhow::Result<Option<(u8, Vec
 }
 
 fn watched_state(
-    durable: Option<henosis_proto::proto::henosis::v1::DurableGraphState>,
+    durable: Option<(u64, henosis_proto::proto::henosis::v1::DurableGraphState)>,
     reports: Vec<SliceReport>,
 ) -> Option<GraphState> {
-    durable.map(|durable| GraphState {
+    durable.map(|(sequence, durable)| GraphState {
         durable: durable.into(),
-        reports,
+        reports: reports
+            .into_iter()
+            .filter(|report| report.sequence == Some(sequence))
+            .collect(),
         ..Default::default()
     })
 }
@@ -797,6 +866,8 @@ mod tests {
     use crate::henosis::manifest::{EnvironmentSection, pinned};
     use indexmap::IndexMap;
     use serde_json::{Value, json};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     struct PackageReader {
         packages: BTreeMap<(String, String), PackageJson>,
@@ -826,9 +897,9 @@ mod tests {
 
     #[tokio::test]
     async fn boundary_emits_context_v1_and_package_graph_edges() {
-        let environment_id = PreviewEnvironmentId::from_untyped_uuid(uuid::Uuid::from_u128(
-            0x018f_1234_5678_7abc_8def_0123_4567_89ab,
-        ))
+        let environment_id = TypedUuid::<PreviewEnvironmentKind>::from_untyped_uuid(
+            uuid::Uuid::from_u128(0x018f_1234_5678_7abc_8def_0123_4567_89ab),
+        )
         .to_string();
         let a_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let b_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -888,15 +959,11 @@ mod tests {
             ]),
         };
 
-        let components = graph_components(&manifest, &registered, &reader)
+        let specs = graph_component_specs(&manifest, &registered, &reader)
             .await
             .unwrap();
-        assert_eq!(
-            components[1].depends_on,
-            vec![components[0].id.clone().unwrap()]
-        );
-        let context: Value =
-            serde_json::from_slice(components[1].context.as_deref().unwrap()).unwrap();
+        assert_eq!(specs[1].dependencies, vec!["service-a"]);
+        let context: Value = serde_json::from_slice(&specs[1].connector_context).unwrap();
         assert_eq!(context["apiVersion"], COMPONENT_CONTEXT_API_VERSION);
         assert_eq!(context["environment"]["id"], environment_id);
         assert_eq!(
@@ -912,11 +979,211 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn registers_dependency_ordered_specs_before_graph_creation() {
+        let server = MockServer::start().await;
+        let first_hash =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1_u8; 32]);
+        let second_hash =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [2_u8; 32]);
+        let registration_first_hash = first_hash.clone();
+        let registration_second_hash = second_hash.clone();
+        Mock::given(method("POST"))
+            .and(path("/henosis.v1.GraphService/RegisterComponentSpec"))
+            .respond_with(move |request: &Request| {
+                let body: Value = request.body_json().unwrap();
+                let spec = body["spec"].clone();
+                let hash = match spec["name"].as_str().unwrap() {
+                    "service-a" => {
+                        assert!(spec.get("dependsOn").is_none());
+                        &registration_first_hash
+                    }
+                    "service-b" => {
+                        assert_eq!(spec["dependsOn"], json!([registration_first_hash.clone()]));
+                        &registration_second_hash
+                    }
+                    name => panic!("unexpected component spec `{name}`"),
+                };
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "component": {
+                        "hash": hash,
+                        "spec": spec
+                    }
+                }))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/henosis.v1.GraphService/GetGraph"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "code": "not_found",
+                "message": "graph does not exist"
+            })))
+            .mount(&server)
+            .await;
+        let create_first_hash = first_hash.clone();
+        let create_second_hash = second_hash.clone();
+        Mock::given(method("POST"))
+            .and(path("/henosis.v1.GraphService/CreateGraph"))
+            .respond_with(move |request: &Request| {
+                let body: Value = request.body_json().unwrap();
+                assert_eq!(
+                    body["componentSpecHashes"],
+                    json!([create_first_hash.clone(), create_second_hash.clone()])
+                );
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "graph": {
+                        "id": body["graphId"],
+                        "generation": "1",
+                        "componentSpecHashes": body["componentSpecHashes"]
+                    }
+                }))
+            })
+            .mount(&server)
+            .await;
+        let config: CoreApiConfig = toml::from_str(&format!(
+            "endpoint = {:?}\ntoken = \"test-token\"",
+            server.uri()
+        ))
+        .unwrap();
+        let environment_id = TypedUuid::<PreviewEnvironmentKind>::from_untyped_uuid(
+            uuid::Uuid::from_u128(0x018f_1234_5678_7abc_8def_0123_4567_89ac),
+        )
+        .to_string();
+        let client = CoreClient::new(&config).unwrap();
+
+        let generation = client
+            .apply_graph(
+                &environment_id,
+                vec![
+                    PlannedComponentSpec {
+                        name: "service-b".to_string(),
+                        dependencies: vec!["service-a".to_string()],
+                        connector_context: b"service-b".to_vec(),
+                    },
+                    PlannedComponentSpec {
+                        name: "service-a".to_string(),
+                        dependencies: Vec::new(),
+                        connector_context: b"service-a".to_vec(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(generation, 1);
+        let requests = server.received_requests().await.unwrap();
+        let methods = requests
+            .iter()
+            .map(|request| request.url.path().rsplit('/').next().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "RegisterComponentSpec",
+                "RegisterComponentSpec",
+                "GetGraph",
+                "CreateGraph"
+            ]
+        );
+    }
+
     #[test]
     fn core_preview_ids_are_canonical_uuid_v7_typeids() {
         let id = CoreEnvironmentIdGenerator.new_preview_environment_id();
-        let parsed: PreviewEnvironmentId = id.parse().unwrap();
+        let parsed: TypedUuid<PreviewEnvironmentKind> = id.parse().unwrap();
         assert_eq!(parsed.get_version_num(), 7);
         assert_eq!(parsed.to_string(), id);
+    }
+
+    #[test]
+    fn mutation_request_ids_are_unique_raw_uuid_v4_values() {
+        let first = new_request_id();
+        let second = new_request_id();
+        assert_ne!(first, second);
+        assert_eq!(uuid::Uuid::from_slice(&first).unwrap().get_version_num(), 4);
+        assert_eq!(
+            uuid::Uuid::from_slice(&second).unwrap().get_version_num(),
+            4
+        );
+    }
+
+    #[test]
+    fn status_uses_only_the_newest_durable_report_level() {
+        let first = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1_u8; 32]);
+        let second = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [2_u8; 32]);
+        let state: GraphState = serde_json::from_value(json!({
+            "durable": {
+                "graph": {
+                    "id": base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        [3_u8; 16]
+                    ),
+                    "generation": "4",
+                    "componentSpecHashes": [&first, &second]
+                },
+                "lifecycle": "GRAPH_LIFECYCLE_ACTIVE"
+            },
+            "reports": [
+                {
+                    "generation": "4",
+                    "connector": "k8s",
+                    "sequence": "7",
+                    "dispositions": [{
+                        "componentSpecHash": &first,
+                        "kind": "COMPONENT_DISPOSITION_KIND_FAILED"
+                    }],
+                    "diagnostics": [{
+                        "code": "stale.failure",
+                        "severity": "DIAGNOSTIC_SEVERITY_ERROR"
+                    }]
+                },
+                {
+                    "generation": "4",
+                    "connector": "k8s",
+                    "sequence": "8",
+                    "dispositions": [
+                        {
+                            "componentSpecHash": &first,
+                            "kind": "COMPONENT_DISPOSITION_KIND_READY"
+                        },
+                        {
+                            "componentSpecHash": &second,
+                            "kind": "COMPONENT_DISPOSITION_KIND_READY"
+                        }
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let status = graph_status(&state).unwrap();
+        assert_eq!(status.generation, 4);
+        assert_eq!(status.sequence, Some(8));
+        assert_eq!(status.lifecycle, GraphLifecycle::Active);
+        assert_eq!(status.status, RenderStatus::Success);
+        assert_eq!(status.diagnostic, None);
+    }
+
+    #[test]
+    fn status_rejects_retired_graph_lifecycle() {
+        let state: GraphState = serde_json::from_value(json!({
+            "durable": {
+                "graph": {
+                    "id": base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        [4_u8; 16]
+                    ),
+                    "generation": "1"
+                },
+                "lifecycle": "GRAPH_LIFECYCLE_RETIRED"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            graph_status(&state).unwrap_err().to_string(),
+            "Graph state is not active"
+        );
     }
 }
