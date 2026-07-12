@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 
 use crate::bors::RepositoryState;
 use crate::bors::mergeability_queue::MergeabilityQueueSender;
+use crate::config::RepositoryConfig;
+use crate::github::api::config_exempt;
 use crate::{PgDbClient, TeamApiClient, database};
 
 /// Reload the team DB bors permissions for the given repository.
@@ -50,7 +52,11 @@ pub async fn reload_mergeability_status(
 
 /// Reloads the bors configuration for the given repository from GitHub.
 pub async fn reload_repository_config(repo: Arc<RepositoryState>) -> anyhow::Result<()> {
-    let config = repo.client.load_config().await?;
+    let config = if config_exempt(repo.repository()) {
+        RepositoryConfig::henosis_permissive_default()
+    } else {
+        repo.client.load_config().await?
+    };
     repo.config.store(Arc::new(config));
     Ok(())
 }

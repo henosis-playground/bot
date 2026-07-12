@@ -165,12 +165,7 @@ async fn create_repo_state(
 
 async fn load_config(client: &GithubRepositoryClient) -> anyhow::Result<RepositoryConfig> {
     let name = client.repository();
-    if std::env::var("BORS_CONFIG_EXEMPT_REPOS")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .any(|repo| repo == name.to_string())
-    {
+    if config_exempt(name) {
         return Ok(RepositoryConfig::henosis_permissive_default());
     }
     match client.load_config().await {
@@ -182,4 +177,12 @@ async fn load_config(client: &GithubRepositoryClient) -> anyhow::Result<Reposito
             Ok(RepositoryConfig::henosis_permissive_default())
         }
     }
+}
+
+pub(crate) fn config_exempt(name: &GithubRepoName) -> bool {
+    std::env::var("BORS_CONFIG_EXEMPT_REPOS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .any(|repo| repo == name.to_string())
 }
