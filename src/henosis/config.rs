@@ -42,6 +42,8 @@ pub struct HenosisConfig {
 #[serde(deny_unknown_fields)]
 pub struct CoreApiConfig {
     pub endpoint: String,
+    #[serde(default)]
+    pub presentation_endpoint: Option<String>,
     pub token: CoreApiToken,
 }
 
@@ -355,6 +357,7 @@ deploy_repo = "henosis-playground/deploy"
 
 [core_api]
 endpoint = "https://core.henosis.dev"
+presentation_endpoint = "https://henosis.skuld.systems"
 token = "super-secret"
 
 [[environments]]
@@ -366,6 +369,10 @@ manifest_path = "dev.toml"
 
         let core_api = config.core_api.unwrap();
         assert_eq!(core_api.endpoint, "https://core.henosis.dev");
+        assert_eq!(
+            core_api.presentation_endpoint.as_deref(),
+            Some("https://henosis.skuld.systems")
+        );
         assert_eq!(core_api.token.expose(), "super-secret");
         assert_eq!(format!("{:?}", core_api.token), "[REDACTED]");
     }

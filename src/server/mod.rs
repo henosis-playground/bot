@@ -2,6 +2,7 @@ use crate::bors::event::BorsEvent;
 use crate::bors::{CommandPrefix, RepositoryState, format_help};
 use crate::database::{ApprovalStatus, QueueStatus};
 use crate::github::{GithubRepoName, PullRequestNumber, rollup};
+use crate::henosis::core_client::CoreClient;
 use crate::templates::{
     HelpTemplate, HtmlTemplate, NotFoundTemplate, PullRequestStats, QueueTemplate, RepositoryView,
     RollupsInfo,
@@ -136,6 +137,7 @@ pub fn create_app(state: ServerState) -> Router {
         )
         .route("/github", post(github_webhook_handler))
         .route("/health", get(health_handler))
+        .route("/graphs/{environment_id}", get(graph_handler))
         .route("/oauth/callback", get(rollup::oauth_callback_handler))
         .nest("/api", api)
         .nest_service("/assets", serve_assets)
@@ -144,6 +146,35 @@ pub fn create_app(state: ServerState) -> Router {
         .layer(trace_layer)
         .with_state(ServerStateRef(Arc::new(state)))
         .fallback(not_found_handler)
+}
+
+async fn graph_handler(
+    Path(environment_id): Path<String>,
+    State(ServerStateRef(state)): State<ServerStateRef>,
+) -> Response {
+    let Some(core_api) = state
+        .ctx
+        .henosis_config
+        .as_ref()
+        .and_then(|config| config.core_api.as_ref())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let client = match CoreClient::new(core_api) {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::error!(?error, "Invalid Henosis core client configuration");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    match client.get_graph(&environment_id).await {
+        Ok(Some(graph)) => Json(graph).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::warn!(?error, %environment_id, "Cannot present Henosis core graph");
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+    }
 }
 
 fn create_api_router() -> Router<ServerStateRef> {

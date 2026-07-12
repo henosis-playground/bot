@@ -65,6 +65,7 @@ struct PlannedComponentSpec {
 #[derive(Clone)]
 pub struct CoreClient {
     endpoint: String,
+    presentation_endpoint: String,
     token: String,
     http: Client,
 }
@@ -78,19 +79,33 @@ impl CoreClient {
         );
         reqwest::Url::parse(&endpoint)
             .with_context(|| format!("Invalid Henosis core endpoint `{endpoint}`"))?;
+        let presentation_endpoint = config
+            .presentation_endpoint
+            .as_deref()
+            .unwrap_or(&endpoint)
+            .trim_end_matches('/')
+            .to_string();
+        anyhow::ensure!(
+            !presentation_endpoint.is_empty(),
+            "Henosis core presentation endpoint cannot be empty"
+        );
+        reqwest::Url::parse(&presentation_endpoint).with_context(|| {
+            format!("Invalid Henosis core presentation endpoint `{presentation_endpoint}`")
+        })?;
         anyhow::ensure!(
             !config.token.expose().is_empty(),
             "Henosis core token cannot be empty"
         );
         Ok(Self {
             endpoint,
+            presentation_endpoint,
             token: config.token.expose().to_string(),
             http: Client::new(),
         })
     }
 
     pub fn graph_url(&self, environment_id: &str) -> String {
-        format!("{}/graphs/{environment_id}", self.endpoint)
+        format!("{}/graphs/{environment_id}", self.presentation_endpoint)
     }
 
     async fn apply_graph(
