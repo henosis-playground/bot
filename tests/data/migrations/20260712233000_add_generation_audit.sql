@@ -1,20 +1,28 @@
-ALTER TABLE environment
-ADD COLUMN desired_render_key TEXT;
+UPDATE environment
+SET desired_render_key = 'generation:1'
+WHERE id = 'dev';
 
-ALTER TABLE environment_render
-ADD COLUMN generation BIGINT,
-ADD COLUMN publication_revision TEXT,
-ADD COLUMN publication_url TEXT;
+UPDATE environment_render
+SET generation = 1,
+    publication_revision = 'sample-publication-sha',
+    publication_url = 'https://github.com/henosis-playground/deploy/commit/sample-publication-sha'
+WHERE environment_id = 'dev';
 
-CREATE TABLE environment_render_comment (
-    environment_id TEXT NOT NULL,
-    generation BIGINT NOT NULL,
-    consumer TEXT NOT NULL,
-    repo TEXT NOT NULL,
-    pr_number BIGINT NOT NULL,
-    node_id TEXT NOT NULL,
-    original_body TEXT NOT NULL,
-    resolved_generation BIGINT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (environment_id, generation, consumer, repo, pr_number)
+INSERT INTO environment_render_comment (
+    environment_id,
+    generation,
+    consumer,
+    repo,
+    pr_number,
+    node_id,
+    original_body
+)
+VALUES (
+    'dev',
+    1,
+    'service-a',
+    'henosis-playground/service-a',
+    1,
+    'sample-render-comment-node',
+    'sample generation diagnostic'
 );
