@@ -54,6 +54,30 @@ ORDER BY e.id
             .collect()
     }
 
+    pub async fn active_preview_environments(&self) -> anyhow::Result<Vec<EnvironmentState>> {
+        let rows = sqlx::query(
+            r#"
+SELECT id, manifest_path, is_preview
+FROM environment
+WHERE retired_at IS NULL
+  AND is_preview = TRUE
+ORDER BY id
+"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(EnvironmentState {
+                    id: row.try_get("id")?,
+                    manifest_path: row.try_get("manifest_path")?,
+                    is_preview: row.try_get("is_preview")?,
+                })
+            })
+            .collect()
+    }
+
     pub async fn record_render_outcome(&self, outcome: &RenderOutcome) -> anyhow::Result<()> {
         sqlx::query(
             r#"
@@ -114,16 +138,18 @@ impl EnvironmentStore for PgEnvironmentStore {
         id: &str,
         manifest_path: &str,
         is_preview: bool,
+        display_label: Option<&str>,
     ) -> anyhow::Result<()> {
         let can_reuse_retired = can_reuse_retired_environment_id(id, is_preview);
         sqlx::query(
             r#"
-INSERT INTO environment (id, manifest_path, is_preview, retired_at, updated_at)
-VALUES ($1, $2, $3, NULL, NOW())
+INSERT INTO environment (id, manifest_path, is_preview, display_label, retired_at, updated_at)
+VALUES ($1, $2, $3, $5, NULL, NOW())
 ON CONFLICT (id)
 DO UPDATE SET
     manifest_path = EXCLUDED.manifest_path,
     is_preview = EXCLUDED.is_preview,
+    display_label = EXCLUDED.display_label,
     retired_at = NULL,
     updated_at = NOW()
 WHERE environment.retired_at IS NULL OR $4
@@ -134,6 +160,7 @@ RETURNING id
         .bind(manifest_path)
         .bind(is_preview)
         .bind(can_reuse_retired)
+        .bind(display_label)
         .fetch_optional(&self.pool)
         .await?
         .with_context(|| format!("Cannot reuse retired environment id `{id}`"))?;
@@ -323,6 +350,33 @@ VALUES ($1, $2)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn active_environment_by_display_label(
+        &self,
+        display_label: &str,
+    ) -> anyhow::Result<Option<EnvironmentState>> {
+        let row = sqlx::query(
+            r#"
+SELECT id, manifest_path, is_preview
+FROM environment
+WHERE display_label = $1
+  AND retired_at IS NULL
+  AND is_preview = TRUE
+"#,
+        )
+        .bind(display_label)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| {
+            Ok(EnvironmentState {
+                id: row.try_get("id")?,
+                manifest_path: row.try_get("manifest_path")?,
+                is_preview: row.try_get("is_preview")?,
+            })
+        })
+        .transpose()
     }
 }
 

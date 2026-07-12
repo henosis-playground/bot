@@ -104,6 +104,9 @@ pub fn create_bors_process(
                 _ = consume_henosis_queue_ticks(ctx.clone()) => {
                     tracing::error!("Henosis queue scheduler has ended")
                 }
+                _ = consume_henosis_core_status(ctx.clone()) => {
+                    tracing::error!("Henosis core status scheduler has ended")
+                }
                 _ = merge_queue_fut => {
                     tracing::error!("Merge queue handling process has ended");
                 }
@@ -285,6 +288,33 @@ async fn consume_henosis_queue_ticks(ctx: Arc<BorsContext>) {
             Ok(None) => {
                 tracing::debug!("Henosis queue tick found no work");
             }
+            Err(error) => handle_root_error(span, error),
+        }
+    }
+}
+
+#[cfg(not(test))]
+async fn consume_henosis_core_status(ctx: Arc<BorsContext>) {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    if config.core_api.is_none() {
+        tracing::debug!("Henosis core status scheduler disabled");
+        std::future::pending::<()>().await;
+        return;
+    }
+
+    let mut interval = tokio::time::interval(config.queue_tick_interval());
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let span = tracing::info_span!("HenosisCoreStatus");
+        match crate::henosis::service::reconcile_core_graphs(&ctx)
+            .instrument(span.clone())
+            .await
+        {
+            Ok(count) => tracing::debug!(count, "Reconciled Henosis core graph status"),
             Err(error) => handle_root_error(span, error),
         }
     }

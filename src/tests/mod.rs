@@ -620,6 +620,10 @@ impl BorsTester {
         crate::henosis::service::tick_queue(&self.ctx).await
     }
 
+    pub async fn reconcile_henosis_core_now(&self) -> anyhow::Result<usize> {
+        crate::henosis::service::reconcile_core_graphs(&self.ctx).await
+    }
+
     /// Repeatedly trigger the merge queue until it attempts to perform a merge.
     /// When that happens, wait until the merge queue completely finishes processing.
     pub async fn run_merge_queue_until_merge_attempt(&self) {

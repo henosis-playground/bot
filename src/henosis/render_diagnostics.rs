@@ -43,16 +43,21 @@ pub fn render_failure_comment(outcome: &RenderOutcome) -> String {
         .excerpt
         .as_deref()
         .unwrap_or("No render log excerpt was available.");
+    let revision = outcome
+        .commit_sha
+        .strip_prefix("generation:")
+        .map(|generation| format!("at graph generation `{generation}`"))
+        .unwrap_or_else(|| format!("for commit `{}`", outcome.commit_sha));
     if diagnostic.starts_with("**Henosis merge gate failed") {
         return format!(
-            "couldn't materialise environment `{}` for commit `{}`.\n\n{}\n\n[render run]({})",
-            outcome.environment_id, outcome.commit_sha, diagnostic, outcome.run_url
+            "couldn't materialise environment `{}` {revision}.\n\n{}\n\n[render run]({})",
+            outcome.environment_id, diagnostic, outcome.run_url
         );
     }
 
     format!(
-        "couldn't materialise environment `{}` for commit `{}`.\n\n<details><summary>render log</summary>\n\n```text\n{}\n```\n\n</details>\n\n[render run]({})",
-        outcome.environment_id, outcome.commit_sha, diagnostic, outcome.run_url
+        "couldn't materialise environment `{}` {revision}.\n\n<details><summary>render log</summary>\n\n```text\n{}\n```\n\n</details>\n\n[render run]({})",
+        outcome.environment_id, diagnostic, outcome.run_url
     )
 }
 

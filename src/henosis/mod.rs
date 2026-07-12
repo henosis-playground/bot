@@ -1,4 +1,5 @@
 pub mod config;
+pub mod core_client;
 pub mod db;
 #[cfg(test)]
 mod db_tests;

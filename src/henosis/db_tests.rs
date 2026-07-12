@@ -167,7 +167,7 @@ async fn named_preview_environment_can_be_recreated_after_retirement(
     let mut store = PgEnvironmentStore::new(pool.clone());
     let named_id = "preview-demo-shared";
     store
-        .upsert_environment(named_id, "preview-demo-shared.toml", true)
+        .upsert_environment(named_id, "preview-demo-shared.toml", true, None)
         .await?;
     store.retire_environment(named_id).await?;
     sqlx::query("INSERT INTO manifest_revision (environment_id, commit_sha) VALUES ($1, $2)")
@@ -186,7 +186,7 @@ async fn named_preview_environment_can_be_recreated_after_retirement(
     .await?;
 
     store
-        .upsert_environment(named_id, "preview-demo-shared.toml", true)
+        .upsert_environment(named_id, "preview-demo-shared.toml", true, None)
         .await?;
 
     assert!(store.active_environment(named_id).await?.is_some());
@@ -209,6 +209,7 @@ async fn named_preview_environment_can_be_recreated_after_retirement(
             uuid_id,
             "preview-00000000-0000-4000-8000-000000000001.toml",
             true,
+            None,
         )
         .await?;
     store.retire_environment(uuid_id).await?;
@@ -217,6 +218,7 @@ async fn named_preview_environment_can_be_recreated_after_retirement(
             uuid_id,
             "preview-00000000-0000-4000-8000-000000000001.toml",
             true,
+            None,
         )
         .await
         .unwrap_err();

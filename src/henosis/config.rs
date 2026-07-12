@@ -11,6 +11,8 @@ pub const HENOSIS_CONFIG_ENV: &str = "HENOSIS_CONFIG";
 #[serde(deny_unknown_fields)]
 pub struct HenosisConfig {
     pub deploy_repo: String,
+    #[serde(default)]
+    pub core_api: Option<CoreApiConfig>,
     #[serde(default = "default_manifest_branch")]
     pub manifest_branch: String,
     #[serde(default = "default_gate_command")]
@@ -34,6 +36,29 @@ pub struct HenosisConfig {
     #[serde(default = "default_dev_manifest_path")]
     pub dev_manifest_path: String,
     pub environments: Vec<EnvironmentConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreApiConfig {
+    pub endpoint: String,
+    pub token: CoreApiToken,
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct CoreApiToken(String);
+
+impl CoreApiToken {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for CoreApiToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -232,6 +257,7 @@ manifest_path = "dev.toml"
             "Henosis advisory merge gate"
         );
         assert_eq!(config.preview_mode, PreviewMode::OnDemand);
+        assert_eq!(config.core_api, None);
         assert_eq!(config.render_workflow_name, "Render environments");
         assert_eq!(config.queue_tick_interval_secs, 15);
         assert_eq!(config.queue_tick_interval(), Duration::from_secs(15));
@@ -319,6 +345,29 @@ manifest_path = "dev.toml"
         assert!(config.is_component_repo("henosis-playground/service-a"));
         assert!(!config.is_component_repo("henosis-playground/service-b"));
         assert!(config.is_chained_component_repo("henosis-playground/service-a"));
+    }
+
+    #[test]
+    fn parses_core_api_without_exposing_token_in_debug_output() {
+        let config = parse_config(
+            r#"
+deploy_repo = "henosis-playground/deploy"
+
+[core_api]
+endpoint = "https://core.henosis.dev"
+token = "super-secret"
+
+[[environments]]
+id = "dev"
+manifest_path = "dev.toml"
+"#,
+        )
+        .unwrap();
+
+        let core_api = config.core_api.unwrap();
+        assert_eq!(core_api.endpoint, "https://core.henosis.dev");
+        assert_eq!(core_api.token.expose(), "super-secret");
+        assert_eq!(format!("{:?}", core_api.token), "[REDACTED]");
     }
 
     #[test]

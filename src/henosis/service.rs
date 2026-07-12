@@ -4,10 +4,12 @@ use crate::bors::event::WorkflowRunCompleted;
 use crate::database::WorkflowStatus;
 use crate::github::{GithubRepoName, PullRequest, PullRequestNumber};
 use crate::henosis::config::{HenosisConfig, PreviewMode};
+use crate::henosis::core_client::{CoreClient, CoreEnvironmentIdGenerator, CoreGraphWriter};
 use crate::henosis::db::{PgEnvironmentStore, PgQueueStore};
 use crate::henosis::environment::{
-    EnvironmentChange, EnvironmentManager, EnvironmentStatus, EnvironmentStore, PreviewPullRequest,
-    PullRequestKey, RenderOutcome, RenderStatus, environment_branch,
+    DeployRepoWriter, DeployWriteResult, EnvironmentChange, EnvironmentManager, EnvironmentStatus,
+    EnvironmentStore, PreviewPullRequest, PullRequestKey, RenderOutcome, RenderStatus,
+    environment_branch,
 };
 use crate::henosis::gate::{CliGateExecutor, GateExecutor};
 use crate::henosis::github::{
@@ -28,6 +30,73 @@ use crate::henosis::status::{
 };
 use anyhow::Context;
 use std::collections::BTreeSet;
+use std::sync::Arc;
+
+enum PreviewWriter<'a> {
+    Deploy(GithubDeployRepoWriter<'a>),
+    Core(CoreGraphWriter<'a, GithubComponentPackageReader<'a>>),
+}
+
+impl DeployRepoWriter for PreviewWriter<'_> {
+    async fn write_manifest(
+        &mut self,
+        path: &str,
+        contents: &str,
+    ) -> anyhow::Result<DeployWriteResult> {
+        match self {
+            Self::Deploy(writer) => writer.write_manifest(path, contents).await,
+            Self::Core(writer) => writer.write_manifest(path, contents).await,
+        }
+    }
+
+    async fn delete_manifest(&mut self, path: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Deploy(writer) => writer.delete_manifest(path).await,
+            Self::Core(writer) => writer.delete_manifest(path).await,
+        }
+    }
+
+    async fn create_branch(&mut self, branch: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Deploy(writer) => writer.create_branch(branch).await,
+            Self::Core(writer) => writer.create_branch(branch).await,
+        }
+    }
+
+    async fn delete_branch(&mut self, branch: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Deploy(writer) => writer.delete_branch(branch).await,
+            Self::Core(writer) => writer.delete_branch(branch).await,
+        }
+    }
+}
+
+fn environment_manager(config: &HenosisConfig) -> EnvironmentManager {
+    let components = config.registered_components();
+    if config.core_api.is_some() {
+        EnvironmentManager::with_core_previews(components, Arc::new(CoreEnvironmentIdGenerator))
+    } else {
+        EnvironmentManager::new(components)
+    }
+}
+
+fn preview_writer<'a>(
+    config: &HenosisConfig,
+    deploy_repo: &'a crate::bors::RepositoryState,
+    packages: &'a GithubComponentPackageReader<'a>,
+) -> anyhow::Result<PreviewWriter<'a>> {
+    match config.core_api.as_ref() {
+        Some(core_api) => Ok(PreviewWriter::Core(CoreGraphWriter::new(
+            core_api,
+            config.registered_components(),
+            packages,
+        )?)),
+        None => Ok(PreviewWriter::Deploy(GithubDeployRepoWriter::new(
+            &deploy_repo.client,
+            &config.manifest_branch,
+        ))),
+    }
+}
 
 pub fn is_henosis_component_repo(ctx: &BorsContext, repo: &GithubRepoName) -> bool {
     ctx.henosis_config
@@ -68,16 +137,16 @@ pub async fn create_preview_environment(
     let Some(pr) = preview_pull_request(config, repo, pr) else {
         return Ok(None);
     };
-    let manager = EnvironmentManager::new(config.registered_components());
+    let manager = environment_manager(config);
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
-    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.manifest_branch);
+    let packages = GithubComponentPackageReader::new(&ctx.repositories);
+    let mut writer = preview_writer(config, &deploy_repo, &packages)?;
     let dev = GithubDevManifestReader::new(
         &deploy_repo.client,
         &config.manifest_branch,
         &config.dev_manifest_path,
     );
-    let packages = GithubComponentPackageReader::new(&ctx.repositories);
     let digest = GithubImageDigestResolver::new(&ctx.repositories);
 
     let change = manager
@@ -102,16 +171,16 @@ pub async fn reopen_preview_environment(
         return Ok(None);
     }
 
-    let manager = EnvironmentManager::new(config.registered_components());
+    let manager = environment_manager(config);
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
-    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.manifest_branch);
+    let packages = GithubComponentPackageReader::new(&ctx.repositories);
+    let mut writer = preview_writer(config, &deploy_repo, &packages)?;
     let dev = GithubDevManifestReader::new(
         &deploy_repo.client,
         &config.manifest_branch,
         &config.dev_manifest_path,
     );
-    let packages = GithubComponentPackageReader::new(&ctx.repositories);
     let digest = GithubImageDigestResolver::new(&ctx.repositories);
 
     let change = manager
@@ -133,7 +202,7 @@ pub async fn refresh_preview_environment(
         return Ok(None);
     };
 
-    let manager = EnvironmentManager::new(config.registered_components());
+    let manager = environment_manager(config);
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     if config.preview_mode == PreviewMode::OnDemand
         && store
@@ -150,13 +219,13 @@ pub async fn refresh_preview_environment(
         return Ok(None);
     }
     let deploy_repo = deploy_repo(ctx, config)?;
-    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.manifest_branch);
+    let packages = GithubComponentPackageReader::new(&ctx.repositories);
+    let mut writer = preview_writer(config, &deploy_repo, &packages)?;
     let dev = GithubDevManifestReader::new(
         &deploy_repo.client,
         &config.manifest_branch,
         &config.dev_manifest_path,
     );
-    let packages = GithubComponentPackageReader::new(&ctx.repositories);
     let digest = GithubImageDigestResolver::new(&ctx.repositories);
 
     let change = manager
@@ -179,16 +248,16 @@ pub async fn join_environment(
         return Ok(None);
     };
 
-    let manager = EnvironmentManager::new(config.registered_components());
+    let manager = environment_manager(config);
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
-    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.manifest_branch);
+    let packages = GithubComponentPackageReader::new(&ctx.repositories);
+    let mut writer = preview_writer(config, &deploy_repo, &packages)?;
     let dev = GithubDevManifestReader::new(
         &deploy_repo.client,
         &config.manifest_branch,
         &config.dev_manifest_path,
     );
-    let packages = GithubComponentPackageReader::new(&ctx.repositories);
     let digest = GithubImageDigestResolver::new(&ctx.repositories);
 
     let change = manager
@@ -211,16 +280,16 @@ pub async fn leave_environment(
         return Ok(None);
     };
 
-    let manager = EnvironmentManager::new(config.registered_components());
+    let manager = environment_manager(config);
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
-    let mut writer = GithubDeployRepoWriter::new(&deploy_repo.client, &config.manifest_branch);
+    let packages = GithubComponentPackageReader::new(&ctx.repositories);
+    let mut writer = preview_writer(config, &deploy_repo, &packages)?;
     let dev = GithubDevManifestReader::new(
         &deploy_repo.client,
         &config.manifest_branch,
         &config.dev_manifest_path,
     );
-    let packages = GithubComponentPackageReader::new(&ctx.repositories);
     let digest = GithubImageDigestResolver::new(&ctx.repositories);
 
     let change = manager
@@ -541,9 +610,13 @@ pub async fn handle_render_workflow_completed(
     };
 
     let environment_store = PgEnvironmentStore::new(ctx.db.pool().clone());
-    let environments = environment_store
-        .active_preview_environments_for_commit_sha(&payload.commit_sha.0)
-        .await?;
+    let environments = if config.core_api.is_some() {
+        Vec::new()
+    } else {
+        environment_store
+            .active_preview_environments_for_commit_sha(&payload.commit_sha.0)
+            .await?
+    };
     for environment in environments {
         let outcome = RenderOutcome {
             environment_id: environment.id.clone(),
@@ -657,9 +730,28 @@ async fn reconcile_environment_status(
         return Ok(());
     };
     let members = environment_store.active_members(environment_id).await?;
-    let render = environment_store
-        .latest_render_outcome(environment_id)
-        .await?;
+    let render = if let Some(core_api) = config.core_api.as_ref() {
+        let client = CoreClient::new(core_api)?;
+        match client.get_graph(environment_id).await? {
+            Some(state) => {
+                let status = client.graph_status(&state)?;
+                let outcome = RenderOutcome {
+                    environment_id: environment_id.to_string(),
+                    commit_sha: format!("generation:{}", status.generation),
+                    status: status.status,
+                    run_url: client.graph_url(environment_id),
+                    excerpt: status.diagnostic,
+                };
+                record_core_render_outcome(ctx, &environment_store, &outcome).await?;
+                Some(outcome)
+            }
+            None => None,
+        }
+    } else {
+        environment_store
+            .latest_render_outcome(environment_id)
+            .await?
+    };
     let queue_store = PgQueueStore::new(ctx.db.pool().clone());
 
     for member in &members {
@@ -686,6 +778,12 @@ async fn reconcile_environment_status(
                 &config.manifest_branch,
                 &environment.manifest_path,
             ),
+            graph_url: config
+                .core_api
+                .as_ref()
+                .map(CoreClient::new)
+                .transpose()?
+                .map(|client| client.graph_url(&environment.id)),
             branch_url: deploy_branch_url(
                 &config.deploy_repo,
                 &environment_branch(&environment.id),
@@ -703,6 +801,62 @@ async fn reconcile_environment_status(
         }
     }
 
+    Ok(())
+}
+
+pub async fn reconcile_core_graphs(ctx: &BorsContext) -> anyhow::Result<usize> {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return Ok(0);
+    };
+    let Some(core_api) = config.core_api.as_ref() else {
+        return Ok(0);
+    };
+    let client = CoreClient::new(core_api)?;
+    let store = PgEnvironmentStore::new(ctx.db.pool().clone());
+    let environments = store.active_preview_environments().await?;
+    for environment in &environments {
+        let state = match client.watch_graph(&environment.id).await {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(
+                    environment_id = %environment.id,
+                    "WatchGraph snapshot failed, falling back to GetGraph: {error:#}"
+                );
+                client
+                    .get_graph(&environment.id)
+                    .await?
+                    .with_context(|| format!("Core graph `{}` disappeared", environment.id))?
+            }
+        };
+        let status = client.graph_status(&state)?;
+        let outcome = RenderOutcome {
+            environment_id: environment.id.clone(),
+            commit_sha: format!("generation:{}", status.generation),
+            status: status.status,
+            run_url: client.graph_url(&environment.id),
+            excerpt: status.diagnostic,
+        };
+        record_core_render_outcome(ctx, &store, &outcome).await?;
+        reconcile_environment_status(ctx, &environment.id).await?;
+    }
+    Ok(environments.len())
+}
+
+async fn record_core_render_outcome(
+    ctx: &BorsContext,
+    store: &PgEnvironmentStore,
+    outcome: &RenderOutcome,
+) -> anyhow::Result<()> {
+    let previous = store.latest_render_outcome(&outcome.environment_id).await?;
+    if previous.as_ref() == Some(outcome) {
+        return Ok(());
+    }
+    store.record_render_outcome(outcome).await?;
+    if should_post_render_failure(&previous, outcome) {
+        for member in store.active_members(&outcome.environment_id).await? {
+            post_render_failure_comment(ctx, &member.key, outcome).await?;
+        }
+    }
     Ok(())
 }
 

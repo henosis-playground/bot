@@ -1,0 +1,1 @@
+-- Empty to satisfy migration tests; display labels are optional and created by preview workflows.

@@ -10,6 +10,7 @@ pub struct StatusSnapshot {
     pub environment: EnvironmentStatus,
     pub current_pr: PullRequestKey,
     pub manifest_url: String,
+    pub graph_url: Option<String>,
     pub branch_url: String,
     pub advisory_gate: Option<GateStatus>,
     pub gate: Option<GateStatus>,
@@ -18,9 +19,9 @@ pub struct StatusSnapshot {
 
 pub fn render_status_section(snapshot: &StatusSnapshot) -> String {
     format!(
-        "{STATUS_START}\n### Henosis status\n\n**Environment** `{}` · [manifest]({}) · [branch]({})\n**Members** {}\n**Merge gate** {}\n**Render** {}\n{STATUS_END}",
+        "{STATUS_START}\n### Henosis status\n\n**Environment** `{}` · {} · [branch]({})\n**Members** {}\n**Merge gate** {}\n**Render** {}\n{STATUS_END}",
         snapshot.environment.environment.id,
-        snapshot.manifest_url,
+        environment_link(snapshot),
         snapshot.branch_url,
         member_list(&snapshot.environment.members, &snapshot.current_pr),
         merge_gate_row(
@@ -30,6 +31,14 @@ pub fn render_status_section(snapshot: &StatusSnapshot) -> String {
         ),
         render_row(snapshot.render.as_ref()),
     )
+}
+
+fn environment_link(snapshot: &StatusSnapshot) -> String {
+    snapshot
+        .graph_url
+        .as_ref()
+        .map(|url| format!("[graph]({url})"))
+        .unwrap_or_else(|| format!("[manifest]({})", snapshot.manifest_url))
 }
 
 pub fn upsert_status_section(body: &str, section: &str) -> String {
@@ -137,6 +146,7 @@ fn render_row(render: Option<&RenderOutcome>) -> String {
         Some(render) => format!(
             "{} ([run]({}))",
             icon_word(match render.status {
+                RenderStatus::Pending => "running",
                 RenderStatus::Success => "passed",
                 RenderStatus::Failure => "failed",
             }),
@@ -216,6 +226,7 @@ mod tests {
             current_pr: PullRequestKey::new("henosis-playground/service-a", 12),
             manifest_url: "https://github.com/henosis-playground/deploy/blob/main/preview.toml"
                 .to_string(),
+            graph_url: None,
             branch_url: "https://github.com/henosis-playground/deploy/tree/env/preview".to_string(),
             advisory_gate: Some(GateStatus {
                 external_id: "gate-advisory".to_string(),

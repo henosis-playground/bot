@@ -90,6 +90,7 @@ pub struct EnvironmentStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderStatus {
+    Pending,
     Success,
     Failure,
 }
@@ -97,6 +98,7 @@ pub enum RenderStatus {
 impl RenderStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Success => "success",
             Self::Failure => "failure",
         }
@@ -108,6 +110,7 @@ impl TryFrom<&str> for RenderStatus {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
+            "pending" => Ok(Self::Pending),
             "success" => Ok(Self::Success),
             "failure" => Ok(Self::Failure),
             _ => anyhow::bail!("unknown render status `{value}`"),
@@ -154,6 +157,7 @@ pub trait EnvironmentStore {
         id: &str,
         manifest_path: &str,
         is_preview: bool,
+        display_label: Option<&str>,
     ) -> anyhow::Result<()>;
     async fn retire_environment(&mut self, id: &str) -> anyhow::Result<()>;
     async fn put_member(
@@ -174,6 +178,13 @@ pub trait EnvironmentStore {
         environment_id: &str,
         commit_sha: &str,
     ) -> anyhow::Result<()>;
+
+    async fn active_environment_by_display_label(
+        &self,
+        _display_label: &str,
+    ) -> anyhow::Result<Option<EnvironmentState>> {
+        Ok(None)
+    }
 }
 
 pub trait EnvironmentIdGenerator {
@@ -195,6 +206,7 @@ impl EnvironmentIdGenerator for RandomEnvironmentIdGenerator {
 pub struct EnvironmentManager {
     components: Vec<RegisteredComponent>,
     id_generator: Arc<dyn EnvironmentIdGenerator + Send + Sync>,
+    core_previews: bool,
 }
 
 impl EnvironmentManager {
@@ -202,6 +214,7 @@ impl EnvironmentManager {
         Self {
             components,
             id_generator: Arc::new(RandomEnvironmentIdGenerator),
+            core_previews: false,
         }
     }
 
@@ -212,6 +225,18 @@ impl EnvironmentManager {
         Self {
             components,
             id_generator,
+            core_previews: false,
+        }
+    }
+
+    pub fn with_core_previews(
+        components: Vec<RegisteredComponent>,
+        id_generator: Arc<dyn EnvironmentIdGenerator + Send + Sync>,
+    ) -> Self {
+        Self {
+            components,
+            id_generator,
+            core_previews: true,
         }
     }
 
@@ -233,7 +258,9 @@ impl EnvironmentManager {
         let previous = store.environment_for_pr(&pr.key).await?;
         let id = self.id_generator.new_preview_environment_id();
         let manifest_path = environment_manifest_path(&id);
-        store.upsert_environment(&id, &manifest_path, true).await?;
+        store
+            .upsert_environment(&id, &manifest_path, true, None)
+            .await?;
         store.retire_member(&pr.key).await?;
         store.put_member(&id, &pr).await?;
 
@@ -365,13 +392,29 @@ impl EnvironmentManager {
     {
         let requested = name.trim();
         anyhow::ensure!(!requested.is_empty(), "Environment name must be specified");
-        let target_id = shared_environment_id(requested);
-        let target = if let Some(target) = store.active_environment(&target_id).await? {
+        let target = if self.core_previews {
+            store.active_environment_by_display_label(requested).await?
+        } else {
+            store
+                .active_environment(&shared_environment_id(requested))
+                .await?
+        };
+        let target = if let Some(target) = target {
             target
         } else {
+            let target_id = if self.core_previews {
+                self.id_generator.new_preview_environment_id()
+            } else {
+                shared_environment_id(requested)
+            };
             let manifest_path = environment_manifest_path(&target_id);
             store
-                .upsert_environment(&target_id, &manifest_path, true)
+                .upsert_environment(
+                    &target_id,
+                    &manifest_path,
+                    true,
+                    self.core_previews.then_some(requested),
+                )
                 .await?;
             EnvironmentState {
                 id: target_id.clone(),
@@ -590,9 +633,27 @@ impl EnvironmentManager {
                         .image_digest(&member.key.repo, &member.head_sha)
                         .await?
                         .unwrap_or_else(|| synthetic_digest_for_ref(&member.head_sha));
-                    pinned(member.key.repo.clone(), member.head_branch.clone(), digest)
+                    pinned(
+                        member.key.repo.clone(),
+                        if self.core_previews {
+                            member.head_sha.clone()
+                        } else {
+                            member.head_branch.clone()
+                        },
+                        digest,
+                    )
                 }
                 None if closure.contains(&component.name) => {
+                    let dev_pin = dev_pins.get(&component.name).with_context(|| {
+                        format!("No dev pin found for component `{}`", component.name)
+                    })?;
+                    pinned(
+                        dev_pin.repo.clone(),
+                        dev_pin.r#ref.clone(),
+                        dev_pin.digest.clone(),
+                    )
+                }
+                None if self.core_previews => {
                     let dev_pin = dev_pins.get(&component.name).with_context(|| {
                         format!("No dev pin found for component `{}`", component.name)
                     })?;
@@ -839,6 +900,7 @@ mod tests {
             id: &str,
             manifest_path: &str,
             is_preview: bool,
+            _display_label: Option<&str>,
         ) -> anyhow::Result<()> {
             if self.retired_environments.contains(id) {
                 anyhow::ensure!(

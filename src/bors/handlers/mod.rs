@@ -1253,8 +1253,12 @@ fn is_bors_observed_branch(branch: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::{Arc, Mutex};
 
+    use serde_json::{Value, json};
     use tempfile::TempDir;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use crate::bors::PullRequestStatus;
     use crate::database::WorkflowStatus;
@@ -1302,6 +1306,301 @@ manifest_path = "dev.toml"
 "#,
         )
         .unwrap()
+    }
+
+    const CORE_DEV_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const CORE_PR_SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const CORE_PUSH_SHA: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    fn henosis_core_config(endpoint: &str) -> HenosisConfig {
+        toml::from_str(&format!(
+            r#"
+deploy_repo = "rust-lang/borstest"
+render_workflow_name = "Workflow1"
+preview_mode = "on-demand"
+
+[core_api]
+endpoint = "{endpoint}"
+token = "test-core-token"
+
+[[components]]
+name = "borstest"
+repo = "rust-lang/borstest"
+
+[[environments]]
+id = "dev"
+manifest_path = "dev.toml"
+"#,
+        ))
+        .unwrap()
+    }
+
+    fn henosis_core_github() -> GitHub {
+        let github = GitHub::default();
+        {
+            let repo = github.default_repo();
+            let mut repo = repo.lock();
+            repo.set_file(
+                "dev.toml",
+                &format!(
+                    r#"
+[environment]
+id = "dev"
+
+[components.borstest]
+repo = "rust-lang/borstest"
+ref = "{CORE_DEV_SHA}"
+digest = "sha256:{}"
+"#,
+                    "d".repeat(64)
+                ),
+            );
+            repo.set_file(
+                "henosis/package.json",
+                r#"{"name":"@henosis/borstest","dependencies":{},"henosis":{"component":"borstest"}}"#,
+            );
+        }
+        github
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    enum MockCoreReport {
+        #[default]
+        Pending,
+        Ready,
+        Failed,
+    }
+
+    #[derive(Debug, Default)]
+    struct MockCoreState {
+        graph: Option<Value>,
+        retired: bool,
+        report: MockCoreReport,
+        calls: Vec<String>,
+        requests: Vec<Value>,
+    }
+
+    impl MockCoreState {
+        fn graph_id(&self) -> Option<&str> {
+            self.graph
+                .as_ref()
+                .and_then(|graph| graph.get("id"))
+                .and_then(Value::as_str)
+        }
+
+        fn generation(&self) -> u64 {
+            self.graph
+                .as_ref()
+                .and_then(|graph| graph.get("generation"))
+                .and_then(Value::as_str)
+                .and_then(|generation| generation.parse().ok())
+                .expect("mock graph generation")
+        }
+
+        fn durable(&self) -> Value {
+            json!({
+                "graph": self.graph.clone().expect("mock graph exists"),
+                "lifecycle": if self.retired {
+                    "GRAPH_LIFECYCLE_RETIRED"
+                } else {
+                    "GRAPH_LIFECYCLE_ACTIVE"
+                }
+            })
+        }
+
+        fn reports(&self) -> Vec<Value> {
+            if self.report == MockCoreReport::Pending || self.retired {
+                return Vec::new();
+            }
+            let graph = self.graph.as_ref().expect("mock graph exists");
+            let components = graph["components"].as_array().expect("mock components");
+            let failed_id = components
+                .first()
+                .and_then(|component| component["id"].as_str());
+            let dispositions = components
+                .iter()
+                .map(|component| {
+                    let id = component["id"].as_str().expect("component id");
+                    json!({
+                        "componentId": id,
+                        "kind": if self.report == MockCoreReport::Failed && Some(id) == failed_id {
+                            "COMPONENT_DISPOSITION_KIND_FAILED"
+                        } else {
+                            "COMPONENT_DISPOSITION_KIND_READY"
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let diagnostics = if self.report == MockCoreReport::Failed {
+                vec![json!({
+                    "code": "k8s.render_failed",
+                    "message": "renderer rejected the desired world",
+                    "pointer": "/components/borstest",
+                    "help": "fix the component declaration",
+                    "severity": "DIAGNOSTIC_SEVERITY_ERROR"
+                })]
+            } else {
+                Vec::new()
+            };
+            vec![json!({
+                "graphId": graph["id"],
+                "generation": graph["generation"],
+                "connector": "k8s",
+                "dispositions": dispositions,
+                "diagnostics": diagnostics
+            })]
+        }
+
+        fn get_response(&self) -> Value {
+            json!({
+                "state": {
+                    "durable": self.durable(),
+                    "reports": self.reports()
+                }
+            })
+        }
+    }
+
+    async fn mock_core() -> (MockServer, Arc<Mutex<MockCoreState>>) {
+        let server = MockServer::start().await;
+        let state = Arc::new(Mutex::new(MockCoreState::default()));
+        let responder_state = state.clone();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/henosis\.v1\.GraphService/[A-Za-z]+$"))
+            .respond_with(move |request: &Request| {
+                assert_eq!(
+                    request
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("Bearer test-core-token")
+                );
+                let method = request
+                    .url
+                    .path()
+                    .rsplit('/')
+                    .next()
+                    .expect("GraphService method")
+                    .to_string();
+                let streaming = method == "WatchGraph";
+                let body: Value = if streaming {
+                    let length = u32::from_be_bytes(
+                        request.body[1..5].try_into().expect("watch frame header"),
+                    ) as usize;
+                    serde_json::from_slice(&request.body[5..5 + length]).expect("watch request")
+                } else {
+                    request.body_json().expect("core JSON request")
+                };
+                let mut state = responder_state.lock().unwrap();
+                state.calls.push(method.clone());
+                state.requests.push(body.clone());
+
+                match method.as_str() {
+                    "GetGraph" => {
+                        if state.retired
+                            || state.graph.is_none()
+                            || state.graph_id() != body["graphId"].as_str()
+                        {
+                            ResponseTemplate::new(404).set_body_json(json!({
+                                "code": "not_found",
+                                "message": "graph does not exist"
+                            }))
+                        } else {
+                            ResponseTemplate::new(200).set_body_json(state.get_response())
+                        }
+                    }
+                    "CreateGraph" => {
+                        state.retired = false;
+                        state.report = MockCoreReport::Pending;
+                        state.graph = Some(json!({
+                            "id": body["graphId"],
+                            "generation": "1",
+                            "components": body["components"]
+                        }));
+                        ResponseTemplate::new(200).set_body_json(json!({
+                            "graph": state.graph
+                        }))
+                    }
+                    "AddComponents" => {
+                        let generation = state.generation() + 1;
+                        let graph = state.graph.as_mut().expect("mock graph exists");
+                        graph["generation"] = Value::String(generation.to_string());
+                        graph["components"]
+                            .as_array_mut()
+                            .unwrap()
+                            .extend(body["components"].as_array().unwrap().iter().cloned());
+                        ResponseTemplate::new(200).set_body_json(json!({"graph": graph}))
+                    }
+                    "UpdateComponents" => {
+                        let generation = state.generation() + 1;
+                        let graph = state.graph.as_mut().expect("mock graph exists");
+                        graph["generation"] = Value::String(generation.to_string());
+                        let components = graph["components"].as_array_mut().unwrap();
+                        for update in body["updates"].as_array().unwrap() {
+                            let desired = &update["component"];
+                            let id = desired["id"].as_str();
+                            if let Some(existing) = components
+                                .iter_mut()
+                                .find(|component| component["id"].as_str() == id)
+                            {
+                                *existing = desired.clone();
+                            }
+                        }
+                        ResponseTemplate::new(200).set_body_json(json!({"graph": graph}))
+                    }
+                    "RemoveComponents" => {
+                        let generation = state.generation() + 1;
+                        let graph = state.graph.as_mut().expect("mock graph exists");
+                        graph["generation"] = Value::String(generation.to_string());
+                        let removed = body["componentIds"].as_array().unwrap();
+                        graph["components"]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|component| !removed.iter().any(|id| id == &component["id"]));
+                        ResponseTemplate::new(200).set_body_json(json!({"graph": graph}))
+                    }
+                    "RetireGraph" => {
+                        state.retired = true;
+                        ResponseTemplate::new(200).set_body_json(json!({
+                            "graphId": body["graphId"],
+                            "lastGeneration": body["expectedGeneration"]
+                        }))
+                    }
+                    "WatchGraph" => {
+                        let sequence = state.generation();
+                        let snapshot = json!({
+                            "snapshot": {
+                                "sequence": sequence.to_string(),
+                                "state": state.durable()
+                            }
+                        });
+                        let status = json!({
+                            "volatileStatus": {
+                                "deliveredSequence": sequence.to_string(),
+                                "reports": state.reports()
+                            }
+                        });
+                        let mut frames = connect_frame(&snapshot);
+                        frames.extend(connect_frame(&status));
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "application/connect+json")
+                            .set_body_bytes(frames)
+                    }
+                    other => panic!("unexpected GraphService call {other}"),
+                }
+            })
+            .mount(&server)
+            .await;
+        (server, state)
+    }
+
+    fn connect_frame(value: &Value) -> Vec<u8> {
+        let payload = serde_json::to_vec(value).unwrap();
+        let mut frame = Vec::with_capacity(payload.len() + 5);
+        frame.push(0);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend(payload);
+        frame
     }
 
     fn henosis_config_with_gate(gate_command: &str) -> HenosisConfig {
@@ -1681,6 +1980,162 @@ digest = "sha256:service-b"
                 assert_eq!(body, "Description of PR 2");
                 assert_no_status_section(&body);
                 assert_preview_retired(ctx, &environment_id).await?;
+                Ok(())
+            })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_core_preview_lifecycle_and_status_cutover(pool: sqlx::PgPool) {
+        let (core, core_state) = mock_core().await;
+        BorsBuilder::new(pool)
+            .github(henosis_core_github())
+            .henosis_config(henosis_core_config(&core.uri()))
+            .run_test(async move |ctx: &mut BorsTester| {
+                let pr = ctx
+                    .open_pr((), |pr| {
+                        pr.reset_to_single_commit(Commit::from_sha(CORE_PR_SHA));
+                    })
+                    .await?;
+                let pr_id = (default_repo_name(), pr.number().0);
+
+                ctx.post_comment(Comment::new(pr_id.clone(), "@bors p+ shared-demo"))
+                    .await?;
+                let body = ctx.pr(pr_id.clone()).await.get_gh_pr().description;
+                let first_environment_id = environment_id_from_body(&body);
+                assert!(first_environment_id.starts_with("preview_"));
+                assert_eq!(first_environment_id.len(), "preview_".len() + 26);
+                assert!(body.contains("[graph](http://"));
+                assert!(body.contains("**Render** :hourglass_flowing_sand: running"));
+                assert!(!deploy_has_manifest(
+                    ctx,
+                    &preview_manifest_path(&first_environment_id)
+                ));
+                assert!(!deploy_has_branch(
+                    ctx,
+                    &preview_branch_name(&first_environment_id)
+                ));
+
+                {
+                    let state = core_state.lock().unwrap();
+                    let create = state
+                        .calls
+                        .iter()
+                        .zip(&state.requests)
+                        .find(|(method, _)| method.as_str() == "CreateGraph")
+                        .map(|(_, request)| request)
+                        .expect("CreateGraph request");
+                    let component = &create["components"][0];
+                    let context = base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        component["context"].as_str().unwrap(),
+                    )?;
+                    let context: Value = serde_json::from_slice(&context)?;
+                    assert_eq!(
+                        context["apiVersion"],
+                        "henosis.dev/k8s-component-context/v1"
+                    );
+                    assert_eq!(context["environment"]["id"], first_environment_id);
+                    assert_eq!(context["source"]["repository"], "rust-lang/borstest");
+                    assert_eq!(context["source"]["revision"], CORE_PR_SHA);
+                    assert_eq!(component["revision"]["revision"], CORE_PR_SHA);
+                    assert_eq!(component["connector"], "k8s");
+                }
+
+                ctx.push_to_pr(pr_id.clone(), Commit::from_sha(CORE_PUSH_SHA))
+                    .await?;
+                {
+                    let state = core_state.lock().unwrap();
+                    let update = state
+                        .calls
+                        .iter()
+                        .zip(&state.requests)
+                        .rev()
+                        .find(|(method, _)| method.as_str() == "UpdateComponents")
+                        .map(|(_, request)| request)
+                        .expect("UpdateComponents request");
+                    assert_eq!(
+                        update["updates"][0]["component"]["revision"]["revision"],
+                        CORE_PUSH_SHA
+                    );
+                }
+
+                core_state.lock().unwrap().report = MockCoreReport::Ready;
+                assert_eq!(ctx.reconcile_henosis_core_now().await?, 1);
+                let body = ctx.pr(pr_id.clone()).await.get_gh_pr().description;
+                assert!(body.contains("**Render** :white_check_mark: passed"));
+
+                core_state.lock().unwrap().report = MockCoreReport::Failed;
+                assert_eq!(ctx.reconcile_henosis_core_now().await?, 1);
+                let comment = ctx.get_next_comment_text(pr_id.clone()).await?;
+                assert!(comment.contains("at graph generation `2`"));
+                assert!(comment.contains("k8s.render_failed: renderer rejected the desired world"));
+                assert!(comment.contains("help: fix the component declaration"));
+                let body = ctx.pr(pr_id.clone()).await.get_gh_pr().description;
+                assert!(body.contains("**Render** :x: failed"));
+                assert!(!body.contains("renderer rejected the desired world"));
+
+                core_state.lock().unwrap().report = MockCoreReport::Ready;
+                assert_eq!(ctx.reconcile_henosis_core_now().await?, 1);
+                let render_before_workflow = ctx.pr(pr_id.clone()).await.get_gh_pr().description;
+                let comments_before_workflow =
+                    ctx.modify_repo((), |repo| repo.get_pr(pr.number().0).comment_history_len());
+                let run_id = ctx.create_workflow(default_repo_name(), "main");
+                ctx.workflow_full_failure(run_id).await?;
+                assert_eq!(
+                    ctx.pr(pr_id.clone()).await.get_gh_pr().description,
+                    render_before_workflow
+                );
+                assert_eq!(
+                    ctx.modify_repo((), |repo| repo.get_pr(pr.number().0).comment_history_len()),
+                    comments_before_workflow
+                );
+
+                ctx.post_comment(Comment::new(pr_id.clone(), "@bors p-"))
+                    .await?;
+                assert_eq!(
+                    ctx.pr(pr_id.clone()).await.get_gh_pr().description,
+                    "Description of PR 2"
+                );
+
+                ctx.post_comment(Comment::new(pr_id.clone(), "@bors p+ shared-demo"))
+                    .await?;
+                let second_environment_id =
+                    environment_id_from_body(&ctx.pr(pr_id.clone()).await.get_gh_pr().description);
+                assert!(second_environment_id.starts_with("preview_"));
+                assert_ne!(second_environment_id, first_environment_id);
+
+                ctx.set_pr_status_closed(pr_id.clone()).await?;
+                assert_eq!(
+                    ctx.pr(pr_id).await.get_gh_pr().description,
+                    "Description of PR 2"
+                );
+
+                let calls = core_state.lock().unwrap().calls.clone();
+                assert_eq!(
+                    calls,
+                    vec![
+                        "GetGraph",
+                        "CreateGraph",
+                        "GetGraph",
+                        "GetGraph",
+                        "UpdateComponents",
+                        "GetGraph",
+                        "WatchGraph",
+                        "GetGraph",
+                        "WatchGraph",
+                        "GetGraph",
+                        "WatchGraph",
+                        "GetGraph",
+                        "GetGraph",
+                        "RetireGraph",
+                        "GetGraph",
+                        "CreateGraph",
+                        "GetGraph",
+                        "GetGraph",
+                        "RetireGraph",
+                    ]
+                );
                 Ok(())
             })
             .await;
