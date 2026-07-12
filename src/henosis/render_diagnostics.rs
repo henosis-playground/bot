@@ -307,6 +307,8 @@ mod tests {
             status: RenderStatus::Failure,
             run_url: "https://github.com/henosis-playground/deploy/actions/runs/1".to_string(),
             excerpt: Some(diagnostic.to_string()),
+            generation: None,
+            publication: None,
         });
 
         assert!(body.contains(diagnostic));

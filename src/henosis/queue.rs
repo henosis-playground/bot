@@ -883,6 +883,7 @@ mod tests {
                 message: "service-b consumes service-a.databaseUrl which no longer exists"
                     .to_string(),
                 excerpt: "Property 'databaseUrl' does not exist on type".to_string(),
+                source_url: None,
             }],
         }
     }

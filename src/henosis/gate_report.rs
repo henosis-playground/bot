@@ -19,6 +19,8 @@ pub struct GateFailure {
     pub kind: String,
     pub message: String,
     pub excerpt: String,
+    #[serde(default)]
+    pub source_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -75,6 +77,9 @@ impl GateReport {
 }
 
 fn render_failure(failure: &GateFailure) -> String {
+    if failure.producer == "unknown" {
+        return render_component_failure(failure);
+    }
     if is_self_mismatch(failure) {
         return render_self_mismatch(failure);
     }
@@ -93,12 +98,52 @@ fn render_failure(failure: &GateFailure) -> String {
     writeln!(body, "--> {}", consumed_span_line(failure, &analyses)).unwrap();
     writeln!(body, "note: {}", version_note(failure)).unwrap();
     writeln!(body, "```").unwrap();
+    if let Some(source_url) = &failure.source_url {
+        writeln!(body, "\n[source]({source_url})").unwrap();
+    }
 
     if let Some(diff) = schema_diff(failure) {
         writeln!(body, "\n```diff\n{diff}```").unwrap();
     }
 
     writeln!(body, "\nhelp: {}", help_line(failure, &analyses)).unwrap();
+    body.trim_end().to_string()
+}
+
+fn render_component_failure(failure: &GateFailure) -> String {
+    let mut body = String::new();
+    writeln!(
+        body,
+        "**Henosis component validation failed — `{}` could not compile.**\n",
+        failure.consumer
+    )
+    .unwrap();
+    writeln!(body, "```text").unwrap();
+    writeln!(body, "error: {}", sentence(&failure.message)).unwrap();
+    if let Some(source_url) = &failure.source_url {
+        writeln!(body, "--> [source]({source_url})").unwrap();
+    } else {
+        writeln!(body, "--> {} source", failure.consumer).unwrap();
+    }
+    writeln!(
+        body,
+        "note: the @henosis/platform-k8s Resources capability accepts only requests and limits"
+    )
+    .unwrap();
+    writeln!(body, "```").unwrap();
+    if failure.message.contains("Resources field") {
+        writeln!(
+            body,
+            "\nhelp: use `resources: {{ requests: {{ cpu: \"100m\" }} }}`"
+        )
+        .unwrap();
+    } else {
+        writeln!(
+            body,
+            "\nhelp: fix the TypeScript error at the linked source line"
+        )
+        .unwrap();
+    }
     body.trim_end().to_string()
 }
 
@@ -126,10 +171,10 @@ fn render_self_mismatch(failure: &GateFailure) -> String {
     writeln!(body, "--> {}", self_span_line(&analyses)).unwrap();
     writeln!(body, "```").unwrap();
 
-    if analyses.iter().any(SelfPathAnalysis::is_type_mismatch) {
-        if let Some(diff) = schema_diff(failure) {
-            writeln!(body, "\n```diff\n{diff}```").unwrap();
-        }
+    if analyses.iter().any(SelfPathAnalysis::is_type_mismatch)
+        && let Some(diff) = schema_diff(failure)
+    {
+        writeln!(body, "\n```diff\n{diff}```").unwrap();
     }
 
     writeln!(body, "\nhelp: {}", self_help_line(&analyses)).unwrap();
@@ -486,7 +531,7 @@ fn schema_diff(failure: &GateFailure) -> Option<String> {
 fn relevant_diff_lines(diff: &TextDiff<'_, '_, '_, str>, consumed_paths: &[String]) -> String {
     let fragments = consumed_paths
         .iter()
-        .flat_map(|path| path.split('.').last())
+        .flat_map(|path| path.split('.').next_back())
         .map(|path| path.to_string())
         .collect::<Vec<_>>();
 
@@ -661,7 +706,7 @@ mod tests {
         assert!(
             report
                 .check_run_summary()
-                .contains("producer version context")
+                .contains("Henosis component validation failed")
         );
     }
 
@@ -692,6 +737,7 @@ mod tests {
                 kind: "compile".to_string(),
                 message: "service-b consumes service-a.api which no longer exists".to_string(),
                 excerpt: "Property 'api' does not exist on type".to_string(),
+                source_url: Some("https://github.com/henosis-playground/service-b/blob/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/henosis/src/index.ts#L25".to_string()),
             }],
         };
 
@@ -705,6 +751,8 @@ error: service-b consumes outputs from service-a that are incompatible with the 
 --> service-a outputs consumed by service-b: api (removed), port (number → string)
 note: you pinned service-a @ 1111111; this environment resolved service-a @ 2222222
 ```
+
+[source](https://github.com/henosis-playground/service-b/blob/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/henosis/src/index.ts#L25)
 
 ```diff
  outputs {
@@ -740,6 +788,7 @@ help: you depended on outputs [`api`, `port`] which no longer exist or changed t
                 kind: "validate".to_string(),
                 message: "service-a.test expected string, got missing".to_string(),
                 excerpt: "service-a.test expected string, got missing".to_string(),
+                source_url: None,
             }],
         };
 
@@ -782,6 +831,7 @@ help: return `test` from build, or remove it from `outputs`
                 kind: "validate".to_string(),
                 message: "service-a.port expected string, got number".to_string(),
                 excerpt: "service-a.port expected string, got number".to_string(),
+                source_url: None,
             }],
         };
 

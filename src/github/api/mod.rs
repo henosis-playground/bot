@@ -165,17 +165,20 @@ async fn create_repo_state(
 
 async fn load_config(client: &GithubRepositoryClient) -> anyhow::Result<RepositoryConfig> {
     let name = client.repository();
+    if std::env::var("BORS_CONFIG_EXEMPT_REPOS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .any(|repo| repo == name.to_string())
+    {
+        return Ok(RepositoryConfig::henosis_permissive_default());
+    }
     match client.load_config().await {
-        Ok(config) => {
-            tracing::info!("Loaded repository config for {name}: {config:?}");
-            Ok(config)
-        }
+        Ok(config) => Ok(config),
         Err(error) => {
             // D5: startup must tolerate a missing config only if genuinely cheap.
             // A permissive local default keeps source repos loadable while Henosis owns gating.
-            tracing::warn!(
-                "Could not load repository config for {name}; using Henosis permissive default: {error:?}"
-            );
+            let _ = error;
             Ok(RepositoryConfig::henosis_permissive_default())
         }
     }

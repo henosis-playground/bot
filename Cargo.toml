@@ -22,6 +22,7 @@ thiserror = "2"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 toml = "1.0"
 rust_team_data = { git = "https://github.com/rust-lang/team" }
 
@@ -46,7 +47,7 @@ http = "1"
 askama = "0.16"
 
 # Henosis core boundary
-henosis-proto = { git = "https://github.com/henosis-playground/core.git", branch = "proto-draft" }
+henosis-proto = { git = "https://github.com/henosis-playground/core.git", branch = "fix/verification-loop-1" }
 newtype-uuid = { git = "https://github.com/henosis-playground/newtype-uuid.git", features = ["v4", "v7"] }
 uuid = { version = "1.18.1", features = ["v4", "v7"] }
 
@@ -80,7 +81,6 @@ similar = "2.7"
 [dev-dependencies]
 insta = "1.26"
 wiremock = "0.6"
-base64 = "0.22"
 tracing-test = "0.2"
 regex = "1"
 parking_lot = "0.12"

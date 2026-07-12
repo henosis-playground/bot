@@ -11,18 +11,16 @@ pub struct StatusSnapshot {
     pub current_pr: PullRequestKey,
     pub manifest_url: String,
     pub graph_url: Option<String>,
-    pub branch_url: String,
     pub advisory_gate: Option<GateStatus>,
     pub gate: Option<GateStatus>,
     pub render: Option<RenderOutcome>,
+    pub last_publication: Option<RenderOutcome>,
 }
 
 pub fn render_status_section(snapshot: &StatusSnapshot) -> String {
     format!(
-        "{STATUS_START}\n### Henosis status\n\n**Environment** `{}` · {} · [branch]({})\n**Members** {}\n**Merge gate** {}\n**Render** {}\n{STATUS_END}",
-        snapshot.environment.environment.id,
-        environment_link(snapshot),
-        snapshot.branch_url,
+        "{STATUS_START}\n### Henosis status\n\n| | |\n|---|---|\n| Environment | {} |\n| Members | {} |\n| Merge gate | {} |\n| Render | {} |\n{STATUS_END}",
+        environment_cell(snapshot),
         member_list(&snapshot.environment.members, &snapshot.current_pr),
         merge_gate_row(
             snapshot.current_pr.repo.as_str(),
@@ -39,6 +37,51 @@ fn environment_link(snapshot: &StatusSnapshot) -> String {
         .as_ref()
         .map(|url| format!("[graph]({url})"))
         .unwrap_or_else(|| format!("[manifest]({})", snapshot.manifest_url))
+}
+
+fn environment_cell(snapshot: &StatusSnapshot) -> String {
+    let environment = &snapshot.environment.environment;
+    let identity = environment
+        .display_label
+        .as_ref()
+        .map(|label| format!("**{label}** · `{}`", environment.id))
+        .unwrap_or_else(|| format!("`{}`", environment.id));
+    let mut links = vec![environment_link(snapshot)];
+    if let Some(render) = snapshot.render.as_ref()
+        && let Some(generation) = render.generation
+    {
+        links.push(format!("[generation {generation}]({})", render.run_url));
+    }
+    match snapshot.last_publication.as_ref() {
+        Some(publication) => {
+            let generation = publication
+                .generation
+                .map(|generation| format!("generation {generation}"))
+                .unwrap_or_else(|| "revision".to_string());
+            if let Some(link) = publication.publication.as_ref() {
+                links.push(format!(
+                    "[rendered manifest]({})",
+                    rendered_manifest_url(&link.url, &link.revision)
+                ));
+                let prefix = snapshot
+                    .render
+                    .as_ref()
+                    .filter(|render| render.publication == publication.publication)
+                    .map(|_| "published")
+                    .unwrap_or("last published");
+                links.push(format!("{prefix}: [{generation}]({})", link.url));
+            }
+        }
+        None => links.push("rendered manifest: not published".to_string()),
+    }
+    format!("{identity}<br>{}", links.join(" · "))
+}
+
+fn rendered_manifest_url(publication_url: &str, revision: &str) -> String {
+    publication_url
+        .strip_suffix(&format!("/commit/{revision}"))
+        .map(|repo| format!("{repo}/blob/{revision}/manifest.json"))
+        .unwrap_or_else(|| publication_url.to_string())
 }
 
 pub fn upsert_status_section(body: &str, section: &str) -> String {
@@ -204,6 +247,10 @@ mod tests {
                     id: "preview-00000000-0000-4000-8000-000000000001".to_string(),
                     manifest_path: "preview-00000000-0000-4000-8000-000000000001.toml".to_string(),
                     is_preview: true,
+                    display_label: Some("shared-demo".to_string()),
+                    desired_render_key: Some(
+                        "cccccccccccccccccccccccccccccccccccccccc".to_string(),
+                    ),
                 },
                 branch: "env/preview-00000000-0000-4000-8000-000000000001".to_string(),
                 members: vec![
@@ -227,7 +274,6 @@ mod tests {
             manifest_url: "https://github.com/henosis-playground/deploy/blob/main/preview.toml"
                 .to_string(),
             graph_url: None,
-            branch_url: "https://github.com/henosis-playground/deploy/tree/env/preview".to_string(),
             advisory_gate: Some(GateStatus {
                 external_id: "gate-advisory".to_string(),
                 head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
@@ -246,17 +292,22 @@ mod tests {
                 status: RenderStatus::Failure,
                 run_url: "https://github.com/henosis-playground/deploy/actions/runs/1".to_string(),
                 excerpt: Some("not rendered in status".to_string()),
+                generation: None,
+                publication: None,
             }),
+            last_publication: None,
         });
 
         insta::assert_snapshot!(section, @r#"
 <!-- henosis:status -->
 ### Henosis status
 
-**Environment** `preview-00000000-0000-4000-8000-000000000001` · [manifest](https://github.com/henosis-playground/deploy/blob/main/preview.toml) · [branch](https://github.com/henosis-playground/deploy/tree/env/preview)
-**Members** [henosis-playground/service-a#12](https://github.com/henosis-playground/service-a/pull/12) (this PR), [henosis-playground/service-b#34](https://github.com/henosis-playground/service-b/pull/34)
-**Merge gate** final: :x: failed ([details](https://github.com/henosis-playground/service-a/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/checks))<br>advisory: :white_check_mark: passed ([details](https://github.com/henosis-playground/service-a/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/checks))
-**Render** :x: failed ([run](https://github.com/henosis-playground/deploy/actions/runs/1))
+| | |
+|---|---|
+| Environment | **shared-demo** · `preview-00000000-0000-4000-8000-000000000001`<br>[manifest](https://github.com/henosis-playground/deploy/blob/main/preview.toml) · rendered manifest: not published |
+| Members | [henosis-playground/service-a#12](https://github.com/henosis-playground/service-a/pull/12) (this PR), [henosis-playground/service-b#34](https://github.com/henosis-playground/service-b/pull/34) |
+| Merge gate | final: :x: failed ([details](https://github.com/henosis-playground/service-a/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/checks))<br>advisory: :white_check_mark: passed ([details](https://github.com/henosis-playground/service-a/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/checks)) |
+| Render | :x: failed ([run](https://github.com/henosis-playground/deploy/actions/runs/1)) |
 <!-- /henosis:status -->
 "#);
     }

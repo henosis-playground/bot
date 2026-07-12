@@ -13,16 +13,18 @@ use crate::{
     WebhookSecret, bors, database,
 };
 use axum::extract::{FromRef, Path, Query, State};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_embed::ServeEmbed;
+use base64::Engine as _;
 use chrono::Utc;
 use http::{Request, StatusCode};
 use pulldown_cmark::Parser;
 use rust_embed::Embed;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer};
+use sqlx::Row as _;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -138,6 +140,18 @@ pub fn create_app(state: ServerState) -> Router {
         .route("/github", post(github_webhook_handler))
         .route("/health", get(health_handler))
         .route("/graphs/{environment_id}", get(graph_handler))
+        .route(
+            "/graphs/{environment_id}/latest.json",
+            get(graph_json_handler),
+        )
+        .route(
+            "/graphs/{environment_id}/generations/{generation}",
+            get(graph_generation_handler),
+        )
+        .route(
+            "/graphs/{environment_id}/generations/{generation}/raw.json",
+            get(graph_generation_json_handler),
+        )
         .route("/oauth/callback", get(rollup::oauth_callback_handler))
         .nest("/api", api)
         .nest_service("/assets", serve_assets)
@@ -160,21 +174,338 @@ async fn graph_handler(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let client = match CoreClient::new(core_api) {
-        Ok(client) => client,
-        Err(error) => {
-            tracing::error!(?error, "Invalid Henosis core client configuration");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let Ok(client) = CoreClient::new(core_api) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    match client.get_graph(&environment_id).await {
+        Ok(Some(graph)) => {
+            let value = serde_json::to_value(&graph).unwrap_or_default();
+            let Some(generation) = json_u64(value.pointer("/durable/graph/generation")) else {
+                return StatusCode::BAD_GATEWAY.into_response();
+            };
+            graph_generation_response(&state, &client, &environment_id, generation).await
         }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
+async fn graph_json_handler(
+    Path(environment_id): Path<String>,
+    State(ServerStateRef(state)): State<ServerStateRef>,
+) -> Response {
+    let Some(core_api) = state
+        .ctx
+        .henosis_config
+        .as_ref()
+        .and_then(|config| config.core_api.as_ref())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(client) = CoreClient::new(core_api) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     match client.get_graph(&environment_id).await {
         Ok(Some(graph)) => Json(graph).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => {
-            tracing::warn!(?error, %environment_id, "Cannot present Henosis core graph");
-            StatusCode::BAD_GATEWAY.into_response()
-        }
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
     }
+}
+
+async fn graph_generation_handler(
+    Path((environment_id, generation)): Path<(String, u64)>,
+    State(ServerStateRef(state)): State<ServerStateRef>,
+) -> Response {
+    let Some(core_api) = state
+        .ctx
+        .henosis_config
+        .as_ref()
+        .and_then(|config| config.core_api.as_ref())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(client) = CoreClient::new(core_api) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    graph_generation_response(&state, &client, &environment_id, generation).await
+}
+
+async fn graph_generation_response(
+    state: &ServerState,
+    client: &CoreClient,
+    environment_id: &str,
+    generation: u64,
+) -> Response {
+    match client
+        .get_graph_generation(environment_id, generation)
+        .await
+    {
+        Ok(Some(record)) => {
+            let label = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT display_label FROM environment WHERE id = $1",
+            )
+            .bind(environment_id)
+            .fetch_optional(state.ctx.db.pool())
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+            let value = serde_json::to_value(record).unwrap_or_default();
+            let members = sqlx::query(
+                "SELECT component, repo, pr_number, head_sha FROM environment_member WHERE environment_id = $1",
+            )
+            .bind(environment_id)
+            .fetch_all(state.ctx.db.pool())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| {
+                Some((
+                    (row.try_get::<Option<String>, _>("component").ok()??, row.try_get::<Option<String>, _>("head_sha").ok()??),
+                    (row.try_get::<String, _>("repo").ok()?, row.try_get::<i64, _>("pr_number").ok()? as u64),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+            Html(render_generation_page(
+                environment_id,
+                label.as_deref(),
+                &value,
+                &members,
+            ))
+            .into_response()
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
+async fn graph_generation_json_handler(
+    Path((environment_id, generation)): Path<(String, u64)>,
+    State(ServerStateRef(state)): State<ServerStateRef>,
+) -> Response {
+    let Some(core_api) = state
+        .ctx
+        .henosis_config
+        .as_ref()
+        .and_then(|config| config.core_api.as_ref())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(client) = CoreClient::new(core_api) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    match client
+        .get_graph_generation(&environment_id, generation)
+        .await
+    {
+        Ok(Some(record)) => Json(record).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
+fn render_generation_page(
+    environment_id: &str,
+    label: Option<&str>,
+    record: &serde_json::Value,
+    members: &HashMap<(String, String), (String, u64)>,
+) -> String {
+    let generation = json_u64(record.pointer("/state/durable/graph/generation")).unwrap_or(0);
+    let lifecycle = record
+        .get("currentLifecycle")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .trim_start_matches("GRAPH_LIFECYCLE_")
+        .to_ascii_lowercase();
+    let last_published = json_u64(record.get("lastPublishedGeneration"));
+    let title = label
+        .map(|label| {
+            format!(
+                "{} · <code>{}</code>",
+                escape_html(label),
+                escape_html(environment_id)
+            )
+        })
+        .unwrap_or_else(|| format!("<code>{}</code>", escape_html(environment_id)));
+    let mut component_rows = String::new();
+    for component in record
+        .get("components")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let hash = component
+            .get("hash")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let spec = component.get("spec").unwrap_or(&serde_json::Value::Null);
+        let name = spec
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let context = spec
+            .get("connectorContext")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|encoded| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .ok()
+            })
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .unwrap_or_default();
+        let repo = context
+            .pointer("/source/repository")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let revision = context
+            .pointer("/source/revision")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let pull_request = members
+            .get(&(name.to_string(), revision.to_string()))
+            .map(|(repo, number)| {
+                format!(
+                    " · <a href=\"https://github.com/{}/pull/{}\">PR #{}</a>",
+                    escape_html(repo),
+                    number,
+                    number
+                )
+            })
+            .unwrap_or_default();
+        component_rows.push_str(&format!(
+            "<tr><td><strong>{}</strong><br><small>{}</small></td><td><a href=\"https://github.com/{}/tree/{}\"><code>{}</code></a>{}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(name), escape_html(hash), escape_html(repo), escape_html(revision), escape_html(short_revision(revision)),
+            pull_request, disposition_for(record, hash), outputs_for(record, hash)
+        ));
+    }
+    let reports = record
+        .pointer("/state/reports")
+        .and_then(serde_json::Value::as_array);
+    let publication = reports
+        .into_iter()
+        .flatten()
+        .find_map(|report| report.get("publication"));
+    let publication_html = publication
+        .and_then(|publication| {
+            Some(format!(
+                "<a href=\"{}\"><code>{}</code></a>",
+                escape_html(publication.get("uri")?.as_str()?),
+                escape_html(short_revision(publication.get("revision")?.as_str()?))
+            ))
+        })
+        .unwrap_or_else(|| "not published".to_string());
+    let diagnostics = reports
+        .into_iter()
+        .flatten()
+        .flat_map(|report| {
+            report
+                .get("diagnostics")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .map(|diagnostic| {
+            format!(
+                "<details><summary>{}: {}</summary><pre>{}</pre></details>",
+                escape_html(
+                    diagnostic
+                        .get("code")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("diagnostic")
+                ),
+                escape_html(
+                    diagnostic
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                ),
+                escape_html(&serde_json::to_string_pretty(diagnostic).unwrap_or_default())
+            )
+        })
+        .collect::<String>();
+    format!(
+        r#"<!doctype html><html><head><meta charset="utf-8"><title>Henosis generation {generation}</title><style>body{{font:16px system-ui;max-width:1100px;margin:3rem auto;padding:0 1rem;color:#202124}}table{{border-collapse:collapse;width:100%}}th,td{{text-align:left;vertical-align:top;border-bottom:1px solid #ddd;padding:.65rem}}code,pre{{font-family:ui-monospace,monospace}}pre{{white-space:pre-wrap;background:#f6f8fa;padding:1rem}}small{{color:#666}}</style></head><body><h1>{title}</h1><table><tr><th>Lifecycle</th><td>{lifecycle}</td></tr><tr><th>Requested generation</th><td>{generation}</td></tr><tr><th>Last published generation</th><td>{last_published}</td></tr><tr><th>Publication</th><td>{publication_html}</td></tr><tr><th>Audit data</th><td><a href="/graphs/{environment_id}/generations/{generation}/raw.json">raw JSON</a></td></tr></table><h2>Components</h2><table><thead><tr><th>Component</th><th>Source SHA</th><th>Disposition</th><th>Decoded outputs</th></tr></thead><tbody>{component_rows}</tbody></table><h2>Diagnostics</h2>{diagnostics}</body></html>"#,
+        last_published = last_published
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        environment_id = escape_html(environment_id),
+    )
+}
+
+fn disposition_for(record: &serde_json::Value, hash: &str) -> String {
+    record
+        .pointer("/state/reports")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|report| {
+            report
+                .get("dispositions")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .find(|disposition| {
+            disposition
+                .get("componentSpecHash")
+                .and_then(serde_json::Value::as_str)
+                == Some(hash)
+        })
+        .and_then(|disposition| disposition.get("kind").and_then(serde_json::Value::as_str))
+        .unwrap_or("PENDING")
+        .trim_start_matches("COMPONENT_DISPOSITION_KIND_")
+        .to_ascii_lowercase()
+}
+
+fn outputs_for(record: &serde_json::Value, hash: &str) -> String {
+    record
+        .pointer("/state/reports")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|report| {
+            report
+                .get("outputs")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .find(|output| {
+            output
+                .get("componentSpecHash")
+                .and_then(serde_json::Value::as_str)
+                == Some(hash)
+        })
+        .and_then(|output| output.get("valuesJson").and_then(serde_json::Value::as_str))
+        .and_then(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+        })
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .map(|value| {
+            format!(
+                "<pre>{}</pre>",
+                escape_html(&serde_json::to_string_pretty(&value).unwrap_or_default())
+            )
+        })
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn json_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    value.and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+fn short_revision(revision: &str) -> &str {
+    revision.get(..revision.len().min(8)).unwrap_or(revision)
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn create_api_router() -> Router<ServerStateRef> {

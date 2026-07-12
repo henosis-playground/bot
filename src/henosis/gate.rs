@@ -218,6 +218,7 @@ mod tests {
                 kind: "compile".to_string(),
                 message: "service-b consumes service-a.url which no longer exists".to_string(),
                 excerpt: "error TS2339".to_string(),
+                source_url: None,
             }],
         };
         let executor =

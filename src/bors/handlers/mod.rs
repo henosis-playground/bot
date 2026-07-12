@@ -1705,9 +1705,10 @@ digest = "sha256:dev"
     }
 
     fn environment_id_from_body(body: &str) -> String {
-        body.split_once("**Environment** `")
-            .and_then(|(_, rest)| rest.split_once('`'))
-            .map(|(id, _)| id.to_string())
+        body.lines()
+            .find(|line| line.starts_with("| Environment |"))
+            .and_then(|line| line.split('`').nth(1))
+            .map(str::to_string)
             .expect("status body should include an environment id")
     }
 
@@ -1950,20 +1951,16 @@ digest = "sha256:service-b"
 
                 assert!(body.contains("<!-- henosis:status -->"));
                 assert!(body.contains("<!-- /henosis:status -->"));
-                assert!(body.contains("**Environment** `preview-"));
+                assert!(body.contains("| Environment | `preview-"));
                 assert!(body.contains(
                     "[manifest](https://github.com/rust-lang/borstest/blob/main/preview-"
                 ));
-                assert!(
-                    body.contains(
-                        "[branch](https://github.com/rust-lang/borstest/tree/env/preview-"
-                    )
-                );
+                assert!(!body.contains("[branch]("));
                 assert!(body.contains(
                     "[rust-lang/borstest#2](https://github.com/rust-lang/borstest/pull/2) (this PR)"
                 ));
-                assert!(body.contains("**Merge gate** :grey_question: none"));
-                assert!(body.contains("**Render** :grey_question: none"));
+                assert!(body.contains("| Merge gate | :grey_question: none |"));
+                assert!(body.contains("| Render | :grey_question: none |"));
                 Ok(())
             })
             .await;
@@ -1987,8 +1984,8 @@ digest = "sha256:service-b"
 
                 let body = ctx.pr(pr_id.clone()).await.get_gh_pr().description;
                 assert!(body.contains("<!-- henosis:status -->"));
-                assert!(body.contains("**Environment** `preview-"));
-                assert!(body.contains("**Render** :grey_question: none"));
+                assert!(body.contains("| Environment | `preview-"));
+                assert!(body.contains("| Render | :grey_question: none |"));
                 let environment_id = environment_id_from_body(&body);
                 assert_preview_active(ctx, &environment_id).await?;
 
@@ -2025,7 +2022,7 @@ digest = "sha256:service-b"
                 assert!(first_environment_id.starts_with("preview_"));
                 assert_eq!(first_environment_id.len(), "preview_".len() + 26);
                 assert!(body.contains("[graph](http://"));
-                assert!(body.contains("**Render** :hourglass_flowing_sand: running"));
+                assert!(body.contains("| Render | :hourglass_flowing_sand: running"));
                 assert!(!deploy_has_manifest(
                     ctx,
                     &preview_manifest_path(&first_environment_id)
@@ -2110,7 +2107,7 @@ digest = "sha256:service-b"
                 core_state.lock().unwrap().report = MockCoreReport::Ready;
                 assert_eq!(ctx.reconcile_henosis_core_now().await?, 1);
                 let body = ctx.pr(pr_id.clone()).await.get_gh_pr().description;
-                assert!(body.contains("**Render** :white_check_mark: passed"));
+                assert!(body.contains("| Render | :white_check_mark: passed"));
 
                 core_state.lock().unwrap().report = MockCoreReport::Failed;
                 assert_eq!(ctx.reconcile_henosis_core_now().await?, 1);
@@ -2119,7 +2116,7 @@ digest = "sha256:service-b"
                 assert!(comment.contains("k8s.render_failed: renderer rejected the desired world"));
                 assert!(comment.contains("help: fix the component declaration"));
                 let body = ctx.pr(pr_id.clone()).await.get_gh_pr().description;
-                assert!(body.contains("**Render** :x: failed"));
+                assert!(body.contains("| Render | :x: failed"));
                 assert!(!body.contains("renderer rejected the desired world"));
 
                 core_state.lock().unwrap().report = MockCoreReport::Ready;
@@ -2318,7 +2315,7 @@ digest = "sha256:service-b"
                 );
 
                 let body = ctx.pr(pr_id).await.get_gh_pr().description;
-                assert!(body.contains("**Render** :x: failed ([run](https://github.com/rust-lang/borstest/actions/runs/"));
+                assert!(body.contains("| Render | :x: failed ([run](https://github.com/rust-lang/borstest/actions/runs/"));
                 assert!(!body.contains("##[error]missing DATABASE_URL"));
                 Ok(())
             })
@@ -2391,8 +2388,8 @@ digest = "sha256:service-b"
 
                 let service_a_body = ctx.pr(service_a_id).await.get_gh_pr().description;
                 let service_b_body = ctx.pr(service_b_id).await.get_gh_pr().description;
-                assert!(service_a_body.contains(&format!("**Environment** `{environment_id}`")));
-                assert!(service_b_body.contains(&format!("**Environment** `{environment_id}`")));
+                assert!(service_a_body.contains(&format!("| Environment | `{environment_id}`")));
+                assert!(service_b_body.contains(&format!("| Environment | `{environment_id}`")));
                 assert!(
                     service_a_body
                         .contains("[rust-lang/borstest#2](https://github.com/rust-lang/borstest/pull/2) (this PR), [rust-lang/service-b#1](https://github.com/rust-lang/service-b/pull/1)")
@@ -2441,7 +2438,7 @@ digest = "sha256:service-b"
                 assert_preview_active(ctx, environment_id).await?;
                 assert_eq!(active_member_count(ctx, environment_id).await?, 1);
                 let service_b_body = ctx.pr(service_b_id).await.get_gh_pr().description;
-                assert!(service_b_body.contains(&format!("**Environment** `{environment_id}`")));
+                assert!(service_b_body.contains(&format!("| Environment | `{environment_id}`")));
                 assert!(service_b_body.contains(
                     "[rust-lang/service-b#1](https://github.com/rust-lang/service-b/pull/1) (this PR)"
                 ));

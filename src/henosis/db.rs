@@ -19,6 +19,15 @@ pub struct PgEnvironmentStore {
     pool: PgPool,
 }
 
+pub struct RenderComment {
+    pub generation: u64,
+    pub consumer: String,
+    pub repo: String,
+    pub pr_number: u64,
+    pub node_id: String,
+    pub original_body: String,
+}
+
 impl PgEnvironmentStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -30,7 +39,7 @@ impl PgEnvironmentStore {
     ) -> anyhow::Result<Vec<EnvironmentState>> {
         let rows = sqlx::query(
             r#"
-SELECT DISTINCT e.id, e.manifest_path, e.is_preview
+SELECT DISTINCT e.id, e.manifest_path, e.is_preview, e.display_label, e.desired_render_key
 FROM manifest_revision AS mr
 JOIN environment AS e ON e.id = mr.environment_id
 WHERE mr.commit_sha = $1
@@ -49,6 +58,8 @@ ORDER BY e.id
                     id: row.try_get("id")?,
                     manifest_path: row.try_get("manifest_path")?,
                     is_preview: row.try_get("is_preview")?,
+                    display_label: row.try_get("display_label")?,
+                    desired_render_key: row.try_get("desired_render_key")?,
                 })
             })
             .collect()
@@ -57,7 +68,7 @@ ORDER BY e.id
     pub async fn active_preview_environments(&self) -> anyhow::Result<Vec<EnvironmentState>> {
         let rows = sqlx::query(
             r#"
-SELECT id, manifest_path, is_preview
+SELECT id, manifest_path, is_preview, display_label, desired_render_key
 FROM environment
 WHERE retired_at IS NULL
   AND is_preview = TRUE
@@ -73,6 +84,8 @@ ORDER BY id
                     id: row.try_get("id")?,
                     manifest_path: row.try_get("manifest_path")?,
                     is_preview: row.try_get("is_preview")?,
+                    display_label: row.try_get("display_label")?,
+                    desired_render_key: row.try_get("desired_render_key")?,
                 })
             })
             .collect()
@@ -87,8 +100,11 @@ INSERT INTO environment_render (
     status,
     run_url,
     excerpt
+    , generation
+    , publication_revision
+    , publication_url
 )
-VALUES ($1, $2, $3, $4, $5)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 "#,
         )
         .bind(&outcome.environment_id)
@@ -96,6 +112,9 @@ VALUES ($1, $2, $3, $4, $5)
         .bind(outcome.status.as_str())
         .bind(&outcome.run_url)
         .bind(&outcome.excerpt)
+        .bind(outcome.generation.map(|generation| generation as i64))
+        .bind(outcome.publication.as_ref().map(|link| &link.revision))
+        .bind(outcome.publication.as_ref().map(|link| &link.url))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -107,7 +126,8 @@ VALUES ($1, $2, $3, $4, $5)
     ) -> anyhow::Result<Option<RenderOutcome>> {
         let row = sqlx::query(
             r#"
-SELECT environment_id, commit_sha, status, run_url, excerpt
+SELECT environment_id, commit_sha, status, run_url, excerpt, generation,
+       publication_revision, publication_url
 FROM environment_render
 WHERE environment_id = $1
 ORDER BY created_at DESC, id DESC
@@ -120,16 +140,156 @@ LIMIT 1
 
         row.map(|row| {
             let status: String = row.try_get("status")?;
+            let publication_revision: Option<String> = row.try_get("publication_revision")?;
+            let publication_url: Option<String> = row.try_get("publication_url")?;
             Ok(RenderOutcome {
                 environment_id: row.try_get("environment_id")?,
                 commit_sha: row.try_get("commit_sha")?,
                 status: RenderStatus::try_from(status.as_str())?,
                 run_url: row.try_get("run_url")?,
                 excerpt: row.try_get("excerpt")?,
+                generation: row
+                    .try_get::<Option<i64>, _>("generation")?
+                    .map(|generation| generation as u64),
+                publication: publication_revision
+                    .zip(publication_url)
+                    .map(
+                        |(revision, url)| crate::henosis::environment::PublicationLink {
+                            revision,
+                            url,
+                        },
+                    ),
             })
         })
         .transpose()
     }
+
+    pub async fn latest_published_outcome(
+        &self,
+        environment_id: &str,
+    ) -> anyhow::Result<Option<RenderOutcome>> {
+        let row = sqlx::query(
+            r#"
+SELECT environment_id, commit_sha, status, run_url, excerpt, generation,
+       publication_revision, publication_url
+FROM environment_render
+WHERE environment_id = $1
+  AND publication_revision IS NOT NULL
+  AND publication_url IS NOT NULL
+ORDER BY generation DESC NULLS LAST, created_at DESC, id DESC
+LIMIT 1
+"#,
+        )
+        .bind(environment_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(render_outcome_from_row).transpose()
+    }
+
+    pub async fn record_render_comment(
+        &self,
+        outcome: &RenderOutcome,
+        consumer: &str,
+        key: &PullRequestKey,
+        node_id: &str,
+        original_body: &str,
+    ) -> anyhow::Result<()> {
+        let Some(generation) = outcome.generation else {
+            return Ok(());
+        };
+        sqlx::query(
+            r#"
+INSERT INTO environment_render_comment (
+    environment_id, generation, consumer, repo, pr_number, node_id, original_body
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (environment_id, generation, consumer, repo, pr_number)
+DO NOTHING
+"#,
+        )
+        .bind(&outcome.environment_id)
+        .bind(generation as i64)
+        .bind(consumer)
+        .bind(&key.repo)
+        .bind(key.number as i64)
+        .bind(node_id)
+        .bind(original_body)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn unresolved_render_comments(
+        &self,
+        environment_id: &str,
+    ) -> anyhow::Result<Vec<RenderComment>> {
+        let rows = sqlx::query(
+            r#"
+SELECT generation, consumer, repo, pr_number, node_id, original_body
+FROM environment_render_comment
+WHERE environment_id = $1
+  AND resolved_generation IS NULL
+ORDER BY generation, consumer, repo, pr_number
+"#,
+        )
+        .bind(environment_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(RenderComment {
+                    generation: row.try_get::<i64, _>("generation")? as u64,
+                    consumer: row.try_get("consumer")?,
+                    repo: row.try_get("repo")?,
+                    pr_number: row.try_get::<i64, _>("pr_number")? as u64,
+                    node_id: row.try_get("node_id")?,
+                    original_body: row.try_get("original_body")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn mark_render_comment_resolved(
+        &self,
+        environment_id: &str,
+        node_id: &str,
+        generation: u64,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+UPDATE environment_render_comment
+SET resolved_generation = $3
+WHERE environment_id = $1
+  AND node_id = $2
+"#,
+        )
+        .bind(environment_id)
+        .bind(node_id)
+        .bind(generation as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+fn render_outcome_from_row(row: sqlx::postgres::PgRow) -> anyhow::Result<RenderOutcome> {
+    let status: String = row.try_get("status")?;
+    let publication_revision: Option<String> = row.try_get("publication_revision")?;
+    let publication_url: Option<String> = row.try_get("publication_url")?;
+    Ok(RenderOutcome {
+        environment_id: row.try_get("environment_id")?,
+        commit_sha: row.try_get("commit_sha")?,
+        status: RenderStatus::try_from(status.as_str())?,
+        run_url: row.try_get("run_url")?,
+        excerpt: row.try_get("excerpt")?,
+        generation: row
+            .try_get::<Option<i64>, _>("generation")?
+            .map(|generation| generation as u64),
+        publication: publication_revision
+            .zip(publication_url)
+            .map(|(revision, url)| crate::henosis::environment::PublicationLink { revision, url }),
+    })
 }
 
 impl EnvironmentStore for PgEnvironmentStore {
@@ -143,8 +303,10 @@ impl EnvironmentStore for PgEnvironmentStore {
         let can_reuse_retired = can_reuse_retired_environment_id(id, is_preview);
         sqlx::query(
             r#"
-INSERT INTO environment (id, manifest_path, is_preview, display_label, retired_at, updated_at)
-VALUES ($1, $2, $3, $5, NULL, NOW())
+INSERT INTO environment (
+    id, manifest_path, is_preview, display_label, desired_render_key, retired_at, updated_at
+)
+VALUES ($1, $2, $3, $5, 'creating', NULL, NOW())
 ON CONFLICT (id)
 DO UPDATE SET
     manifest_path = EXCLUDED.manifest_path,
@@ -250,7 +412,7 @@ WHERE repo = $1
     ) -> anyhow::Result<Option<EnvironmentState>> {
         let row = sqlx::query(
             r#"
-SELECT e.id, e.manifest_path, e.is_preview
+SELECT e.id, e.manifest_path, e.is_preview, e.display_label, e.desired_render_key
 FROM environment_member AS m
 JOIN environment AS e ON e.id = m.environment_id
 WHERE m.repo = $1
@@ -271,6 +433,8 @@ LIMIT 1
                 id: row.try_get("id")?,
                 manifest_path: row.try_get("manifest_path")?,
                 is_preview: row.try_get("is_preview")?,
+                display_label: row.try_get("display_label")?,
+                desired_render_key: row.try_get("desired_render_key")?,
             })
         })
         .transpose()
@@ -279,7 +443,7 @@ LIMIT 1
     async fn active_environment(&self, id: &str) -> anyhow::Result<Option<EnvironmentState>> {
         let row = sqlx::query(
             r#"
-SELECT id, manifest_path, is_preview
+SELECT id, manifest_path, is_preview, display_label, desired_render_key
 FROM environment
 WHERE id = $1
   AND retired_at IS NULL
@@ -294,6 +458,8 @@ WHERE id = $1
                 id: row.try_get("id")?,
                 manifest_path: row.try_get("manifest_path")?,
                 is_preview: row.try_get("is_preview")?,
+                display_label: row.try_get("display_label")?,
+                desired_render_key: row.try_get("desired_render_key")?,
             })
         })
         .transpose()
@@ -349,6 +515,28 @@ VALUES ($1, $2)
         .bind(commit_sha)
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            "UPDATE environment SET desired_render_key = $2, updated_at = NOW() WHERE id = $1",
+        )
+        .bind(environment_id)
+        .bind(commit_sha)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn mark_render_pending(
+        &mut self,
+        environment_id: &str,
+        pending_key: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE environment SET desired_render_key = $2, updated_at = NOW() WHERE id = $1",
+        )
+        .bind(environment_id)
+        .bind(pending_key)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -358,7 +546,7 @@ VALUES ($1, $2)
     ) -> anyhow::Result<Option<EnvironmentState>> {
         let row = sqlx::query(
             r#"
-SELECT id, manifest_path, is_preview
+SELECT id, manifest_path, is_preview, display_label, desired_render_key
 FROM environment
 WHERE display_label = $1
   AND retired_at IS NULL
@@ -374,6 +562,8 @@ WHERE display_label = $1
                 id: row.try_get("id")?,
                 manifest_path: row.try_get("manifest_path")?,
                 is_preview: row.try_get("is_preview")?,
+                display_label: row.try_get("display_label")?,
+                desired_render_key: row.try_get("desired_render_key")?,
             })
         })
         .transpose()

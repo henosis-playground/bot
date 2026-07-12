@@ -4,7 +4,9 @@ use crate::bors::event::WorkflowRunCompleted;
 use crate::database::WorkflowStatus;
 use crate::github::{GithubRepoName, PullRequest, PullRequestNumber};
 use crate::henosis::config::{HenosisConfig, PreviewMode};
-use crate::henosis::core_client::{CoreClient, CoreEnvironmentIdGenerator, CoreGraphWriter};
+use crate::henosis::core_client::{
+    CoreClient, CoreEnvironmentIdGenerator, CoreFailurePresentation, CoreGraphWriter,
+};
 use crate::henosis::db::{PgEnvironmentStore, PgQueueStore};
 use crate::henosis::environment::{
     DeployRepoWriter, DeployWriteResult, EnvironmentChange, EnvironmentManager, EnvironmentStatus,
@@ -15,7 +17,7 @@ use crate::henosis::gate::{CliGateExecutor, GateExecutor};
 use crate::henosis::github::{
     GitHubMergeExecutor, GithubComponentPackageReader, GithubDeployRepoWriter,
     GithubDevManifestReader, GithubGateCheckReporter, GithubImageDigestResolver, GithubPrCommenter,
-    GithubRepoValidationChecker, deploy_branch_url, deploy_manifest_url,
+    GithubRepoValidationChecker, deploy_manifest_url,
 };
 use crate::henosis::queue::{
     ADVISORY_FAILED_STATUS, ADVISORY_PASSED_STATUS, AdvisoryGateStore, CheckConclusion,
@@ -31,6 +33,14 @@ use crate::henosis::status::{
 use anyhow::Context;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use tokio::sync::Notify;
+
+static CORE_STATUS_WAKE: LazyLock<Notify> = LazyLock::new(Notify::new);
+
+pub async fn wait_for_core_status_wake() {
+    CORE_STATUS_WAKE.notified().await;
+}
 
 enum PreviewWriter<'a> {
     Deploy(GithubDeployRepoWriter<'a>),
@@ -624,6 +634,8 @@ pub async fn handle_render_workflow_completed(
             status,
             run_url: payload.url.clone(),
             excerpt: excerpt.clone(),
+            generation: None,
+            publication: None,
         };
         let previous = environment_store
             .latest_render_outcome(&environment.id)
@@ -631,7 +643,14 @@ pub async fn handle_render_workflow_completed(
         environment_store.record_render_outcome(&outcome).await?;
         if should_post_render_failure(&previous, &outcome) {
             for member in environment_store.active_members(&environment.id).await? {
-                post_render_failure_comment(ctx, &member.key, &outcome).await?;
+                post_render_failure_comment(
+                    ctx,
+                    &environment_store,
+                    &member.key,
+                    &outcome,
+                    "environment",
+                )
+                .await?;
             }
         }
         reconcile_environment_status(ctx, &environment.id).await?;
@@ -648,12 +667,15 @@ pub async fn handle_render_workflow_completed(
             status,
             run_url: payload.url.clone(),
             excerpt,
+            generation: None,
+            publication: None,
         };
         let previous = environment_store.latest_render_outcome("dev").await?;
         environment_store.record_render_outcome(&outcome).await?;
         if should_post_render_failure(&previous, &outcome) {
             for key in &merged_prs {
-                post_render_failure_comment(ctx, key, &outcome).await?;
+                post_render_failure_comment(ctx, &environment_store, key, &outcome, "environment")
+                    .await?;
             }
         }
         reconcile_status_for_keys(ctx, merged_prs).await?;
@@ -672,6 +694,13 @@ async fn reconcile_status_for_change(
     }
     for environment_id in environment_ids {
         reconcile_environment_status(ctx, &environment_id).await?;
+    }
+    if ctx
+        .henosis_config
+        .as_ref()
+        .is_some_and(|config| config.core_api.is_some())
+    {
+        CORE_STATUS_WAKE.notify_one();
     }
     Ok(())
 }
@@ -735,14 +764,24 @@ async fn reconcile_environment_status(
         match client.get_graph(environment_id).await? {
             Some(state) => {
                 let status = client.graph_status(&state)?;
+                let failure_presentations = status.failure_presentations.clone();
                 let outcome = RenderOutcome {
                     environment_id: environment_id.to_string(),
                     commit_sha: format!("generation:{}", status.generation),
                     status: status.status,
-                    run_url: client.graph_url(environment_id),
+                    run_url: client.generation_url(environment_id, status.generation),
                     excerpt: status.diagnostic,
+                    generation: Some(status.generation),
+                    publication: status.publication,
                 };
-                record_core_render_outcome(ctx, &environment_store, &outcome).await?;
+                let outcome = outcome_for_desired_state(&environment, outcome, &client);
+                record_core_render_outcome(
+                    ctx,
+                    &environment_store,
+                    &outcome,
+                    &failure_presentations,
+                )
+                .await?;
                 Some(outcome)
             }
             None => None,
@@ -752,6 +791,9 @@ async fn reconcile_environment_status(
             .latest_render_outcome(environment_id)
             .await?
     };
+    let last_publication = environment_store
+        .latest_published_outcome(environment_id)
+        .await?;
     let queue_store = PgQueueStore::new(ctx.db.pool().clone());
 
     for member in &members {
@@ -784,13 +826,10 @@ async fn reconcile_environment_status(
                 .map(CoreClient::new)
                 .transpose()?
                 .map(|client| client.graph_url(&environment.id)),
-            branch_url: deploy_branch_url(
-                &config.deploy_repo,
-                &environment_branch(&environment.id),
-            ),
             advisory_gate,
             gate,
             render: render.clone(),
+            last_publication: last_publication.clone(),
         };
         let section = render_status_section(&snapshot);
         let body = upsert_status_section(&pr.message, &section);
@@ -817,45 +856,105 @@ pub async fn reconcile_core_graphs(ctx: &BorsContext) -> anyhow::Result<usize> {
     for environment in &environments {
         let state = match client.watch_graph(&environment.id).await {
             Ok(state) => state,
-            Err(error) => {
-                tracing::warn!(
-                    environment_id = %environment.id,
-                    "WatchGraph snapshot failed, falling back to GetGraph: {error:#}"
-                );
-                client
-                    .get_graph(&environment.id)
-                    .await?
-                    .with_context(|| format!("Core graph `{}` disappeared", environment.id))?
-            }
+            Err(_) => match client.get_graph(&environment.id).await? {
+                Some(state) => state,
+                None if environment
+                    .desired_render_key
+                    .as_deref()
+                    .is_some_and(|key| key == "creating" || key.starts_with("pending:")) =>
+                {
+                    continue;
+                }
+                None => anyhow::bail!("Core graph `{}` disappeared", environment.id),
+            },
         };
         let status = client.graph_status(&state)?;
+        let failure_presentations = status.failure_presentations.clone();
         let outcome = RenderOutcome {
             environment_id: environment.id.clone(),
             commit_sha: format!("generation:{}", status.generation),
             status: status.status,
-            run_url: client.graph_url(&environment.id),
+            run_url: client.generation_url(&environment.id, status.generation),
             excerpt: status.diagnostic,
+            generation: Some(status.generation),
+            publication: status.publication,
         };
-        record_core_render_outcome(ctx, &store, &outcome).await?;
+        let outcome = outcome_for_desired_state(environment, outcome, &client);
+        record_core_render_outcome(ctx, &store, &outcome, &failure_presentations).await?;
         reconcile_environment_status(ctx, &environment.id).await?;
     }
     Ok(environments.len())
+}
+
+fn outcome_for_desired_state(
+    environment: &crate::henosis::environment::EnvironmentState,
+    observed: RenderOutcome,
+    client: &CoreClient,
+) -> RenderOutcome {
+    let Some(desired) = environment.desired_render_key.as_deref() else {
+        return observed;
+    };
+    if desired == observed.commit_sha {
+        return observed;
+    }
+    let generation = desired
+        .strip_prefix("generation:")
+        .and_then(|generation| generation.parse::<u64>().ok());
+    RenderOutcome {
+        environment_id: environment.id.clone(),
+        commit_sha: desired.to_string(),
+        status: RenderStatus::Pending,
+        run_url: generation
+            .map(|generation| client.generation_url(&environment.id, generation))
+            .unwrap_or_else(|| client.graph_url(&environment.id)),
+        excerpt: None,
+        generation,
+        publication: None,
+    }
 }
 
 async fn record_core_render_outcome(
     ctx: &BorsContext,
     store: &PgEnvironmentStore,
     outcome: &RenderOutcome,
+    failure_presentations: &[CoreFailurePresentation],
 ) -> anyhow::Result<()> {
     let previous = store.latest_render_outcome(&outcome.environment_id).await?;
     if previous.as_ref() == Some(outcome) {
+        if outcome.status == RenderStatus::Success
+            && let Some(generation) = outcome.generation
+        {
+            resolve_render_failure_comments(ctx, store, &outcome.environment_id, generation)
+                .await?;
+        }
         return Ok(());
     }
     store.record_render_outcome(outcome).await?;
     if should_post_render_failure(&previous, outcome) {
         for member in store.active_members(&outcome.environment_id).await? {
-            post_render_failure_comment(ctx, &member.key, outcome).await?;
+            if failure_presentations.is_empty() {
+                post_render_failure_comment(ctx, store, &member.key, outcome, "environment")
+                    .await?;
+            } else {
+                for presentation in failure_presentations {
+                    let mut diagnostic_outcome = outcome.clone();
+                    diagnostic_outcome.excerpt = Some(presentation.body.clone());
+                    post_render_failure_comment(
+                        ctx,
+                        store,
+                        &member.key,
+                        &diagnostic_outcome,
+                        &presentation.consumer,
+                    )
+                    .await?;
+                }
+            }
         }
+    }
+    if outcome.status == RenderStatus::Success
+        && let Some(generation) = outcome.generation
+    {
+        resolve_render_failure_comments(ctx, store, &outcome.environment_id, generation).await?;
     }
     Ok(())
 }
@@ -889,8 +988,10 @@ async fn render_failure_diagnostic(ctx: &BorsContext, payload: &WorkflowRunCompl
 
 async fn post_render_failure_comment(
     ctx: &BorsContext,
+    store: &PgEnvironmentStore,
     key: &PullRequestKey,
     outcome: &RenderOutcome,
+    consumer: &str,
 ) -> anyhow::Result<()> {
     let repo_name: GithubRepoName = key
         .repo
@@ -900,13 +1001,47 @@ async fn post_render_failure_comment(
         .repositories
         .get(&repo_name)
         .with_context(|| format!("Repository `{repo_name}` is not loaded"))?;
-    repo.client
+    let body = render_failure_comment(outcome);
+    let comment = repo
+        .client
         .post_comment(
             PullRequestNumber(key.number),
-            Comment::new(render_failure_comment(outcome)),
+            Comment::new(body.clone()),
             &ctx.db,
         )
         .await?;
+    store
+        .record_render_comment(outcome, consumer, key, &comment.node_id, &body)
+        .await?;
+    Ok(())
+}
+
+async fn resolve_render_failure_comments(
+    ctx: &BorsContext,
+    store: &PgEnvironmentStore,
+    environment_id: &str,
+    resolved_generation: u64,
+) -> anyhow::Result<()> {
+    for comment in store.unresolved_render_comments(environment_id).await? {
+        let repo_name: GithubRepoName = comment
+            .repo
+            .parse()
+            .map_err(|error| anyhow::anyhow!("Invalid GitHub repo `{}`: {error}", comment.repo))?;
+        let repo = ctx
+            .repositories
+            .get(&repo_name)
+            .with_context(|| format!("Repository `{repo_name}` is not loaded"))?;
+        let body = format!(
+            "✅ **Resolved in generation {resolved_generation}.**\n\n<details><summary>Earlier generation {} diagnostic for {}</summary>\n\n{}\n\n</details>",
+            comment.generation, comment.consumer, comment.original_body
+        );
+        repo.client
+            .update_comment_content(&comment.node_id, &body)
+            .await?;
+        store
+            .mark_render_comment_resolved(environment_id, &comment.node_id, resolved_generation)
+            .await?;
+    }
     Ok(())
 }
 
@@ -937,4 +1072,52 @@ fn deploy_repo(
 
 pub fn preview_branch_for_environment(environment_id: &str) -> String {
     environment_branch(environment_id)
+}
+
+#[cfg(test)]
+mod desired_state_tests {
+    use super::*;
+    use crate::henosis::config::CoreApiConfig;
+    use crate::henosis::environment::EnvironmentState;
+
+    fn client() -> CoreClient {
+        let config: CoreApiConfig = toml::from_str(
+            r#"
+endpoint = "http://core:8080"
+presentation_endpoint = "https://henosis.example"
+token = "test-token"
+"#,
+        )
+        .unwrap();
+        CoreClient::new(&config).unwrap()
+    }
+
+    #[test]
+    fn membership_and_head_changes_never_reuse_old_green() {
+        for change in ["join", "leave", "close", "simultaneous-push-and-leave"] {
+            let environment = EnvironmentState {
+                id: format!("preview_{change}"),
+                manifest_path: format!("preview_{change}.toml"),
+                is_preview: true,
+                display_label: None,
+                desired_render_key: Some("generation:5".to_string()),
+            };
+            let outcome = outcome_for_desired_state(
+                &environment,
+                RenderOutcome {
+                    environment_id: environment.id.clone(),
+                    commit_sha: "generation:4".to_string(),
+                    status: RenderStatus::Success,
+                    run_url: "https://henosis.example/old".to_string(),
+                    excerpt: None,
+                    generation: Some(4),
+                    publication: None,
+                },
+                &client(),
+            );
+            assert_eq!(outcome.status, RenderStatus::Pending, "{change}");
+            assert_eq!(outcome.generation, Some(5), "{change}");
+            assert!(outcome.run_url.ends_with("/generations/5"), "{change}");
+        }
+    }
 }

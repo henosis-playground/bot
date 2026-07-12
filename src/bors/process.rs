@@ -308,13 +308,16 @@ async fn consume_henosis_core_status(ctx: Arc<BorsContext>) {
     let mut interval = tokio::time::interval(config.queue_tick_interval());
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            () = crate::henosis::service::wait_for_core_status_wake() => {}
+        }
         let span = tracing::info_span!("HenosisCoreStatus");
         match crate::henosis::service::reconcile_core_graphs(&ctx)
             .instrument(span.clone())
             .await
         {
-            Ok(count) => tracing::debug!(count, "Reconciled Henosis core graph status"),
+            Ok(_) => {}
             Err(error) => handle_root_error(span, error),
         }
     }

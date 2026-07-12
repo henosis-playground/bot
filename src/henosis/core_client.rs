@@ -6,11 +6,12 @@ use futures::StreamExt;
 use henosis_proto::proto::henosis::v1::__buffa::oneof::watch_graph_response::Item as WatchItem;
 use henosis_proto::proto::henosis::v1::{
     AddComponentsRequest, AddComponentsResponse, ComponentDispositionKind, ComponentReplacement,
-    ComponentSpec, CreateGraphRequest, CreateGraphResponse, Diagnostic, DiagnosticSeverity,
-    GetGraphRequest, GetGraphResponse, Graph, GraphLifecycle, GraphState,
-    RegisterComponentSpecRequest, RegisterComponentSpecResponse, RemoveComponentsRequest,
-    RemoveComponentsResponse, RetireGraphRequest, RetireGraphResponse, SliceReport,
-    UpdateComponentsRequest, UpdateComponentsResponse, WatchGraphRequest, WatchGraphResponse,
+    ComponentSpec, ContractFailureKind, CreateGraphRequest, CreateGraphResponse, Diagnostic,
+    DiagnosticSeverity, GetGraphGenerationRequest, GetGraphGenerationResponse, GetGraphRequest,
+    GetGraphResponse, Graph, GraphLifecycle, GraphState, RegisterComponentSpecRequest,
+    RegisterComponentSpecResponse, RemoveComponentsRequest, RemoveComponentsResponse,
+    RetireGraphRequest, RetireGraphResponse, SliceReport, UpdateComponentsRequest,
+    UpdateComponentsResponse, WatchGraphRequest, WatchGraphResponse,
 };
 use newtype_uuid::{GenericUuid, TypedUuid, TypedUuidKind, TypedUuidTag};
 use reqwest::{Client, StatusCode};
@@ -19,14 +20,15 @@ use serde::de::DeserializeOwned;
 
 use crate::henosis::config::{CoreApiConfig, RegisteredComponent};
 use crate::henosis::environment::{
-    DeployRepoWriter, DeployWriteResult, EnvironmentIdGenerator, RenderStatus,
+    DeployRepoWriter, DeployWriteResult, EnvironmentIdGenerator, PublicationLink, RenderStatus,
 };
+use crate::henosis::gate_report::{GateFailure, GateReport};
 use crate::henosis::graph::{ComponentGraph, ComponentPackageReader, ComponentRef};
 use crate::henosis::manifest::{self, ComponentEntry, Manifest, PinnedEntry};
 
 const K8S_CONNECTOR: &str = "k8s";
 const COMPONENT_CONTEXT_API_VERSION: &str = "henosis.dev/k8s-component-context/v1";
-const WATCH_INITIAL_TIMEOUT: Duration = Duration::from_secs(5);
+const WATCH_INITIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum PreviewEnvironmentKind {}
 
@@ -53,6 +55,14 @@ pub struct CoreGraphStatus {
     pub lifecycle: GraphLifecycle,
     pub status: RenderStatus,
     pub diagnostic: Option<String>,
+    pub publication: Option<PublicationLink>,
+    pub failure_presentations: Vec<CoreFailurePresentation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreFailurePresentation {
+    pub consumer: String,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +118,13 @@ impl CoreClient {
         format!("{}/graphs/{environment_id}", self.presentation_endpoint)
     }
 
+    pub fn generation_url(&self, environment_id: &str, generation: u64) -> String {
+        format!(
+            "{}/graphs/{environment_id}/generations/{generation}",
+            self.presentation_endpoint
+        )
+    }
+
     async fn apply_graph(
         &self,
         environment_id: &str,
@@ -159,6 +176,32 @@ impl CoreClient {
         self.get_graph_by_id(&graph_id_bytes(environment_id)?).await
     }
 
+    pub async fn get_graph_generation(
+        &self,
+        environment_id: &str,
+        generation: u64,
+    ) -> anyhow::Result<Option<GetGraphGenerationResponse>> {
+        let request = GetGraphGenerationRequest {
+            graph_id: Some(graph_id_bytes(environment_id)?),
+            generation: Some(generation),
+            ..Default::default()
+        };
+        match self
+            .unary::<_, GetGraphGenerationResponse>("GetGraphGeneration", &request)
+            .await
+        {
+            Ok(response) => Ok(Some(response)),
+            Err(error)
+                if error
+                    .downcast_ref::<CoreApiError>()
+                    .is_some_and(CoreApiError::not_found) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn watch_graph(&self, environment_id: &str) -> anyhow::Result<GraphState> {
         let request = WatchGraphRequest {
             graph_id: Some(graph_id_bytes(environment_id)?),
@@ -188,6 +231,7 @@ impl CoreClient {
         let mut stream = response.bytes_stream();
         let mut buffered = Vec::new();
         let mut durable = None;
+        let deadline = tokio::time::Instant::now() + WATCH_INITIAL_TIMEOUT;
         loop {
             while let Some((flags, payload)) = take_connect_envelope(&mut buffered)? {
                 if flags & 0x02 != 0 {
@@ -231,20 +275,23 @@ impl CoreClient {
                             "WatchGraph volatile status is ahead of its durable state"
                         );
                         if delivered_sequence == *durable_sequence {
-                            return Ok(watched_state(
+                            let state = watched_state(
                                 Some((*durable_sequence, durable_state.clone())),
                                 status.reports,
                             )
-                            .expect("durable state is present"));
+                            .expect("durable state is present");
+                            if graph_status(&state)?.status != RenderStatus::Pending {
+                                return Ok(state);
+                            }
                         }
                     }
                     Some(WatchItem::Progress(_)) | None => {}
                 }
             }
 
-            let next = tokio::time::timeout(WATCH_INITIAL_TIMEOUT, stream.next())
+            let next = tokio::time::timeout_at(deadline, stream.next())
                 .await
-                .context("Timed out waiting for initial WatchGraph state")?;
+                .context("Timed out waiting for terminal WatchGraph state")?;
             match next {
                 Some(Ok(chunk)) => buffered.extend_from_slice(&chunk),
                 Some(Err(error)) => return Err(error).context("Cannot read WatchGraph stream"),
@@ -505,7 +552,7 @@ impl<R: ComponentPackageReader> DeployRepoWriter for CoreGraphWriter<'_, R> {
             .apply_graph(&manifest.environment.id, specs)
             .await?;
         Ok(DeployWriteResult {
-            commit_sha: generation.to_string(),
+            commit_sha: format!("generation:{generation}"),
         })
     }
 
@@ -726,7 +773,15 @@ fn graph_status(state: &GraphState) -> anyhow::Result<CoreGraphStatus> {
         .into_iter()
         .filter(|report| report.sequence == sequence)
         .collect::<Vec<_>>();
-    let diagnostic = format_diagnostics(&reports);
+    let (diagnostic, failure_presentations) = format_diagnostics(&reports);
+    let publication = reports.iter().find_map(|report| {
+        report.publication.as_option().and_then(|publication| {
+            Some(PublicationLink {
+                revision: publication.revision.as_deref()?.to_string(),
+                url: publication.uri.as_deref()?.to_string(),
+            })
+        })
+    });
     let failed = reports.iter().any(|report| {
         report.dispositions.iter().any(|disposition| {
             disposition.kind.as_ref().and_then(|kind| kind.as_known())
@@ -773,16 +828,84 @@ fn graph_status(state: &GraphState) -> anyhow::Result<CoreGraphStatus> {
         lifecycle,
         status,
         diagnostic,
+        publication,
+        failure_presentations,
     })
 }
 
-fn format_diagnostics(reports: &[&SliceReport]) -> Option<String> {
-    let lines = reports
+fn format_diagnostics(reports: &[&SliceReport]) -> (Option<String>, Vec<CoreFailurePresentation>) {
+    let diagnostics = reports
         .iter()
         .flat_map(|report| &report.diagnostics)
-        .map(format_diagnostic)
         .collect::<Vec<_>>();
-    (!lines.is_empty()).then(|| lines.join("\n"))
+    let contract_failures = diagnostics
+        .iter()
+        .filter_map(|diagnostic| gate_failure(diagnostic))
+        .collect::<Vec<_>>();
+    let mut failures = contract_failures
+        .into_iter()
+        .map(|failure| CoreFailurePresentation {
+            consumer: failure.consumer.clone(),
+            body: GateReport {
+                ok: false,
+                failures: vec![failure],
+            }
+            .pr_comment(),
+        })
+        .collect::<Vec<_>>();
+    failures.extend(
+        diagnostics
+            .into_iter()
+            .filter(|diagnostic| !diagnostic.contract_failure.is_set())
+            .map(|diagnostic| CoreFailurePresentation {
+                consumer: "environment".to_string(),
+                body: format_diagnostic(diagnostic),
+            }),
+    );
+    let combined = (!failures.is_empty()).then(|| {
+        failures
+            .iter()
+            .map(|failure| failure.body.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n")
+    });
+    (combined, failures)
+}
+
+fn gate_failure(diagnostic: &Diagnostic) -> Option<GateFailure> {
+    let detail = diagnostic.contract_failure.as_option()?;
+    let kind = match detail.kind.as_ref()?.as_known()? {
+        ContractFailureKind::Compile => "compile",
+        ContractFailureKind::Render => "render",
+        ContractFailureKind::Validate => "validate",
+        ContractFailureKind::Resolve => "resolve",
+        ContractFailureKind::CONTRACT_FAILURE_KIND_UNSPECIFIED => return None,
+    };
+    Some(GateFailure {
+        consumer: detail.consumer.as_deref()?.to_string(),
+        producer: detail.producer.as_deref()?.to_string(),
+        pinned_sha: detail.pinned_sha.clone(),
+        resolved_sha: detail.resolved_sha.clone(),
+        outputs_schema_at_pinned: detail
+            .outputs_schema_at_pinned_json
+            .as_deref()
+            .filter(|bytes| !bytes.is_empty())
+            .and_then(|bytes| serde_json::from_slice(bytes).ok()),
+        outputs_schema_at_resolved: detail
+            .outputs_schema_at_resolved_json
+            .as_deref()
+            .filter(|bytes| !bytes.is_empty())
+            .and_then(|bytes| serde_json::from_slice(bytes).ok()),
+        consumed_paths: detail.consumed_paths.clone(),
+        kind: kind.to_string(),
+        message: diagnostic
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .to_string(),
+        excerpt: detail.excerpt.clone().unwrap_or_default(),
+        source_url: detail.source_url.clone(),
+    })
 }
 
 fn format_diagnostic(diagnostic: &Diagnostic) -> String {

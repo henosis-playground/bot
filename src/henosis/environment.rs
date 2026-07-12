@@ -57,6 +57,8 @@ pub struct EnvironmentState {
     pub id: String,
     pub manifest_path: String,
     pub is_preview: bool,
+    pub display_label: Option<String>,
+    pub desired_render_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +127,14 @@ pub struct RenderOutcome {
     pub status: RenderStatus,
     pub run_url: String,
     pub excerpt: Option<String>,
+    pub generation: Option<u64>,
+    pub publication: Option<PublicationLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationLink {
+    pub revision: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +187,11 @@ pub trait EnvironmentStore {
         &mut self,
         environment_id: &str,
         commit_sha: &str,
+    ) -> anyhow::Result<()>;
+    async fn mark_render_pending(
+        &mut self,
+        environment_id: &str,
+        pending_key: &str,
     ) -> anyhow::Result<()>;
 
     async fn active_environment_by_display_label(
@@ -261,6 +276,14 @@ impl EnvironmentManager {
         store
             .upsert_environment(&id, &manifest_path, true, None)
             .await?;
+        store
+            .mark_render_pending(&id, &pending_render_key())
+            .await?;
+        if let Some(previous) = previous.as_ref().filter(|previous| previous.id != id) {
+            store
+                .mark_render_pending(&previous.id, &pending_render_key())
+                .await?;
+        }
         store.retire_member(&pr.key).await?;
         store.put_member(&id, &pr).await?;
 
@@ -356,6 +379,9 @@ impl EnvironmentManager {
                 .await;
         };
 
+        store
+            .mark_render_pending(&environment.id, &pending_render_key())
+            .await?;
         store.put_member(&environment.id, &pr).await?;
         let write = self
             .write_environment(
@@ -420,6 +446,8 @@ impl EnvironmentManager {
                 id: target_id.clone(),
                 manifest_path,
                 is_preview: true,
+                display_label: self.core_previews.then(|| requested.to_string()),
+                desired_render_key: Some("creating".to_string()),
             }
         };
         anyhow::ensure!(
@@ -428,6 +456,18 @@ impl EnvironmentManager {
             target.id
         );
         let previous = store.environment_for_pr(&pr.key).await?;
+
+        store
+            .mark_render_pending(&target.id, &pending_render_key())
+            .await?;
+        if let Some(previous) = previous
+            .as_ref()
+            .filter(|previous| previous.id != target.id)
+        {
+            store
+                .mark_render_pending(&previous.id, &pending_render_key())
+                .await?;
+        }
 
         store.retire_member(&pr.key).await?;
         store.put_member(&target.id, &pr).await?;
@@ -488,6 +528,9 @@ impl EnvironmentManager {
         let Some(previous) = previous else {
             return Ok(EnvironmentChange::default());
         };
+        store
+            .mark_render_pending(&previous.id, &pending_render_key())
+            .await?;
         store.retire_member(&pr.key).await?;
 
         let mut change = EnvironmentChange::default();
@@ -706,6 +749,10 @@ impl EnvironmentManager {
     }
 }
 
+fn pending_render_key() -> String {
+    format!("pending:{:032x}", rand::random::<u128>())
+}
+
 impl EnvironmentChange {
     fn extend(&mut self, other: EnvironmentChange) {
         self.written.extend(other.written);
@@ -900,7 +947,7 @@ mod tests {
             id: &str,
             manifest_path: &str,
             is_preview: bool,
-            _display_label: Option<&str>,
+            display_label: Option<&str>,
         ) -> anyhow::Result<()> {
             if self.retired_environments.contains(id) {
                 anyhow::ensure!(
@@ -915,6 +962,8 @@ mod tests {
                     id: id.to_string(),
                     manifest_path: manifest_path.to_string(),
                     is_preview,
+                    display_label: display_label.map(str::to_owned),
+                    desired_render_key: Some("creating".to_string()),
                 },
             );
             Ok(())
@@ -982,6 +1031,20 @@ mod tests {
         ) -> anyhow::Result<()> {
             self.revisions
                 .push((environment_id.to_string(), commit_sha.to_string()));
+            if let Some(environment) = self.environments.get_mut(environment_id) {
+                environment.desired_render_key = Some(commit_sha.to_string());
+            }
+            Ok(())
+        }
+
+        async fn mark_render_pending(
+            &mut self,
+            environment_id: &str,
+            pending_key: &str,
+        ) -> anyhow::Result<()> {
+            if let Some(environment) = self.environments.get_mut(environment_id) {
+                environment.desired_render_key = Some(pending_key.to_string());
+            }
             Ok(())
         }
     }
