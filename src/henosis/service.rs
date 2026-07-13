@@ -1,6 +1,6 @@
 use crate::BorsContext;
 use crate::bors::Comment;
-use crate::bors::event::WorkflowRunCompleted;
+use crate::bors::event::{PushToBranch, WorkflowRunCompleted};
 use crate::database::WorkflowStatus;
 use crate::github::{GithubRepoName, PullRequest, PullRequestNumber};
 use crate::henosis::config::{HenosisConfig, PreviewMode};
@@ -17,8 +17,8 @@ use crate::henosis::environment::{
 use crate::henosis::gate::{CliGateExecutor, GateExecutor};
 use crate::henosis::github::{
     GitHubMergeExecutor, GithubComponentPackageReader, GithubDeployRepoWriter,
-    GithubDevManifestReader, GithubGateCheckReporter, GithubImageDigestResolver, GithubPrCommenter,
-    GithubRepoValidationChecker, deploy_manifest_url,
+    GithubDevManifestBumper, GithubDevManifestReader, GithubGateCheckReporter,
+    GithubImageDigestResolver, GithubPrCommenter, GithubRepoValidationChecker, deploy_manifest_url,
 };
 use crate::henosis::queue::{
     ADVISORY_FAILED_STATUS, ADVISORY_PASSED_STATUS, AdvisoryGateStore, CheckConclusion,
@@ -603,6 +603,40 @@ pub async fn reconcile_status_for_pr(
         vec![PullRequestKey::new(repo.to_string(), pr_number.0)],
     )
     .await
+}
+
+pub async fn reconcile_dev_pin_after_component_push(
+    ctx: &BorsContext,
+    payload: &PushToBranch,
+) -> anyhow::Result<bool> {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        return Ok(false);
+    };
+    let Some(component) = config.component_for_repo(&payload.repository.to_string()) else {
+        return Ok(false);
+    };
+    if payload.branch != component.main_branch {
+        return Ok(false);
+    }
+
+    let queue_store = PgQueueStore::new(ctx.db.pool().clone());
+    if queue_store
+        .has_gate_run_for_merge_commit_sha(&payload.sha)
+        .await?
+    {
+        return Ok(true);
+    }
+
+    let bump = GithubDevManifestBumper::new(&ctx.repositories, config)
+        .bump_component(&component.name, &component.repo, &payload.sha)
+        .await?;
+    tracing::info!(
+        component = component.name,
+        source_sha = payload.sha,
+        dev_bump = bump.commit_sha,
+        "Reconciled dev pin after component main-branch push"
+    );
+    Ok(true)
 }
 
 pub async fn handle_render_workflow_completed(

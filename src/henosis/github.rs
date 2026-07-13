@@ -683,20 +683,28 @@ impl<'a> GithubDevManifestBumper<'a> {
             config,
         }
     }
-}
 
-impl DevManifestBumper for GithubDevManifestBumper<'_> {
-    async fn bump_dev_manifest(
+    pub async fn bump_component(
         &self,
-        gate_run: &GateRun,
-        merge_commit_sha: &str,
+        name: &str,
+        repo: &str,
+        commit_sha: &str,
     ) -> anyhow::Result<DevBump> {
-        let deploy_repo: GithubRepoName = self.config.deploy_repo.parse().map_err(|error| {
-            anyhow::anyhow!("Invalid deploy repo `{}`: {error}", self.config.deploy_repo)
-        })?;
+        self.bump_components(&[(name, repo)], commit_sha).await
+    }
+
+    async fn bump_components(
+        &self,
+        components: &[(&str, &str)],
+        commit_sha: &str,
+    ) -> anyhow::Result<DevBump> {
+        let deploy_repo_name: GithubRepoName =
+            self.config.deploy_repo.parse().map_err(|error| {
+                anyhow::anyhow!("Invalid deploy repo `{}`: {error}", self.config.deploy_repo)
+            })?;
         let deploy_repo = self
             .repositories
-            .get(&deploy_repo)
+            .get(&deploy_repo_name)
             .with_context(|| format!("Repository `{}` is not loaded", self.config.deploy_repo))?;
 
         let current = deploy_repo
@@ -706,38 +714,43 @@ impl DevManifestBumper for GithubDevManifestBumper<'_> {
         let mut manifest =
             manifest::parse_toml(&current.content).context("Cannot parse dev manifest")?;
         let digest = GithubImageDigestResolver::new(self.repositories);
+        let mut changed = false;
 
-        for component in gate_run
-            .world
-            .components
-            .iter()
-            .filter(|component| component.candidate)
-        {
+        for (name, repo) in components {
             let resolved_digest = digest
-                .image_digest(&component.repo, merge_commit_sha)
+                .image_digest(repo, commit_sha)
                 .await?
-                .unwrap_or_else(|| synthetic_digest_for_ref(merge_commit_sha));
-            manifest.components.insert(
-                component.name.clone(),
-                ComponentEntry::Pinned(PinnedEntry {
-                    repo: component.repo.clone(),
-                    r#ref: merge_commit_sha.to_string(),
-                    digest: resolved_digest,
-                }),
-            );
+                .unwrap_or_else(|| synthetic_digest_for_ref(commit_sha));
+            let pin = ComponentEntry::Pinned(PinnedEntry {
+                repo: (*repo).to_string(),
+                r#ref: commit_sha.to_string(),
+                digest: resolved_digest,
+            });
+            if manifest.components.get(*name) != Some(&pin) {
+                manifest.components.insert((*name).to_string(), pin);
+                changed = true;
+            }
         }
 
-        let serialized = manifest::to_toml(&manifest).context("Cannot serialize dev manifest")?;
-        let commit_sha = deploy_repo
-            .client
-            .write_file_to_branch(
-                &self.config.dev_manifest_path,
-                &self.config.manifest_branch,
-                "Bump Henosis dev manifest",
-                &serialized,
-            )
-            .await?;
-        let commit_sha = commit_sha.to_string();
+        let commit_sha = if changed {
+            let serialized =
+                manifest::to_toml(&manifest).context("Cannot serialize dev manifest")?;
+            deploy_repo
+                .client
+                .write_file_to_branch(
+                    &self.config.dev_manifest_path,
+                    &self.config.manifest_branch,
+                    "Bump Henosis dev manifest",
+                    &serialized,
+                )
+                .await?
+        } else {
+            deploy_repo
+                .client
+                .get_branch_sha(&self.config.manifest_branch)
+                .await?
+        }
+        .to_string();
 
         Ok(DevBump {
             commit_url: format!(
@@ -746,6 +759,23 @@ impl DevManifestBumper for GithubDevManifestBumper<'_> {
             ),
             commit_sha,
         })
+    }
+}
+
+impl DevManifestBumper for GithubDevManifestBumper<'_> {
+    async fn bump_dev_manifest(
+        &self,
+        gate_run: &GateRun,
+        merge_commit_sha: &str,
+    ) -> anyhow::Result<DevBump> {
+        let components = gate_run
+            .world
+            .components
+            .iter()
+            .filter(|component| component.candidate)
+            .map(|component| (component.name.as_str(), component.repo.as_str()))
+            .collect::<Vec<_>>();
+        self.bump_components(&components, merge_commit_sha).await
     }
 }
 

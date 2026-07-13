@@ -587,6 +587,25 @@ impl PgQueueStore {
         }
     }
 
+    pub async fn has_gate_run_for_merge_commit_sha(
+        &self,
+        commit_sha: &str,
+    ) -> anyhow::Result<bool> {
+        sqlx::query_scalar(
+            r#"
+SELECT EXISTS(
+    SELECT 1
+    FROM gate_run
+    WHERE merge_commit_sha = $1
+)
+"#,
+        )
+        .bind(commit_sha)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn pull_requests_for_dev_bump_commit_sha(
         &self,
         commit_sha: &str,

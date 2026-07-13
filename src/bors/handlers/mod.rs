@@ -31,7 +31,9 @@ use crate::database::{DelegatedPermission, DelegationStatus, PullRequestModel};
 use crate::github::{
     CommitSha, GithubUser, LabelTrigger, PullRequest, PullRequestInfo, PullRequestNumber,
 };
-use crate::henosis::service::handle_render_workflow_completed;
+use crate::henosis::service::{
+    handle_render_workflow_completed, reconcile_dev_pin_after_component_push,
+};
 use crate::permissions::PermissionType;
 use crate::{PgDbClient, TeamApiClient, load_repositories};
 use anyhow::Context;
@@ -56,6 +58,10 @@ mod review;
 mod squash;
 mod trybuild;
 mod workflow;
+
+fn command_failure_comment(error: &anyhow::Error) -> String {
+    format!(":x: **Command failed.**\n\n```text\nerror: {error:#}\n```")
+}
 
 /// This function executes a single bors repository event
 pub async fn handle_bors_repository_event(
@@ -99,9 +105,7 @@ pub async fn handle_bors_repository_event(
                 repo.client
                     .post_comment(
                         pr_number,
-                        Comment::new(
-                            ":x: Encountered an error while executing command".to_string(),
-                        ),
+                        Comment::new(command_failure_comment(&error)),
                         &db,
                     )
                     .await
@@ -230,6 +234,9 @@ pub async fn handle_bors_repository_event(
             let span =
                 tracing::info_span!("Pushed to branch", repo = payload.repository.to_string());
 
+            reconcile_dev_pin_after_component_push(&ctx, &payload)
+                .instrument(span.clone())
+                .await?;
             handle_push_to_branch(repo, db, senders.mergeability_queue(), payload)
                 .instrument(span.clone())
                 .await?;
@@ -1274,6 +1281,19 @@ mod tests {
         BorsBuilder, BorsTester, Comment, Commit, GitHub, Repo, User, default_repo_name, run_test,
     };
 
+    #[test]
+    fn command_failure_comment_includes_full_diagnostic_chain() {
+        let error = anyhow::anyhow!(
+            "Component-spec inspector returned unknown dependency 'service-e' for 'service-f'"
+        )
+        .context("Cannot collect preview component specs");
+
+        assert_eq!(
+            super::command_failure_comment(&error),
+            ":x: **Command failed.**\n\n```text\nerror: Cannot collect preview component specs: Component-spec inspector returned unknown dependency 'service-e' for 'service-f'\n```"
+        );
+    }
+
     fn henosis_config() -> HenosisConfig {
         toml::from_str(
             r#"
@@ -2014,6 +2034,37 @@ digest = "sha256:service-b"
             insta::assert_snapshot!(ctx.get_next_comment_text(()).await?, @r#"Unknown command "foo". Run `@bors help` or go to <https://bors-test.com/help> to see available commands."#);
             Ok(())
         })
+            .await;
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn henosis_component_main_push_reconciles_dev_pin(pool: sqlx::PgPool) {
+        BorsBuilder::new(pool)
+            .github(henosis_github())
+            .henosis_config(henosis_config())
+            .run_test(async |ctx: &mut BorsTester| {
+                ctx.push_to_branch("main", Commit::new("new-main-sha", "direct push"))
+                    .await?;
+
+                let manifest = ctx.modify_repo(default_repo_name(), |repo| {
+                    crate::henosis::manifest::parse_toml(
+                        &repo
+                            .get_file("dev.toml")
+                            .expect("dev manifest should exist"),
+                    )
+                    .unwrap()
+                });
+                assert!(matches!(
+                    manifest.components.get("borstest"),
+                    Some(crate::henosis::manifest::ComponentEntry::Pinned(pin))
+                        if pin.r#ref == "new-main-sha"
+                            && pin.digest
+                                == crate::henosis::manifest::synthetic_digest_for_ref(
+                                    "new-main-sha"
+                                )
+                ));
+                Ok(())
+            })
             .await;
     }
 
