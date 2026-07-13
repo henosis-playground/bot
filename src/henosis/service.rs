@@ -25,7 +25,8 @@ use crate::henosis::queue::{
     RecordedGateRun, advisory_gate_external_id,
 };
 use crate::henosis::render_diagnostics::{
-    fallback_render_failure_diagnostic, generate_render_failure_diagnostic, render_failure_comment,
+    DiagnosticPresentation, RenderFailureDiagnostic, fallback_render_failure_diagnostic,
+    generate_render_failure_diagnostic, render_failure_comment,
 };
 use crate::henosis::status::{
     StatusSnapshot, remove_status_section, render_status_section, upsert_status_section,
@@ -613,11 +614,18 @@ pub async fn handle_render_workflow_completed(
         WorkflowStatus::Failure => RenderStatus::Failure,
         WorkflowStatus::Pending => return Ok(true),
     };
-    let excerpt = if status == RenderStatus::Failure {
+    let diagnostic = if status == RenderStatus::Failure {
         Some(render_failure_diagnostic(ctx, payload).await)
     } else {
         None
     };
+    let excerpt = diagnostic
+        .as_ref()
+        .map(|diagnostic| diagnostic.body.clone());
+    let presentation = diagnostic
+        .as_ref()
+        .map(|diagnostic| diagnostic.presentation)
+        .unwrap_or(DiagnosticPresentation::RawText);
 
     let environment_store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let environments = if config.core_api.is_some() {
@@ -649,6 +657,7 @@ pub async fn handle_render_workflow_completed(
                     &member.key,
                     &outcome,
                     "environment",
+                    presentation,
                 )
                 .await?;
             }
@@ -674,8 +683,15 @@ pub async fn handle_render_workflow_completed(
         environment_store.record_render_outcome(&outcome).await?;
         if should_post_render_failure(&previous, &outcome) {
             for key in &merged_prs {
-                post_render_failure_comment(ctx, &environment_store, key, &outcome, "environment")
-                    .await?;
+                post_render_failure_comment(
+                    ctx,
+                    &environment_store,
+                    key,
+                    &outcome,
+                    "environment",
+                    presentation,
+                )
+                .await?;
             }
         }
         reconcile_status_for_keys(ctx, merged_prs).await?;
@@ -933,8 +949,15 @@ async fn record_core_render_outcome(
     if should_post_render_failure(&previous, outcome) {
         for member in store.active_members(&outcome.environment_id).await? {
             if failure_presentations.is_empty() {
-                post_render_failure_comment(ctx, store, &member.key, outcome, "environment")
-                    .await?;
+                post_render_failure_comment(
+                    ctx,
+                    store,
+                    &member.key,
+                    outcome,
+                    "environment",
+                    DiagnosticPresentation::RawText,
+                )
+                .await?;
             } else {
                 for presentation in failure_presentations {
                     let mut diagnostic_outcome = outcome.clone();
@@ -945,6 +968,7 @@ async fn record_core_render_outcome(
                         &member.key,
                         &diagnostic_outcome,
                         &presentation.consumer,
+                        presentation.presentation,
                     )
                     .await?;
                 }
@@ -970,7 +994,10 @@ fn should_post_render_failure(previous: &Option<RenderOutcome>, outcome: &Render
             .unwrap_or(true)
 }
 
-async fn render_failure_diagnostic(ctx: &BorsContext, payload: &WorkflowRunCompleted) -> String {
+async fn render_failure_diagnostic(
+    ctx: &BorsContext,
+    payload: &WorkflowRunCompleted,
+) -> RenderFailureDiagnostic {
     let Some(repo) = ctx.repositories.get(&payload.repository) else {
         return fallback_render_failure_diagnostic(payload);
     };
@@ -992,6 +1019,7 @@ async fn post_render_failure_comment(
     key: &PullRequestKey,
     outcome: &RenderOutcome,
     consumer: &str,
+    presentation: DiagnosticPresentation,
 ) -> anyhow::Result<()> {
     let repo_name: GithubRepoName = key
         .repo
@@ -1001,7 +1029,7 @@ async fn post_render_failure_comment(
         .repositories
         .get(&repo_name)
         .with_context(|| format!("Repository `{repo_name}` is not loaded"))?;
-    let body = render_failure_comment(outcome);
+    let body = render_failure_comment(outcome, presentation);
     let comment = repo
         .client
         .post_comment(

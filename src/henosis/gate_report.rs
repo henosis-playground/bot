@@ -120,17 +120,16 @@ fn render_component_failure(failure: &GateFailure) -> String {
     .unwrap();
     writeln!(body, "```text").unwrap();
     writeln!(body, "error: {}", sentence(&failure.message)).unwrap();
-    if let Some(source_url) = &failure.source_url {
-        writeln!(body, "--> [source]({source_url})").unwrap();
-    } else {
-        writeln!(body, "--> {} source", failure.consumer).unwrap();
-    }
+    writeln!(body, "--> {} source", failure.consumer).unwrap();
     writeln!(
         body,
         "note: the @henosis/platform-k8s Resources capability accepts only requests and limits"
     )
     .unwrap();
     writeln!(body, "```").unwrap();
+    if let Some(source_url) = &failure.source_url {
+        writeln!(body, "\n[source]({source_url})").unwrap();
+    }
     if failure.message.contains("Resources field") {
         writeln!(
             body,

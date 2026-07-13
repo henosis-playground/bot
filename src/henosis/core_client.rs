@@ -25,6 +25,7 @@ use crate::henosis::environment::{
 use crate::henosis::gate_report::{GateFailure, GateReport};
 use crate::henosis::graph::{ComponentGraph, ComponentPackageReader, ComponentRef};
 use crate::henosis::manifest::{self, ComponentEntry, Manifest, PinnedEntry};
+use crate::henosis::render_diagnostics::DiagnosticPresentation;
 
 const K8S_CONNECTOR: &str = "k8s";
 const COMPONENT_CONTEXT_API_VERSION: &str = "henosis.dev/k8s-component-context/v1";
@@ -63,6 +64,7 @@ pub struct CoreGraphStatus {
 pub struct CoreFailurePresentation {
     pub consumer: String,
     pub body: String,
+    pub presentation: DiagnosticPresentation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -851,6 +853,7 @@ fn format_diagnostics(reports: &[&SliceReport]) -> (Option<String>, Vec<CoreFail
                 failures: vec![failure],
             }
             .pr_comment(),
+            presentation: DiagnosticPresentation::Markdown,
         })
         .collect::<Vec<_>>();
     failures.extend(
@@ -860,6 +863,7 @@ fn format_diagnostics(reports: &[&SliceReport]) -> (Option<String>, Vec<CoreFail
             .map(|diagnostic| CoreFailurePresentation {
                 consumer: "environment".to_string(),
                 body: format_diagnostic(diagnostic),
+                presentation: DiagnosticPresentation::RawText,
             }),
     );
     let combined = (!failures.is_empty()).then(|| {

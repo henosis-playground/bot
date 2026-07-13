@@ -16,10 +16,22 @@ static ANSI_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-?]*[ -/
 static TIMESTAMP_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s*").unwrap());
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticPresentation {
+    Markdown,
+    RawText,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderFailureDiagnostic {
+    pub body: String,
+    pub presentation: DiagnosticPresentation,
+}
+
 pub async fn generate_render_failure_diagnostic(
     client: &GithubRepositoryClient,
     payload: &WorkflowRunCompleted,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<RenderFailureDiagnostic> {
     let jobs = client.get_jobs_for_workflow_run(payload.run_id).await?;
     let Some(job) = jobs.iter().find(|job| job_failed(job)) else {
         return Ok(fallback_render_failure_diagnostic(payload));
@@ -34,11 +46,16 @@ pub async fn generate_render_failure_diagnostic(
     ))
 }
 
-pub fn fallback_render_failure_diagnostic(payload: &WorkflowRunCompleted) -> String {
+pub fn fallback_render_failure_diagnostic(
+    payload: &WorkflowRunCompleted,
+) -> RenderFailureDiagnostic {
     render_failure_diagnostic(payload, None, None, None)
 }
 
-pub fn render_failure_comment(outcome: &RenderOutcome) -> String {
+pub fn render_failure_comment(
+    outcome: &RenderOutcome,
+    presentation: DiagnosticPresentation,
+) -> String {
     let diagnostic = outcome
         .excerpt
         .as_deref()
@@ -48,17 +65,16 @@ pub fn render_failure_comment(outcome: &RenderOutcome) -> String {
         .strip_prefix("generation:")
         .map(|generation| format!("at graph generation `{generation}`"))
         .unwrap_or_else(|| format!("for commit `{}`", outcome.commit_sha));
-    if diagnostic.starts_with("**Henosis merge gate failed") {
-        return format!(
+    match presentation {
+        DiagnosticPresentation::Markdown => format!(
             "couldn't materialise environment `{}` {revision}.\n\n{}\n\n[render run]({})",
             outcome.environment_id, diagnostic, outcome.run_url
-        );
+        ),
+        DiagnosticPresentation::RawText => format!(
+            "couldn't materialise environment `{}` {revision}.\n\n<details><summary>render log</summary>\n\n```text\n{}\n```\n\n</details>\n\n[render run]({})",
+            outcome.environment_id, diagnostic, outcome.run_url
+        ),
     }
-
-    format!(
-        "couldn't materialise environment `{}` {revision}.\n\n<details><summary>render log</summary>\n\n```text\n{}\n```\n\n</details>\n\n[render run]({})",
-        outcome.environment_id, diagnostic, outcome.run_url
-    )
 }
 
 fn render_failure_diagnostic(
@@ -66,12 +82,15 @@ fn render_failure_diagnostic(
     job: Option<&Job>,
     step: Option<&Step>,
     logs: Option<&str>,
-) -> String {
+) -> RenderFailureDiagnostic {
     if let Some(report) = logs.and_then(structured_gate_report) {
-        return report.pr_comment();
+        return RenderFailureDiagnostic {
+            body: report.pr_comment(),
+            presentation: DiagnosticPresentation::Markdown,
+        };
     }
 
-    match logs.and_then(|logs| log_excerpt(logs, step.map(|step| step.name.as_str()))) {
+    let body = match logs.and_then(|logs| log_excerpt(logs, step.map(|step| step.name.as_str()))) {
         Some(excerpt) => excerpt,
         None if job.is_some() => {
             "No ##[error] lines were available for the failed job.".to_string()
@@ -80,6 +99,10 @@ fn render_failure_diagnostic(
             "{} failed for commit `{}` on `{}`, but no failed job logs were available.",
             payload.name, payload.commit_sha, payload.branch
         ),
+    };
+    RenderFailureDiagnostic {
+        body,
+        presentation: DiagnosticPresentation::RawText,
     }
 }
 
@@ -198,8 +221,11 @@ fn runner_housekeeping_line(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{log_excerpt, render_failure_comment, structured_gate_report};
+    use super::{
+        DiagnosticPresentation, log_excerpt, render_failure_comment, structured_gate_report,
+    };
     use crate::henosis::environment::{RenderOutcome, RenderStatus};
+    use crate::henosis::gate_report::{GateFailure, GateReport};
 
     #[test]
     fn strips_timestamps_ansi_and_keeps_error_context() {
@@ -299,20 +325,100 @@ mod tests {
 
     #[test]
     fn rich_render_failure_comment_is_not_wrapped_as_raw_log() {
-        let diagnostic =
-            "**Henosis merge gate failed — `service-a` violates its own output contract.**";
-        let body = render_failure_comment(&RenderOutcome {
-            environment_id: "dev".to_string(),
-            commit_sha: "aaaaaaaa".to_string(),
-            status: RenderStatus::Failure,
-            run_url: "https://github.com/henosis-playground/deploy/actions/runs/1".to_string(),
-            excerpt: Some(diagnostic.to_string()),
-            generation: None,
-            publication: None,
-        });
+        let diagnostic = "**Henosis component validation failed — `service-a` could not compile.**\n\n```text\nerror: unsupported field\n```\n\n[source](https://example.com/source)\n\nhelp: fix it";
+        let body = render_failure_comment(
+            &RenderOutcome {
+                environment_id: "dev".to_string(),
+                commit_sha: "aaaaaaaa".to_string(),
+                status: RenderStatus::Failure,
+                run_url: "https://github.com/henosis-playground/deploy/actions/runs/1".to_string(),
+                excerpt: Some(diagnostic.to_string()),
+                generation: None,
+                publication: None,
+            },
+            DiagnosticPresentation::Markdown,
+        );
 
         assert!(body.contains(diagnostic));
         assert!(!body.contains("<details><summary>render log</summary>"));
-        assert!(!body.contains("```text"));
+        assert_eq!(body.matches("```text").count(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "calls GitHub's Markdown rendering API"]
+    async fn github_renders_component_failure_as_balanced_actionable_html() {
+        let source_url = "https://github.com/henosis-playground/service-a/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/henosis/src/index.ts#L29";
+        let run_url = "https://henosis.skuld.systems/graphs/preview_test/generations/1";
+        let diagnostic = GateReport {
+            ok: false,
+            failures: vec![GateFailure {
+                consumer: "service-a".to_string(),
+                producer: "unknown".to_string(),
+                pinned_sha: None,
+                resolved_sha: Some("a".repeat(40)),
+                outputs_schema_at_pinned: None,
+                outputs_schema_at_resolved: None,
+                consumed_paths: Vec::new(),
+                kind: "compile".to_string(),
+                message: "service-a uses unsupported Resources field cpu; Resources is { requests?, limits? }".to_string(),
+                excerpt: "src/index.ts:29:9 - error TS2353".to_string(),
+                source_url: Some(source_url.to_string()),
+            }],
+        }
+        .pr_comment();
+        let original = render_failure_comment(
+            &RenderOutcome {
+                environment_id: "preview_test".to_string(),
+                commit_sha: "generation:1".to_string(),
+                status: RenderStatus::Failure,
+                run_url: run_url.to_string(),
+                excerpt: Some(diagnostic),
+                generation: Some(1),
+                publication: None,
+            },
+            DiagnosticPresentation::Markdown,
+        );
+        let markdown = format!(
+            "✅ **Resolved in generation 2.**\n\n<details><summary>Earlier generation 1 diagnostic for service-a</summary>\n\n{original}\n\n</details>"
+        );
+        let token = std::env::var("GITHUB_TOKEN").unwrap_or_else(|_| {
+            let path = std::env::var("HENOSIS_GITHUB_TOKEN_FILE")
+                .expect("GITHUB_TOKEN or HENOSIS_GITHUB_TOKEN_FILE is required");
+            std::fs::read_to_string(path)
+                .expect("GitHub token file must be readable")
+                .trim()
+                .to_string()
+        });
+        let response = reqwest::Client::new()
+            .post("https://api.github.com/markdown")
+            .header(reqwest::header::USER_AGENT, "henosis-render-regression")
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "text": markdown,
+                "mode": "gfm",
+                "context": "henosis-playground/service-a"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        assert_eq!(response.matches("<details").count(), 1);
+        assert_eq!(response.matches("</details>").count(), 1);
+        assert_eq!(response.matches("<pre").count(), 1);
+        assert!(response.contains(&format!("href=\"{source_url}\"")));
+        assert!(response.contains(&format!("href=\"{run_url}\"")));
+        let heading = response
+            .find("Henosis component validation failed")
+            .unwrap();
+        let code_block = response.find("<pre").unwrap();
+        let code_block_end = response.find("</pre>").unwrap();
+        let help = response.find("help:").unwrap();
+        assert!(heading < code_block);
+        assert!(code_block_end < help);
     }
 }
