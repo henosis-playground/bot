@@ -540,8 +540,10 @@ fn superseded_generation(
     latest_generation: Option<u64>,
 ) -> Option<u64> {
     let generation = json_u64(record.pointer("/state/durable/graph/generation"))?;
-    let latest = latest_generation.filter(|latest| *latest > generation)?;
-    (!generation_is_terminal(record)).then_some(latest)
+    latest_generation.filter(|latest| *latest > generation)?;
+    (!generation_is_terminal(record))
+        .then(|| generation.checked_add(1))
+        .flatten()
 }
 
 fn generation_is_terminal(record: &serde_json::Value) -> bool {
