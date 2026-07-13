@@ -60,7 +60,13 @@ mod trybuild;
 mod workflow;
 
 fn command_failure_comment(error: &anyhow::Error) -> String {
-    format!(":x: **Command failed.**\n\n```text\nerror: {error:#}\n```")
+    let root_cause = error.root_cause().to_string();
+    let diagnostic = root_cause
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(root_cause.as_str());
+    format!(":x: **Command failed.**\n\n```text\nerror: {diagnostic}\n```")
 }
 
 /// This function executes a single bors repository event
@@ -1284,13 +1290,13 @@ mod tests {
     #[test]
     fn command_failure_comment_includes_full_diagnostic_chain() {
         let error = anyhow::anyhow!(
-            "Component-spec inspector returned unknown dependency 'service-e' for 'service-f'"
+            "Component-spec inspector failed: setup noise\nComponent-spec inspector returned unknown dependency 'service-e' for 'service-f'"
         )
         .context("Cannot collect preview component specs");
 
         assert_eq!(
             super::command_failure_comment(&error),
-            ":x: **Command failed.**\n\n```text\nerror: Cannot collect preview component specs: Component-spec inspector returned unknown dependency 'service-e' for 'service-f'\n```"
+            ":x: **Command failed.**\n\n```text\nerror: Component-spec inspector returned unknown dependency 'service-e' for 'service-f'\n```"
         );
     }
 
