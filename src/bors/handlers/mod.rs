@@ -1317,6 +1317,44 @@ manifest_path = "dev.toml"
     const CORE_PUSH_SHA: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
     fn henosis_core_config(endpoint: &str) -> HenosisConfig {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap().keep();
+        let inspector = directory.join("inspect.py");
+        std::fs::write(
+            &inspector,
+            r#"#!/usr/bin/env python3
+import base64
+import json
+import sys
+import tomllib
+
+manifest_path = sys.argv[1]
+output_path = sys.argv[sys.argv.index("--output") + 1]
+with open(manifest_path, "rb") as source:
+    manifest = tomllib.load(source)
+components = {}
+for name, pin in manifest["components"].items():
+    context = {
+        "apiVersion": "henosis.dev/k8s-component-context/v1",
+        "environment": {"id": manifest["environment"]["id"]},
+        "source": {"repository": pin["repo"], "revision": pin["ref"]},
+        "image": {"digest": pin["digest"]},
+    }
+    components[name] = {
+        "connector": "k8s",
+        "outputsSchema": base64.b64encode(b'{"kind":"object"}').decode(),
+        "connectorContext": base64.b64encode(json.dumps(context, separators=(",", ":")).encode()).decode(),
+    }
+with open(output_path, "w") as destination:
+    json.dump({"apiVersion": "henosis.dev/component-spec-inspection/v1", "components": components}, destination)
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&inspector).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&inspector, permissions).unwrap();
+
         toml::from_str(&format!(
             r#"
 deploy_repo = "rust-lang/borstest"
@@ -1326,6 +1364,7 @@ preview_mode = "on-demand"
 [core_api]
 endpoint = "{endpoint}"
 token = "test-core-token"
+component_spec_command = {inspector:?}
 
 [[components]]
 name = "borstest"
@@ -1447,12 +1486,19 @@ digest = "sha256:{}"
             } else {
                 Vec::new()
             };
+            let publication = (self.report == MockCoreReport::Ready).then(|| {
+                json!({
+                    "revision": "ready",
+                    "uri": "https://example.test/ready"
+                })
+            });
             vec![json!({
                 "graphId": graph["id"],
                 "generation": graph["generation"],
                 "connector": "k8s",
                 "dispositions": dispositions,
                 "diagnostics": diagnostics,
+                "publication": publication,
                 "sequence": graph["generation"]
             })]
         }

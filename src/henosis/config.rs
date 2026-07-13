@@ -44,8 +44,8 @@ pub struct CoreApiConfig {
     pub endpoint: String,
     #[serde(default)]
     pub presentation_endpoint: Option<String>,
-    #[serde(default)]
-    pub output_schema_command: Option<String>,
+    #[serde(default, alias = "output_schema_command")]
+    pub component_spec_command: Option<String>,
     pub token: CoreApiToken,
 }
 
@@ -350,6 +350,7 @@ deploy_repo = "henosis-playground/deploy"
 [core_api]
 endpoint = "https://core.henosis.dev"
 presentation_endpoint = "https://henosis.skuld.systems"
+output_schema_command = "/usr/local/bin/henosis-inspect"
 token = "super-secret"
 
 [[environments]]
@@ -365,7 +366,10 @@ manifest_path = "dev.toml"
             core_api.presentation_endpoint.as_deref(),
             Some("https://henosis.skuld.systems")
         );
-        assert_eq!(core_api.output_schema_command, None);
+        assert_eq!(
+            core_api.component_spec_command.as_deref(),
+            Some("/usr/local/bin/henosis-inspect")
+        );
         assert_eq!(core_api.token.expose(), "super-secret");
         assert_eq!(format!("{:?}", core_api.token), "[REDACTED]");
     }

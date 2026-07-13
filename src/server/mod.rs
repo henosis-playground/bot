@@ -3,6 +3,7 @@ use crate::bors::{CommandPrefix, RepositoryState, format_help};
 use crate::database::{ApprovalStatus, QueueStatus};
 use crate::github::{GithubRepoName, PullRequestNumber, rollup};
 use crate::henosis::core_client::CoreClient;
+use crate::henosis::generation::{GenerationState, derive_generation};
 use crate::templates::{
     HelpTemplate, HtmlTemplate, NotFoundTemplate, PullRequestStats, QueueTemplate, RepositoryView,
     RollupsInfo,
@@ -19,6 +20,7 @@ use axum::{Json, Router};
 use axum_embed::ServeEmbed;
 use base64::Engine as _;
 use chrono::Utc;
+use henosis_proto::proto::henosis::v1::{ComponentDispositionKind, SliceReport};
 use http::{Request, StatusCode};
 use pulldown_cmark::Parser;
 use rust_embed::Embed;
@@ -26,7 +28,7 @@ use serde::de::Error;
 use serde::{Deserialize, Deserializer};
 use sqlx::Row as _;
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -353,6 +355,28 @@ fn render_generation_page(
     view: &GraphPageView,
 ) -> String {
     let generation = json_u64(record.pointer("/state/durable/graph/generation")).unwrap_or(0);
+    let reports = record
+        .pointer("/state/reports")
+        .cloned()
+        .and_then(|reports| serde_json::from_value::<Vec<SliceReport>>(reports).ok())
+        .unwrap_or_default();
+    let expected_components = record
+        .pointer("/state/durable/graph/componentSpecHashes")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(|hash| base64::engine::general_purpose::STANDARD.decode(hash).ok())
+        .collect::<BTreeSet<_>>();
+    let presentation = derive_generation(generation, &expected_components, &reports).ok();
+    let generation_state = presentation
+        .as_ref()
+        .map(|presentation| presentation.state)
+        .unwrap_or(GenerationState::Reconciling);
+    let selected_reports = presentation
+        .as_ref()
+        .map(|presentation| presentation.reports.as_slice())
+        .unwrap_or_default();
     let as_of_lifecycle = record
         .get("currentLifecycle")
         .and_then(serde_json::Value::as_str)
@@ -366,7 +390,7 @@ fn render_generation_page(
         GraphPageView::Latest { .. } => None,
         GraphPageView::Generation {
             latest_generation, ..
-        } => superseded_generation(record, *latest_generation),
+        } => superseded_generation(generation, generation_state, *latest_generation),
     };
     let last_published = json_u64(record.get("lastPublishedGeneration"));
     let title = label
@@ -404,72 +428,25 @@ fn render_generation_page(
             })
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
             .unwrap_or_default();
-        let repo = context
-            .pointer("/source/repository")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-        let revision = context
-            .pointer("/source/revision")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-        let pull_request = members
-            .get(&(name.to_string(), revision.to_string()))
-            .map(|(repo, number)| {
-                format!(
-                    " · <a href=\"https://github.com/{}/pull/{}\">PR #{}</a>",
-                    escape_html(repo),
-                    number,
-                    number
-                )
-            })
-            .unwrap_or_default();
+        let source = component_source(&context, name, members);
         component_rows.push_str(&format!(
-            "<tr><td><strong>{}</strong><br><small>{}</small></td><td><a href=\"https://github.com/{}/tree/{}\"><code>{}</code></a>{}</td><td>{}</td><td>{}</td></tr>",
-            escape_html(name), escape_html(hash), escape_html(repo), escape_html(revision), escape_html(short_revision(revision)),
-            pull_request, disposition_for(record, hash, superseded_by.is_some()), outputs_for(record, hash)
+            "<tr><td><strong>{}</strong><br><small>{}</small></td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(name),
+            escape_html(hash),
+            source,
+            disposition_for(selected_reports, hash, superseded_by.is_some()),
+            outputs_for(selected_reports, hash)
         ));
     }
-    let reports = record
-        .pointer("/state/reports")
-        .and_then(serde_json::Value::as_array);
-    let publication = reports
-        .into_iter()
-        .flatten()
-        .find_map(|report| report.get("publication"));
-    let publication_html = publication
-        .and_then(|publication| {
-            Some(format!(
-                "<a href=\"{}\"><code>{}</code></a>",
-                escape_html(publication.get("uri")?.as_str()?),
-                escape_html(short_revision(publication.get("revision")?.as_str()?))
-            ))
-        })
-        .unwrap_or_else(|| "not published".to_string());
-    let diagnostics = reports
-        .into_iter()
-        .flatten()
-        .flat_map(|report| {
-            report
-                .get("diagnostics")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-        })
+    let publication_html = connector_publications(selected_reports);
+    let diagnostics = selected_reports
+        .iter()
+        .flat_map(|report| &report.diagnostics)
         .map(|diagnostic| {
             format!(
                 "<details><summary>{}: {}</summary><pre>{}</pre></details>",
-                escape_html(
-                    diagnostic
-                        .get("code")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("diagnostic")
-                ),
-                escape_html(
-                    diagnostic
-                        .get("message")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                ),
+                escape_html(diagnostic.code.as_deref().unwrap_or("diagnostic")),
+                escape_html(diagnostic.message.as_deref().unwrap_or("")),
                 escape_html(&serde_json::to_string_pretty(diagnostic).unwrap_or_default())
             )
         })
@@ -486,15 +463,15 @@ fn render_generation_page(
         } => current_lifecycle.as_deref() == Some("retired"),
     };
     let generation_status = if superseded_by.is_some() {
-        "superseded before a terminal report".to_string()
-    } else if publication.is_some() {
-        "published".to_string()
-    } else if generation_is_terminal(record) {
-        "terminal report received; not published".to_string()
-    } else if current_graph_is_retired {
-        "graph retired; no terminal connector report recorded for this generation".to_string()
+        "superseded before convergence".to_string()
     } else {
-        "reconciling; no terminal connector report recorded yet".to_string()
+        match (generation_state, current_graph_is_retired) {
+            (GenerationState::Reconciling, true) => "graph retired; not converged".to_string(),
+            (GenerationState::PartiallyPublished, true) => {
+                "partially published; graph retired before convergence".to_string()
+            }
+            (state, _) => state.as_str().to_string(),
+        }
     };
     let audit_context = match view {
         GraphPageView::Latest { .. } => format!(
@@ -509,49 +486,78 @@ fn render_generation_page(
     let superseded_notice = superseded_by
         .map(|latest| {
             format!(
-                "<aside><strong>Superseded by <a href=\"/graphs/{environment_id}/generations/{latest}\">generation {latest}</a></strong> before a terminal report was received.<br><small>This is current audit context; the component rows retain the last observation recorded for generation {generation}.</small></aside>",
+                "<aside><strong>Superseded by <a href=\"/graphs/{environment_id}/generations/{latest}\">generation {latest}</a></strong> before convergence.<br><small>This is current audit context; the component rows retain the last observation recorded for generation {generation}.</small></aside>",
                 environment_id = escape_html(environment_id),
             )
         })
         .unwrap_or_default();
     format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><title>Henosis generation {generation}</title><style>body{{font:16px system-ui;max-width:1100px;margin:3rem auto;padding:0 1rem;color:#202124}}table{{border-collapse:collapse;width:100%}}th,td{{text-align:left;vertical-align:top;border-bottom:1px solid #ddd;padding:.65rem}}code,pre{{font-family:ui-monospace,monospace}}pre{{white-space:pre-wrap;background:#f6f8fa;padding:1rem}}small{{color:#666}}aside{{margin:1rem 0;padding:1rem;border-left:4px solid #bf8700;background:#fff8c5}}</style></head><body><h1>{title}</h1>{superseded_notice}<table><tr><th>Lifecycle</th><td>{lifecycle}</td></tr><tr><th>Requested generation</th><td>{generation}</td></tr><tr><th>Generation status</th><td>{generation_status}</td></tr><tr><th>Last published generation</th><td>{last_published}</td></tr><tr><th>Publication</th><td>{publication_html}</td></tr><tr><th>Audit data</th><td>{audit_context}</td></tr></table><h2>Components</h2><table><thead><tr><th>Component</th><th>Source SHA</th><th>Disposition</th><th>Reported outputs</th></tr></thead><tbody>{component_rows}</tbody></table><h2>Diagnostics</h2>{diagnostics}</body></html>"#,
+        r#"<!doctype html><html><head><meta charset="utf-8"><title>Henosis generation {generation}</title><style>body{{font:16px system-ui;max-width:1100px;margin:3rem auto;padding:0 1rem;color:#202124}}table{{border-collapse:collapse;width:100%}}th,td{{text-align:left;vertical-align:top;border-bottom:1px solid #ddd;padding:.65rem}}code,pre{{font-family:ui-monospace,monospace}}pre{{white-space:pre-wrap;background:#f6f8fa;padding:1rem}}small{{color:#666}}aside{{margin:1rem 0;padding:1rem;border-left:4px solid #bf8700;background:#fff8c5}}</style></head><body><h1>{title}</h1>{superseded_notice}<table><tr><th>Lifecycle</th><td>{lifecycle}</td></tr><tr><th>Requested generation</th><td>{generation}</td></tr><tr><th>Generation status</th><td>{generation_status}</td></tr><tr><th>Last connector publication generation</th><td>{last_published}</td></tr><tr><th>Connector publications</th><td>{publication_html}</td></tr><tr><th>Audit data</th><td>{audit_context}</td></tr></table><h2>Components</h2><table><thead><tr><th>Component</th><th>Source SHA</th><th>Disposition</th><th>Reported outputs</th></tr></thead><tbody>{component_rows}</tbody></table><h2>Diagnostics</h2>{diagnostics}</body></html>"#,
         last_published = last_published
             .map(|value| value.to_string())
             .unwrap_or_else(|| "none".to_string()),
     )
 }
 
-fn disposition_for(record: &serde_json::Value, hash: &str, superseded: bool) -> String {
-    let observed = record
-        .pointer("/state/reports")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .flat_map(|report| {
-            report
-                .get("dispositions")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
+fn component_source(
+    context: &serde_json::Value,
+    name: &str,
+    members: &HashMap<(String, String), (String, u64)>,
+) -> String {
+    let Some(repo) = context
+        .pointer("/source/repository")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return "not reported by connector".to_string();
+    };
+    let Some(revision) = context
+        .pointer("/source/revision")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return "not reported by connector".to_string();
+    };
+    let pull_request = members
+        .get(&(name.to_string(), revision.to_string()))
+        .map(|(repo, number)| {
+            format!(
+                " · <a href=\"https://github.com/{}/pull/{}\">PR #{}</a>",
+                escape_html(repo),
+                number,
+                number
+            )
         })
-        .find(|disposition| {
-            disposition
-                .get("componentSpecHash")
-                .and_then(serde_json::Value::as_str)
-                == Some(hash)
+        .unwrap_or_default();
+    format!(
+        "<a href=\"https://github.com/{}/tree/{}\"><code>{}</code></a>{}",
+        escape_html(repo),
+        escape_html(revision),
+        escape_html(short_revision(revision)),
+        pull_request
+    )
+}
+
+fn disposition_for(reports: &[&SliceReport], hash: &str, superseded: bool) -> String {
+    let hash = base64::engine::general_purpose::STANDARD.decode(hash).ok();
+    let observed = reports
+        .iter()
+        .flat_map(|report| &report.dispositions)
+        .find(|disposition| disposition.component_spec_hash.as_deref() == hash.as_deref())
+        .and_then(|disposition| disposition.kind.as_ref()?.as_known())
+        .map(|kind| match kind {
+            ComponentDispositionKind::Pending => "pending",
+            ComponentDispositionKind::Reconciling => "reconciling",
+            ComponentDispositionKind::Ready => "ready",
+            ComponentDispositionKind::Failed => "failed",
+            _ => "pending",
         })
-        .and_then(|disposition| disposition.get("kind").and_then(serde_json::Value::as_str))
-        .unwrap_or("PENDING")
-        .trim_start_matches("COMPONENT_DISPOSITION_KIND_")
-        .to_ascii_lowercase();
+        .unwrap_or("pending");
     if superseded {
         format!(
             "superseded<br><small>last report: {}</small>",
-            escape_html(&observed)
+            escape_html(observed)
         )
     } else {
-        observed
+        observed.to_string()
     }
 }
 
@@ -570,66 +576,53 @@ fn display_lifecycle(lifecycle: &str) -> String {
 }
 
 fn superseded_generation(
-    record: &serde_json::Value,
+    generation: u64,
+    state: GenerationState,
     latest_generation: Option<u64>,
 ) -> Option<u64> {
-    let generation = json_u64(record.pointer("/state/durable/graph/generation"))?;
-    latest_generation.filter(|latest| *latest > generation)?;
-    (!generation_is_terminal(record))
-        .then(|| generation.checked_add(1))
-        .flatten()
+    latest_generation.filter(|latest| *latest > generation && !state.is_terminal())
 }
 
-fn generation_is_terminal(record: &serde_json::Value) -> bool {
-    record
-        .pointer("/state/reports")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|reports| {
-            reports.iter().any(|report| {
-                report.get("publication").is_some()
-                    || report
-                        .get("diagnostics")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|diagnostics| !diagnostics.is_empty())
-                    || report
-                        .get("dispositions")
-                        .and_then(serde_json::Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .any(|disposition| {
-                            disposition.get("kind").and_then(serde_json::Value::as_str)
-                                == Some("COMPONENT_DISPOSITION_KIND_FAILED")
-                        })
-            })
+fn connector_publications(reports: &[&SliceReport]) -> String {
+    let publications = reports
+        .iter()
+        .filter_map(|report| {
+            let connector = report.connector.as_deref()?;
+            let publication = report.publication.as_option()?;
+            Some((
+                connector,
+                (
+                    publication.revision.as_deref()?,
+                    publication.uri.as_deref()?,
+                ),
+            ))
         })
-}
-
-fn outputs_for(record: &serde_json::Value, hash: &str) -> String {
-    record
-        .pointer("/state/reports")
-        .and_then(serde_json::Value::as_array)
+        .collect::<BTreeMap<_, _>>();
+    if publications.is_empty() {
+        return "none reported".to_string();
+    }
+    publications
         .into_iter()
-        .flatten()
-        .flat_map(|report| {
-            report
-                .get("outputs")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
+        .map(|(connector, (revision, uri))| {
+            format!(
+                "<strong>{}</strong>: <a href=\"{}\"><code>{}</code></a>",
+                escape_html(connector),
+                escape_html(uri),
+                escape_html(short_revision(revision))
+            )
         })
-        .find(|output| {
-            output
-                .get("componentSpecHash")
-                .and_then(serde_json::Value::as_str)
-                == Some(hash)
-        })
-        .and_then(|output| output.get("valuesJson").and_then(serde_json::Value::as_str))
-        .and_then(|encoded| {
-            base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .ok()
-        })
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn outputs_for(reports: &[&SliceReport], hash: &str) -> String {
+    let hash = base64::engine::general_purpose::STANDARD.decode(hash).ok();
+    reports
+        .iter()
+        .flat_map(|report| &report.outputs)
+        .find(|output| output.component_spec_hash.as_deref() == hash.as_deref())
+        .and_then(|output| output.values_json.as_deref())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
         .map(|value| {
             format!(
                 "<pre>{}</pre>",
@@ -993,11 +986,83 @@ pub async fn github_webhook_handler(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::henosis::config::HenosisConfig;
     use crate::tests::{ApiRequest, BorsBuilder, BorsTester, default_repo_name, run_test};
     use serde_json::{Value, json};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    #[test]
+    fn mixed_generation_page_never_presents_partial_publication_as_success() {
+        let first = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1_u8; 32]);
+        let second = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [2_u8; 32]);
+        let record = json!({
+            "state": {
+                "durable": {
+                    "graph": {
+                        "generation": "2",
+                        "componentSpecHashes": [&first, &second]
+                    },
+                    "lifecycle": "GRAPH_LIFECYCLE_ACTIVE"
+                },
+                "reports": [
+                    {
+                        "generation": "2",
+                        "connector": "k8s",
+                        "sequence": "7",
+                        "dispositions": [{
+                            "componentSpecHash": &first,
+                            "kind": "COMPONENT_DISPOSITION_KIND_READY"
+                        }],
+                        "publication": {
+                            "revision": "8b47754200000000000000000000000000000000",
+                            "uri": "https://example.test/k8s"
+                        }
+                    },
+                    {
+                        "generation": "2",
+                        "connector": "supabase",
+                        "sequence": "9",
+                        "dispositions": [{
+                            "componentSpecHash": &second,
+                            "kind": "COMPONENT_DISPOSITION_KIND_FAILED"
+                        }],
+                        "diagnostics": [{
+                            "code": "supabase.plan.migration-checksum",
+                            "message": "migration checksum does not match",
+                            "severity": "DIAGNOSTIC_SEVERITY_ERROR"
+                        }]
+                    }
+                ]
+            },
+            "components": [
+                {"hash": &first, "spec": {"name": "service-a", "connector": "k8s"}},
+                {"hash": &second, "spec": {"name": "service-d", "connector": "supabase"}}
+            ],
+            "currentLifecycle": "GRAPH_LIFECYCLE_ACTIVE",
+            "lastPublishedGeneration": "2"
+        });
+
+        let page = render_generation_page(
+            "preview_test",
+            None,
+            &record,
+            &HashMap::new(),
+            &GraphPageView::Latest {
+                lifecycle: "active".to_string(),
+            },
+        );
+
+        assert!(page.contains("<th>Generation status</th><td>failed</td>"));
+        assert!(page.contains("<th>Connector publications</th><td><strong>k8s</strong>:"));
+        assert!(page.contains("service-d"));
+        assert!(page.contains("<td>failed</td>"));
+        assert!(page.contains("supabase.plan.migration-checksum"));
+        assert!(page.contains("not reported by connector"));
+        assert!(!page.contains("https://github.com/unknown/tree/unknown"));
+        assert!(!page.contains("<th>Generation status</th><td>published</td>"));
+    }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn api_queue_page(pool: sqlx::PgPool) {
@@ -1098,7 +1163,7 @@ manifest_path = "dev.toml"
                     .assert_ok()
                     .into_body();
                 assert!(latest.contains("<th>Lifecycle</th><td>retired</td>"));
-                assert!(latest.contains("graph retired; no terminal connector report recorded"));
+                assert!(latest.contains("graph retired; not converged"));
                 assert!(latest.contains("<h2>Diagnostics</h2>none reported"));
                 assert!(latest.contains("last generation 3"));
                 assert!(latest.contains("immutable as-of evidence"));
@@ -1111,7 +1176,7 @@ manifest_path = "dev.toml"
                     .assert_ok()
                     .into_body();
                 assert!(immutable.contains("<th>Lifecycle</th><td>active</td>"));
-                assert!(immutable.contains("graph retired; no terminal connector report recorded"));
+                assert!(immutable.contains("graph retired; not converged"));
                 assert!(!immutable.contains("immutable as-of evidence"));
 
                 let superseded = ctx

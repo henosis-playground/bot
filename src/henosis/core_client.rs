@@ -6,30 +6,30 @@ use base64::Engine;
 use futures::StreamExt;
 use henosis_proto::proto::henosis::v1::__buffa::oneof::watch_graph_response::Item as WatchItem;
 use henosis_proto::proto::henosis::v1::{
-    AddComponentsRequest, AddComponentsResponse, ComponentDispositionKind, ComponentReplacement,
-    ComponentSpec, ContractFailureKind, CreateGraphRequest, CreateGraphResponse, Diagnostic,
-    DiagnosticSeverity, GetGraphGenerationRequest, GetGraphGenerationResponse, GetGraphRequest,
-    GetGraphResponse, Graph, GraphLifecycle, GraphState, RegisterComponentSpecRequest,
-    RegisterComponentSpecResponse, RemoveComponentsRequest, RemoveComponentsResponse,
-    RetireGraphRequest, RetireGraphResponse, SliceReport, UpdateComponentsRequest,
-    UpdateComponentsResponse, WatchGraphRequest, WatchGraphResponse,
+    AddComponentsRequest, AddComponentsResponse, ComponentReplacement, ComponentSpec,
+    ContractFailureKind, CreateGraphRequest, CreateGraphResponse, Diagnostic,
+    GetGraphGenerationRequest, GetGraphGenerationResponse, GetGraphRequest, GetGraphResponse,
+    Graph, GraphLifecycle, GraphState, RegisterComponentSpecRequest, RegisterComponentSpecResponse,
+    RemoveComponentsRequest, RemoveComponentsResponse, RetireGraphRequest, RetireGraphResponse,
+    SliceReport, UpdateComponentsRequest, UpdateComponentsResponse, WatchGraphRequest,
+    WatchGraphResponse,
 };
 use newtype_uuid::{GenericUuid, TypedUuid, TypedUuidKind, TypedUuidTag};
 use reqwest::{Client, StatusCode};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::henosis::config::{CoreApiConfig, RegisteredComponent};
 use crate::henosis::environment::{
     DeployRepoWriter, DeployWriteResult, EnvironmentIdGenerator, PublicationLink, RenderStatus,
 };
 use crate::henosis::gate_report::{GateFailure, GateReport};
+use crate::henosis::generation::{GenerationState, derive_generation};
 use crate::henosis::graph::{ComponentGraph, ComponentPackageReader, ComponentRef};
 use crate::henosis::manifest::{self, ComponentEntry, Manifest, PinnedEntry};
 use crate::henosis::render_diagnostics::DiagnosticPresentation;
 
-const K8S_CONNECTOR: &str = "k8s";
-const COMPONENT_CONTEXT_API_VERSION: &str = "henosis.dev/k8s-component-context/v1";
+const COMPONENT_SPEC_INSPECTION_API_VERSION: &str = "henosis.dev/component-spec-inspection/v1";
 const WATCH_INITIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum PreviewEnvironmentKind {}
@@ -128,21 +128,45 @@ fn ui_links_from_generation_json(
         }
     }
 
-    let outputs = record
+    let output_levels = record
         .pointer("/state/durable/publishedOutputs")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|level| {
-            level.get("connector").and_then(serde_json::Value::as_str) == Some(K8S_CONNECTOR)
-                && json_u64(level.get("generation")) == generation
-        })
-        .max_by_key(|level| json_u64(level.get("publicationSequence")).unwrap_or(0))
-        .and_then(|level| level.get("outputs"))
-        .and_then(serde_json::Value::as_array);
-    let values_by_hash = outputs
+        .filter(|level| json_u64(level.get("generation")) == generation)
+        .collect::<Vec<_>>();
+    let latest_sequences =
+        output_levels
+            .iter()
+            .fold(BTreeMap::<&str, u64>::new(), |mut latest, level| {
+                if let (Some(connector), Some(sequence)) = (
+                    level.get("connector").and_then(serde_json::Value::as_str),
+                    json_u64(level.get("publicationSequence")),
+                ) {
+                    latest
+                        .entry(connector)
+                        .and_modify(|current| *current = (*current).max(sequence))
+                        .or_insert(sequence);
+                }
+                latest
+            });
+    let values_by_hash = output_levels
         .into_iter()
-        .flatten()
+        .filter(|level| {
+            level
+                .get("connector")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|connector| latest_sequences.get(connector))
+                .copied()
+                == json_u64(level.get("publicationSequence"))
+        })
+        .flat_map(|level| {
+            level
+                .get("outputs")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+        })
         .filter_map(|output| {
             let hash = output.get("componentSpecHash")?.as_str()?.to_string();
             let encoded = output.get("valuesJson")?.as_str()?;
@@ -226,9 +250,35 @@ fn json_u64(value: Option<&serde_json::Value>) -> Option<u64> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlannedComponentSpec {
     name: String,
+    connector: String,
     dependencies: Vec<String>,
     outputs_schema: Vec<u8>,
     connector_context: Vec<u8>,
+    dependency_spec_hash_slots: Vec<DependencySpecHashSlot>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ComponentSpecInspection {
+    api_version: String,
+    components: BTreeMap<String, InspectedComponentSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InspectedComponentSpec {
+    connector: String,
+    outputs_schema: String,
+    connector_context: String,
+    #[serde(default)]
+    dependency_spec_hash_slots: Vec<DependencySpecHashSlot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DependencySpecHashSlot {
+    component: String,
+    pointer: String,
 }
 
 #[derive(Clone)]
@@ -568,12 +618,19 @@ impl CoreClient {
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
             depends_on.sort_unstable();
+            let connector_context = materialize_connector_context(
+                &planned.name,
+                planned.connector_context,
+                &planned.dependency_spec_hash_slots,
+                &planned.dependencies,
+                &hashes,
+            )?;
             let spec = ComponentSpec {
                 name: Some(planned.name.clone()),
-                connector: Some(K8S_CONNECTOR.to_string()),
+                connector: Some(planned.connector.clone()),
                 outputs_schema: Some(planned.outputs_schema),
                 depends_on,
-                connector_context: Some(planned.connector_context),
+                connector_context: Some(connector_context),
                 ..Default::default()
             };
             let request = RegisterComponentSpecRequest {
@@ -677,11 +734,52 @@ impl CoreClient {
     }
 }
 
+fn materialize_connector_context(
+    component: &str,
+    context: Vec<u8>,
+    slots: &[DependencySpecHashSlot],
+    dependencies: &[String],
+    hashes: &BTreeMap<String, Vec<u8>>,
+) -> anyhow::Result<Vec<u8>> {
+    if slots.is_empty() {
+        return Ok(context);
+    }
+    let mut context: serde_json::Value = serde_json::from_slice(&context).with_context(|| {
+        format!("Connector context for `{component}` has dependency slots but is not JSON")
+    })?;
+    for slot in slots {
+        anyhow::ensure!(
+            dependencies.contains(&slot.component),
+            "Connector context for `{component}` references undeclared dependency `{}`",
+            slot.component
+        );
+        let hash = hashes.get(&slot.component).with_context(|| {
+            format!(
+                "Connector context for `{component}` references unregistered dependency `{}`",
+                slot.component
+            )
+        })?;
+        let target = context.pointer_mut(&slot.pointer).with_context(|| {
+            format!(
+                "Connector context for `{component}` has no dependency hash slot at `{}`",
+                slot.pointer
+            )
+        })?;
+        *target = serde_json::Value::Array(
+            hash.iter()
+                .map(|byte| serde_json::Value::from(*byte))
+                .collect(),
+        );
+    }
+    serde_json::to_vec(&context)
+        .with_context(|| format!("Cannot encode materialized connector context for `{component}`"))
+}
+
 pub struct CoreGraphWriter<'a, R> {
     client: CoreClient,
     components: Vec<RegisteredComponent>,
     package_reader: &'a R,
-    output_schema_command: Option<String>,
+    component_spec_command: Option<String>,
 }
 
 impl<'a, R> CoreGraphWriter<'a, R> {
@@ -694,7 +792,7 @@ impl<'a, R> CoreGraphWriter<'a, R> {
             client: CoreClient::new(config)?,
             components,
             package_reader,
-            output_schema_command: config.output_schema_command.clone(),
+            component_spec_command: config.component_spec_command.clone(),
         })
     }
 }
@@ -707,15 +805,15 @@ impl<R: ComponentPackageReader> DeployRepoWriter for CoreGraphWriter<'_, R> {
     ) -> anyhow::Result<DeployWriteResult> {
         let manifest = manifest::parse_toml(contents)
             .context("Cannot parse resolved preview world at core boundary")?;
-        let output_schemas = match self.output_schema_command.as_deref() {
-            Some(command) => collect_output_schemas(command, contents).await?,
-            None => BTreeMap::new(),
-        };
+        let command = self.component_spec_command.as_deref().context(
+            "Core preview collection requires a TypeScript component-spec inspector; components without the TS authoring pattern are unsupported",
+        )?;
+        let inspected_specs = collect_component_specs(command, contents).await?;
         let specs = graph_component_specs(
             &manifest,
             &self.components,
             self.package_reader,
-            &output_schemas,
+            inspected_specs,
         )
         .await?;
         let generation = self
@@ -747,7 +845,7 @@ async fn graph_component_specs<R: ComponentPackageReader>(
     manifest: &Manifest,
     registered: &[RegisteredComponent],
     package_reader: &R,
-    output_schemas: &BTreeMap<String, Vec<u8>>,
+    mut inspected_specs: BTreeMap<String, InspectedComponentSpec>,
 ) -> anyhow::Result<Vec<PlannedComponentSpec>> {
     let pins = resolved_pins(manifest)?;
     let refs = registered
@@ -765,65 +863,96 @@ async fn graph_component_specs<R: ComponentPackageReader>(
         .collect::<anyhow::Result<Vec<_>>>()?;
     let package_graph = ComponentGraph::read(&refs, package_reader).await?;
 
-    registered
+    let specs = registered
         .iter()
         .map(|registered| {
             validate_component_name(&registered.name)?;
-            let pin = pins.get(&registered.name).expect("checked above");
-            validate_pin(pin)?;
             let node = package_graph.node(&registered.name).with_context(|| {
                 format!("Package graph omitted component `{}`", registered.name)
             })?;
-            let context = component_context(&manifest.environment.id, pin)?;
+            let inspected = inspected_specs.remove(&registered.name).with_context(|| {
+                format!(
+                    "Component-spec inspector omitted registered component `{}`",
+                    registered.name
+                )
+            })?;
+            anyhow::ensure!(
+                !inspected.connector.is_empty(),
+                "Component-spec inspector returned an empty connector for `{}`",
+                registered.name
+            );
             Ok(PlannedComponentSpec {
                 name: registered.name.clone(),
+                connector: inspected.connector,
                 dependencies: node.dependencies.iter().cloned().collect(),
-                outputs_schema: output_schemas
-                    .get(&registered.name)
-                    .cloned()
-                    .unwrap_or_default(),
-                connector_context: context,
+                outputs_schema: decode_inspected_bytes(
+                    &registered.name,
+                    "outputsSchema",
+                    &inspected.outputs_schema,
+                )?,
+                connector_context: decode_inspected_bytes(
+                    &registered.name,
+                    "connectorContext",
+                    &inspected.connector_context,
+                )?,
+                dependency_spec_hash_slots: inspected.dependency_spec_hash_slots,
             })
         })
-        .collect()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        inspected_specs.is_empty(),
+        "Component-spec inspector returned unknown components: {}",
+        inspected_specs
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(specs)
 }
 
-async fn collect_output_schemas(
+async fn collect_component_specs(
     command: &str,
     manifest: &str,
-) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
-    let directory = tempfile::tempdir().context("Cannot create output-schema workspace")?;
+) -> anyhow::Result<BTreeMap<String, InspectedComponentSpec>> {
+    let directory = tempfile::tempdir().context("Cannot create component-spec workspace")?;
     let manifest_path = directory.path().join("world.toml");
-    let output_path = directory.path().join("schemas.json");
+    let output_path = directory.path().join("component-specs.json");
     tokio::fs::write(&manifest_path, manifest)
         .await
-        .context("Cannot write output-schema manifest")?;
+        .context("Cannot write component-spec manifest")?;
     let output = tokio::process::Command::new(command)
         .arg(&manifest_path)
         .arg("--output")
         .arg(&output_path)
         .output()
         .await
-        .with_context(|| format!("Cannot run output-schema collector `{command}`"))?;
+        .with_context(|| format!("Cannot run component-spec inspector `{command}`"))?;
     anyhow::ensure!(
         output.status.success(),
-        "Output-schema collector `{command}` failed: {}",
+        "Component-spec inspector `{command}` failed: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    let schemas: BTreeMap<String, serde_json::Value> = serde_json::from_slice(
+    let inspection: ComponentSpecInspection = serde_json::from_slice(
         &tokio::fs::read(&output_path)
             .await
-            .context("Output-schema collector omitted schemas.json")?,
+            .context("Component-spec inspector omitted component-specs.json")?,
     )
-    .context("Cannot decode collected output schemas")?;
-    schemas
-        .into_iter()
-        .map(|(name, schema)| {
-            serde_json::to_vec(&schema)
-                .map(|schema| (name, schema))
-                .context("Cannot encode collected output schema")
+    .context("Cannot decode component-spec inspection")?;
+    anyhow::ensure!(
+        inspection.api_version == COMPONENT_SPEC_INSPECTION_API_VERSION,
+        "Unsupported component-spec inspection API version `{}`",
+        inspection.api_version
+    );
+    Ok(inspection.components)
+}
+
+fn decode_inspected_bytes(component: &str, field: &str, encoded: &str) -> anyhow::Result<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .with_context(|| {
+            format!("Component-spec inspector returned invalid {field} bytes for `{component}`")
         })
-        .collect()
 }
 
 fn resolved_pins(manifest: &Manifest) -> anyhow::Result<BTreeMap<String, &PinnedEntry>> {
@@ -837,76 +966,6 @@ fn resolved_pins(manifest: &Manifest) -> anyhow::Result<BTreeMap<String, &Pinned
             )),
         })
         .collect()
-}
-
-#[derive(Serialize)]
-struct ComponentContext<'a> {
-    #[serde(rename = "apiVersion")]
-    api_version: &'static str,
-    environment: ContextEnvironment<'a>,
-    source: ContextSource<'a>,
-    image: ContextImage<'a>,
-}
-
-#[derive(Serialize)]
-struct ContextEnvironment<'a> {
-    id: &'a str,
-}
-
-#[derive(Serialize)]
-struct ContextSource<'a> {
-    repository: &'a str,
-    revision: &'a str,
-}
-
-#[derive(Serialize)]
-struct ContextImage<'a> {
-    digest: &'a str,
-}
-
-fn component_context(environment_id: &str, pin: &PinnedEntry) -> anyhow::Result<Vec<u8>> {
-    serde_json::to_vec(&ComponentContext {
-        api_version: COMPONENT_CONTEXT_API_VERSION,
-        environment: ContextEnvironment { id: environment_id },
-        source: ContextSource {
-            repository: &pin.repo,
-            revision: &pin.r#ref,
-        },
-        image: ContextImage {
-            digest: &pin.digest,
-        },
-    })
-    .context("Cannot serialize Kubernetes component context v1")
-}
-
-fn validate_pin(pin: &PinnedEntry) -> anyhow::Result<()> {
-    let repository_parts = pin.repo.split('/').collect::<Vec<_>>();
-    anyhow::ensure!(
-        repository_parts.len() == 2
-            && repository_parts.iter().all(|part| !part.is_empty())
-            && !pin.repo.ends_with(".git"),
-        "component repository `{}` is not a GitHub owner/name",
-        pin.repo
-    );
-    anyhow::ensure!(
-        pin.r#ref.len() == 40
-            && pin
-                .r#ref
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
-        "component revision `{}` is not a full lowercase Git commit SHA",
-        pin.r#ref
-    );
-    let digest = pin.digest.strip_prefix("sha256:").unwrap_or_default();
-    anyhow::ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
-        "image digest `{}` is not a lowercase sha256 OCI digest",
-        pin.digest
-    );
-    Ok(())
 }
 
 fn validate_component_name(name: &str) -> anyhow::Result<()> {
@@ -965,77 +1024,29 @@ fn graph_status(state: &GraphState) -> anyhow::Result<CoreGraphStatus> {
     let generation = graph
         .generation
         .context("Graph state omitted graph generation")?;
-    let current_reports = state
-        .reports
-        .iter()
-        .filter(|report| {
-            report.connector.as_deref() == Some(K8S_CONNECTOR)
-                && report.generation == Some(generation)
-        })
-        .collect::<Vec<_>>();
-    anyhow::ensure!(
-        current_reports
-            .iter()
-            .all(|report| report.sequence.is_some()),
-        "Current-generation k8s report omitted durable sequence"
-    );
-    let sequence = current_reports
-        .iter()
-        .filter_map(|report| report.sequence)
-        .max();
-    let reports = current_reports
-        .into_iter()
-        .filter(|report| report.sequence == sequence)
-        .collect::<Vec<_>>();
-    let (diagnostic, failure_presentations) = format_diagnostics(&reports);
-    let publication = reports.iter().find_map(|report| {
-        report.publication.as_option().and_then(|publication| {
-            Some(PublicationLink {
-                revision: publication.revision.as_deref()?.to_string(),
-                url: publication.uri.as_deref()?.to_string(),
-            })
-        })
-    });
-    let failed = reports.iter().any(|report| {
-        report.dispositions.iter().any(|disposition| {
-            disposition.kind.as_ref().and_then(|kind| kind.as_known())
-                == Some(ComponentDispositionKind::Failed)
-        }) || report.diagnostics.iter().any(|diagnostic| {
-            diagnostic
-                .severity
-                .as_ref()
-                .and_then(|severity| severity.as_known())
-                == Some(DiagnosticSeverity::Error)
-        })
-    });
-    let reported_ids = reports
-        .iter()
-        .flat_map(|report| report.dispositions.iter())
-        .filter_map(|disposition| disposition.component_spec_hash.as_deref())
-        .collect::<BTreeSet<_>>();
-    let ready_ids = reports
-        .iter()
-        .flat_map(|report| report.dispositions.iter())
-        .filter(|disposition| {
-            disposition.kind.as_ref().and_then(|kind| kind.as_known())
-                == Some(ComponentDispositionKind::Ready)
-        })
-        .filter_map(|disposition| disposition.component_spec_hash.as_deref())
-        .collect::<BTreeSet<_>>();
-    let expected_ids = graph
+    let expected_components = graph
         .component_spec_hashes
         .iter()
-        .map(Vec::as_slice)
+        .cloned()
         .collect::<BTreeSet<_>>();
-
-    let status = if failed {
-        RenderStatus::Failure
-    } else if !expected_ids.is_empty() && reported_ids == expected_ids && ready_ids == expected_ids
-    {
-        RenderStatus::Success
+    let presentation = derive_generation(generation, &expected_components, &state.reports)?;
+    let (diagnostic, failure_presentations) = format_diagnostics(&presentation.reports);
+    let publication = if presentation.state == GenerationState::Converged {
+        let mut publications = presentation.reports.iter().filter_map(|report| {
+            report.publication.as_option().and_then(|publication| {
+                Some(PublicationLink {
+                    revision: publication.revision.as_deref()?.to_string(),
+                    url: publication.uri.as_deref()?.to_string(),
+                })
+            })
+        });
+        let publication = publications.next();
+        publication.filter(|_| publications.next().is_none())
     } else {
-        RenderStatus::Pending
+        None
     };
+    let status = presentation.state.render_status();
+    let sequence = presentation.sequence;
     Ok(CoreGraphStatus {
         generation,
         sequence,
@@ -1249,6 +1260,19 @@ mod tests {
         }
     }
 
+    fn inspected_spec(
+        connector: &str,
+        outputs_schema: &[u8],
+        connector_context: &[u8],
+    ) -> InspectedComponentSpec {
+        InspectedComponentSpec {
+            connector: connector.to_string(),
+            outputs_schema: base64::engine::general_purpose::STANDARD.encode(outputs_schema),
+            connector_context: base64::engine::general_purpose::STANDARD.encode(connector_context),
+            dependency_spec_hash_slots: Vec::new(),
+        }
+    }
+
     #[tokio::test]
     async fn boundary_emits_context_v1_and_package_graph_edges() {
         let environment_id = TypedUuid::<PreviewEnvironmentKind>::from_untyped_uuid(
@@ -1313,24 +1337,28 @@ mod tests {
             ]),
         };
 
-        let specs = graph_component_specs(&manifest, &registered, &reader, &BTreeMap::new())
+        let context = format!(
+            r#"{{"apiVersion":"henosis.dev/k8s-component-context/v1","environment":{{"id":"{environment_id}"}},"source":{{"repository":"henosis-playground/service-b","revision":"{b_sha}"}},"image":{{"digest":"sha256:{}"}}}}"#,
+            "b".repeat(64)
+        )
+        .into_bytes();
+        let inspected = BTreeMap::from([
+            (
+                "service-a".to_string(),
+                inspected_spec("k8s", br#"{"kind":"object"}"#, b"service-a"),
+            ),
+            (
+                "service-b".to_string(),
+                inspected_spec("k8s", br#"{"kind":"object"}"#, &context),
+            ),
+        ]);
+
+        let specs = graph_component_specs(&manifest, &registered, &reader, inspected)
             .await
             .unwrap();
+        assert_eq!(specs[1].connector, "k8s");
         assert_eq!(specs[1].dependencies, vec!["service-a"]);
-        let context: Value = serde_json::from_slice(&specs[1].connector_context).unwrap();
-        assert_eq!(context["apiVersion"], COMPONENT_CONTEXT_API_VERSION);
-        assert_eq!(context["environment"]["id"], environment_id);
-        assert_eq!(
-            context["source"],
-            json!({
-                "repository": "henosis-playground/service-b",
-                "revision": b_sha
-            })
-        );
-        assert_eq!(
-            context["image"]["digest"],
-            format!("sha256:{}", "b".repeat(64))
-        );
+        assert_eq!(specs[1].connector_context, context);
     }
 
     #[tokio::test]
@@ -1357,11 +1385,18 @@ mod tests {
                 );
                 let hash = match spec["name"].as_str().unwrap() {
                     "service-a" => {
+                        assert_eq!(spec["connector"], "k8s");
                         assert!(spec.get("dependsOn").is_none());
                         &registration_first_hash
                     }
                     "service-b" => {
+                        assert_eq!(spec["connector"], "supabase");
                         assert_eq!(spec["dependsOn"], json!([registration_first_hash.clone()]));
+                        let context = base64::engine::general_purpose::STANDARD
+                            .decode(spec["connectorContext"].as_str().unwrap())
+                            .unwrap();
+                        let context: Value = serde_json::from_slice(&context).unwrap();
+                        assert_eq!(context["producerSpecHash"], json!(vec![1_u8; 32]));
                         &registration_second_hash
                     }
                     name => panic!("unexpected component spec `{name}`"),
@@ -1420,15 +1455,22 @@ mod tests {
                 vec![
                     PlannedComponentSpec {
                         name: "service-b".to_string(),
+                        connector: "supabase".to_string(),
                         dependencies: vec!["service-a".to_string()],
                         outputs_schema: br#"{"kind":"object"}"#.to_vec(),
-                        connector_context: b"service-b".to_vec(),
+                        connector_context: br#"{"producerSpecHash":null}"#.to_vec(),
+                        dependency_spec_hash_slots: vec![DependencySpecHashSlot {
+                            component: "service-a".to_string(),
+                            pointer: "/producerSpecHash".to_string(),
+                        }],
                     },
                     PlannedComponentSpec {
                         name: "service-a".to_string(),
+                        connector: "k8s".to_string(),
                         dependencies: Vec::new(),
                         outputs_schema: br#"{"kind":"object"}"#.to_vec(),
                         connector_context: b"service-a".to_vec(),
+                        dependency_spec_hash_slots: Vec::new(),
                     },
                 ],
             )
@@ -1515,7 +1557,11 @@ mod tests {
                             "componentSpecHash": &second,
                             "kind": "COMPONENT_DISPOSITION_KIND_READY"
                         }
-                    ]
+                    ],
+                    "publication": {
+                        "revision": "ready",
+                        "uri": "https://example.test/ready"
+                    }
                 }
             ]
         }))
@@ -1527,6 +1573,61 @@ mod tests {
         assert_eq!(status.lifecycle, GraphLifecycle::Active);
         assert_eq!(status.status, RenderStatus::Success);
         assert_eq!(status.diagnostic, None);
+    }
+
+    #[test]
+    fn status_aggregates_failures_and_diagnostics_across_connectors() {
+        let first = base64::engine::general_purpose::STANDARD.encode([1_u8; 32]);
+        let second = base64::engine::general_purpose::STANDARD.encode([2_u8; 32]);
+        let state: GraphState = serde_json::from_value(json!({
+            "durable": {
+                "graph": {
+                    "generation": "2",
+                    "componentSpecHashes": [&first, &second]
+                },
+                "lifecycle": "GRAPH_LIFECYCLE_ACTIVE"
+            },
+            "reports": [
+                {
+                    "generation": "2",
+                    "connector": "k8s",
+                    "sequence": "7",
+                    "dispositions": [{
+                        "componentSpecHash": &first,
+                        "kind": "COMPONENT_DISPOSITION_KIND_READY"
+                    }],
+                    "publication": {
+                        "revision": "k8s-ready",
+                        "uri": "https://example.test/k8s-ready"
+                    }
+                },
+                {
+                    "generation": "2",
+                    "connector": "supabase",
+                    "sequence": "9",
+                    "dispositions": [{
+                        "componentSpecHash": &second,
+                        "kind": "COMPONENT_DISPOSITION_KIND_FAILED"
+                    }],
+                    "diagnostics": [{
+                        "code": "supabase.plan.migration-checksum",
+                        "message": "migration checksum does not match",
+                        "severity": "DIAGNOSTIC_SEVERITY_ERROR"
+                    }]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let status = graph_status(&state).unwrap();
+        assert_eq!(status.status, RenderStatus::Failure);
+        assert_eq!(status.sequence, Some(9));
+        assert_eq!(status.publication, None);
+        assert_eq!(
+            status.diagnostic.as_deref(),
+            Some("supabase.plan.migration-checksum: migration checksum does not match")
+        );
+        assert_eq!(status.failure_presentations.len(), 1);
     }
 
     #[test]
@@ -1575,15 +1676,24 @@ mod tests {
             "state": {
                 "durable": {
                     "graph": {"generation": "3"},
-                    "publishedOutputs": [{
-                        "generation": "3",
-                        "connector": "k8s",
-                        "publicationSequence": "9",
-                        "outputs": [
-                            {"componentSpecHash": first, "valuesJson": values(json!({"admin": "https://a.example/admin"}))},
-                            {"componentSpecHash": second, "valuesJson": values(json!({"app": "https://b.example/app"}))}
-                        ]
-                    }]
+                    "publishedOutputs": [
+                        {
+                            "generation": "3",
+                            "connector": "k8s",
+                            "publicationSequence": "9",
+                            "outputs": [
+                                {"componentSpecHash": first, "valuesJson": values(json!({"admin": "https://a.example/admin"}))}
+                            ]
+                        },
+                        {
+                            "generation": "3",
+                            "connector": "supabase",
+                            "publicationSequence": "11",
+                            "outputs": [
+                                {"componentSpecHash": second, "valuesJson": values(json!({"app": "https://b.example/app"}))}
+                            ]
+                        }
+                    ]
                 }
             },
             "components": [
