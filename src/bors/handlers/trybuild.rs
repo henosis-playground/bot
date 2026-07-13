@@ -36,6 +36,13 @@ pub(super) const TRY_MERGE_BRANCH_NAME: &str = "automation/bors/try-merge";
 ///
 /// If `parent` is set, it will use it as a base commit for the merge.
 /// Otherwise, it will use the latest commit on the main repository branch.
+pub(super) struct TryBuildOptions<'a> {
+    pub bot_prefix: &'a CommandPrefix,
+    pub commit_author: &'a CommitAuthor,
+    pub check_run_name: &'a str,
+    pub merge_commit_message_prefix: &'a str,
+}
+
 pub(super) async fn command_try_build(
     repo: Arc<RepositoryState>,
     db: Arc<PgDbClient>,
@@ -43,11 +50,14 @@ pub(super) async fn command_try_build(
     author: &GithubUser,
     parent: Option<Parent>,
     jobs: Vec<String>,
-    bot_prefix: &CommandPrefix,
-    commit_author: &CommitAuthor,
-    check_run_name: &str,
-    merge_commit_message_prefix: &str,
+    options: TryBuildOptions<'_>,
 ) -> anyhow::Result<()> {
+    let TryBuildOptions {
+        bot_prefix,
+        commit_author,
+        check_run_name,
+        merge_commit_message_prefix,
+    } = options;
     let repo = repo.as_ref();
     if !has_permission(repo, author, pr, PermissionType::Try).await? {
         deny_request(repo, &db, pr.number(), author, PermissionType::Try).await?;

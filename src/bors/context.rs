@@ -6,6 +6,16 @@ use crate::github::api::operations::CommitAuthor;
 use crate::henosis::config::HenosisConfig;
 use crate::{PgDbClient, bors::command::CommandParser, github::GithubRepoName};
 
+pub struct BorsContextOptions {
+    pub web_url: String,
+    pub henosis_config: Option<HenosisConfig>,
+    pub commit_author: CommitAuthor,
+    pub auto_build_check_run_name: String,
+    pub try_build_check_run_name: String,
+    pub merge_commit_message_prefix: String,
+    pub service_name: String,
+}
+
 pub struct BorsContext {
     pub parser: CommandParser,
     pub db: Arc<PgDbClient>,
@@ -26,26 +36,20 @@ impl BorsContext {
         db: Arc<PgDbClient>,
         repositories: Arc<RepositoryStore>,
         git: Option<Git>,
-        web_url: &str,
-        henosis_config: Option<HenosisConfig>,
-        commit_author: CommitAuthor,
-        auto_build_check_run_name: String,
-        try_build_check_run_name: String,
-        merge_commit_message_prefix: String,
-        service_name: String,
+        options: BorsContextOptions,
     ) -> Self {
         Self {
             parser,
             db,
             repositories,
-            henosis_config,
-            commit_author,
-            auto_build_check_run_name,
-            try_build_check_run_name,
-            merge_commit_message_prefix,
-            service_name,
+            henosis_config: options.henosis_config,
+            commit_author: options.commit_author,
+            auto_build_check_run_name: options.auto_build_check_run_name,
+            try_build_check_run_name: options.try_build_check_run_name,
+            merge_commit_message_prefix: options.merge_commit_message_prefix,
+            service_name: options.service_name,
             git,
-            web_url: web_url.trim_end_matches('/').to_string(),
+            web_url: options.web_url.trim_end_matches('/').to_string(),
         }
     }
 

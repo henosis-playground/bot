@@ -217,6 +217,11 @@ pub trait RepoValidationChecker {
     ) -> anyhow::Result<RepoValidationStatus>;
 }
 
+pub struct QueueHooks<'a, C, V> {
+    pub commenter: &'a C,
+    pub repo_validation: &'a V,
+}
+
 pub struct QueueManager {
     components: Vec<RegisteredComponent>,
 }
@@ -233,8 +238,7 @@ impl QueueManager {
         check_reporter: &R,
         gate_executor: &E,
         merge_executor: &M,
-        commenter: &C,
-        repo_validation: &V,
+        hooks: QueueHooks<'_, C, V>,
     ) -> anyhow::Result<Option<RecordedGateRun>>
     where
         S: QueueStore,
@@ -245,6 +249,10 @@ impl QueueManager {
         C: PrCommenter,
         V: RepoValidationChecker,
     {
+        let QueueHooks {
+            commenter,
+            repo_validation,
+        } = hooks;
         if !store.try_acquire_global_lock().await? {
             return Ok(None);
         }
@@ -256,8 +264,10 @@ impl QueueManager {
                 check_reporter,
                 gate_executor,
                 merge_executor,
-                commenter,
-                repo_validation,
+                QueueHooks {
+                    commenter,
+                    repo_validation,
+                },
             )
             .await;
         let release = store.release_global_lock().await;
@@ -276,8 +286,7 @@ impl QueueManager {
         check_reporter: &R,
         gate_executor: &E,
         merge_executor: &M,
-        commenter: &C,
-        repo_validation: &V,
+        hooks: QueueHooks<'_, C, V>,
     ) -> anyhow::Result<Option<RecordedGateRun>>
     where
         S: QueueStore,
@@ -288,6 +297,10 @@ impl QueueManager {
         C: PrCommenter,
         V: RepoValidationChecker,
     {
+        let QueueHooks {
+            commenter,
+            repo_validation,
+        } = hooks;
         if let Some(gate_run) = store.oldest_resumable_merge().await? {
             merge_executor.execute(&gate_run).await?;
             return Ok(Some(gate_run));
@@ -379,7 +392,7 @@ impl QueueManager {
                     &report.check_run_summary(),
                 )
                 .await?;
-            merge_executor.execute(&gate_run).await?;
+            merge_executor.execute(gate_run).await?;
         } else {
             let diagnostic = report.pr_comment();
             store
@@ -949,8 +962,10 @@ mod tests {
                 &reporter,
                 &executor,
                 &merge_executor,
-                &commenter,
-                &StaticRepoValidation(RepoValidationStatus::Current),
+                QueueHooks {
+                    commenter: &commenter,
+                    repo_validation: &StaticRepoValidation(RepoValidationStatus::Current),
+                },
             )
             .await
             .unwrap()
@@ -1019,8 +1034,10 @@ mod tests {
                 &reporter,
                 &executor,
                 &merge_executor,
-                &commenter,
-                &StaticRepoValidation(RepoValidationStatus::Current),
+                QueueHooks {
+                    commenter: &commenter,
+                    repo_validation: &StaticRepoValidation(RepoValidationStatus::Current),
+                },
             )
             .await
             .unwrap()
@@ -1071,8 +1088,10 @@ mod tests {
                 &reporter,
                 &executor,
                 &merge_executor,
-                &commenter,
-                &StaticRepoValidation(RepoValidationStatus::Current),
+                QueueHooks {
+                    commenter: &commenter,
+                    repo_validation: &StaticRepoValidation(RepoValidationStatus::Current),
+                },
             )
             .await
             .unwrap()

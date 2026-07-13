@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 pub use command::CommandParser;
 pub use command::RollupMode;
 pub use comment::Comment;
-pub use context::BorsContext;
+pub use context::{BorsContext, BorsContextOptions};
 pub use handlers::{handle_bors_global_event, handle_bors_repository_event};
 use itertools::Itertools;
 use octocrab::models::RunId;

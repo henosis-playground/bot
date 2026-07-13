@@ -224,6 +224,11 @@ pub struct EnvironmentManager {
     core_previews: bool,
 }
 
+pub struct JoinEnvironment<'a> {
+    pub pr: PreviewPullRequest,
+    pub name: &'a str,
+}
+
 impl EnvironmentManager {
     pub fn new(components: Vec<RegisteredComponent>) -> Self {
         Self {
@@ -407,8 +412,7 @@ impl EnvironmentManager {
         package_reader: &R,
         dev_manifests: &D,
         digest_resolver: &impl ImageDigestResolver,
-        pr: PreviewPullRequest,
-        name: &str,
+        request: JoinEnvironment<'_>,
     ) -> anyhow::Result<EnvironmentChange>
     where
         S: EnvironmentStore,
@@ -416,6 +420,7 @@ impl EnvironmentManager {
         R: ComponentPackageReader,
         D: DevManifestReader,
     {
+        let JoinEnvironment { pr, name } = request;
         let requested = name.trim();
         anyhow::ensure!(!requested.is_empty(), "Environment name must be specified");
         let target = if self.core_previews {
@@ -1309,8 +1314,10 @@ mod tests {
                 &packages,
                 &dev,
                 &digest,
-                service_a.clone(),
-                "shared-demo",
+                JoinEnvironment {
+                    pr: service_a.clone(),
+                    name: "shared-demo",
+                },
             )
             .await
             .unwrap();
@@ -1321,8 +1328,10 @@ mod tests {
                 &packages,
                 &dev,
                 &digest,
-                service_b.clone(),
-                "shared-demo",
+                JoinEnvironment {
+                    pr: service_b.clone(),
+                    name: "shared-demo",
+                },
             )
             .await
             .unwrap();
@@ -1391,8 +1400,10 @@ mod tests {
                 &packages,
                 &dev,
                 &digest,
-                service_a.clone(),
-                "shared-demo",
+                JoinEnvironment {
+                    pr: service_a.clone(),
+                    name: "shared-demo",
+                },
             )
             .await
             .unwrap();
@@ -1443,8 +1454,10 @@ mod tests {
                 &packages,
                 &dev,
                 &digest,
-                service_a.clone(),
-                "shared-demo",
+                JoinEnvironment {
+                    pr: service_a.clone(),
+                    name: "shared-demo",
+                },
             )
             .await
             .unwrap();
@@ -1455,8 +1468,10 @@ mod tests {
                 &packages,
                 &dev,
                 &digest,
-                service_a.clone(),
-                "other-demo",
+                JoinEnvironment {
+                    pr: service_a.clone(),
+                    name: "other-demo",
+                },
             )
             .await
             .unwrap();
@@ -1494,8 +1509,10 @@ mod tests {
                 &packages,
                 &dev,
                 &digest,
-                service_a.clone(),
-                "shared-demo",
+                JoinEnvironment {
+                    pr: service_a.clone(),
+                    name: "shared-demo",
+                },
             )
             .await
             .unwrap();
@@ -1517,8 +1534,10 @@ mod tests {
                 &packages,
                 &dev,
                 &digest,
-                service_a,
-                "shared-demo",
+                JoinEnvironment {
+                    pr: service_a,
+                    name: "shared-demo",
+                },
             )
             .await
             .unwrap();
@@ -1585,8 +1604,10 @@ mod tests {
                 &packages,
                 &dev,
                 &digest,
-                service_a,
-                "shared-demo",
+                JoinEnvironment {
+                    pr: service_a,
+                    name: "shared-demo",
+                },
             )
             .await
             .unwrap();
@@ -1597,8 +1618,10 @@ mod tests {
                 &packages,
                 &dev,
                 &digest,
-                service_b,
-                "shared-demo",
+                JoinEnvironment {
+                    pr: service_b,
+                    name: "shared-demo",
+                },
             )
             .await
             .unwrap();

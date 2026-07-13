@@ -11,8 +11,8 @@ use crate::database::{
 };
 use crate::github::PullRequestNumber;
 use crate::{
-    BorsContext, BorsGlobalEvent, BorsProcess, CommandParser, Git, PgDbClient, RepositoryStore,
-    TreeState, WebhookSecret, create_bors_process, load_repositories,
+    BorsContext, BorsContextOptions, BorsGlobalEvent, BorsProcess, CommandParser, Git, PgDbClient,
+    RepositoryStore, TreeState, WebhookSecret, create_bors_process, load_repositories,
 };
 use anyhow::Context;
 use axum::Router;
@@ -247,13 +247,15 @@ impl BorsTester {
             // Create a fake git repo, as we want to enable testing handlers that use
             // local git ops, but we do not currently mock git in tests.
             Some(Git::from_path(PathBuf::from("/tmp/git"))),
-            "https://bors-test.com",
-            henosis_config,
-            default_bors_commit_author(),
-            DEFAULT_AUTO_BUILD_CHECK_RUN_NAME.to_string(),
-            DEFAULT_TRY_BUILD_CHECK_RUN_NAME.to_string(),
-            DEFAULT_MERGE_COMMIT_MESSAGE_PREFIX.to_string(),
-            DEFAULT_SERVICE_NAME.to_string(),
+            BorsContextOptions {
+                web_url: "https://bors-test.com".to_string(),
+                henosis_config,
+                commit_author: default_bors_commit_author(),
+                auto_build_check_run_name: DEFAULT_AUTO_BUILD_CHECK_RUN_NAME.to_string(),
+                try_build_check_run_name: DEFAULT_TRY_BUILD_CHECK_RUN_NAME.to_string(),
+                merge_commit_message_prefix: DEFAULT_MERGE_COMMIT_MESSAGE_PREFIX.to_string(),
+                service_name: DEFAULT_SERVICE_NAME.to_string(),
+            },
         ));
 
         let BorsProcess {

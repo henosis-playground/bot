@@ -464,7 +464,7 @@ mod tests {
     use crate::server::{ServerState, ServerStateRef};
     use crate::tests::{TEST_WEBHOOK_SECRET, create_webhook_request};
     use crate::tests::{default_cmd_prefix, load_test_file};
-    use crate::{BorsContext, CommandParser, PgDbClient, RepositoryStore};
+    use crate::{BorsContext, BorsContextOptions, CommandParser, PgDbClient, RepositoryStore};
 
     #[tokio::test]
     async fn installation_suspend() {
@@ -1761,13 +1761,18 @@ mod tests {
                 db,
                 Arc::new(RepositoryStore::default()),
                 None,
-                "",
-                None,
-                crate::bors::default_bors_commit_author(),
-                crate::bors::DEFAULT_AUTO_BUILD_CHECK_RUN_NAME.to_string(),
-                crate::bors::DEFAULT_TRY_BUILD_CHECK_RUN_NAME.to_string(),
-                crate::bors::DEFAULT_MERGE_COMMIT_MESSAGE_PREFIX.to_string(),
-                crate::bors::DEFAULT_SERVICE_NAME.to_string(),
+                BorsContextOptions {
+                    web_url: String::new(),
+                    henosis_config: None,
+                    commit_author: crate::bors::default_bors_commit_author(),
+                    auto_build_check_run_name: crate::bors::DEFAULT_AUTO_BUILD_CHECK_RUN_NAME
+                        .to_string(),
+                    try_build_check_run_name: crate::bors::DEFAULT_TRY_BUILD_CHECK_RUN_NAME
+                        .to_string(),
+                    merge_commit_message_prefix: crate::bors::DEFAULT_MERGE_COMMIT_MESSAGE_PREFIX
+                        .to_string(),
+                    service_name: crate::bors::DEFAULT_SERVICE_NAME.to_string(),
+                },
             )),
         )));
         GitHubWebhook::from_request(request, &server_ref).await

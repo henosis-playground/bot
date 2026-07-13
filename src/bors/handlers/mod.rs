@@ -506,10 +506,12 @@ async fn handle_comment(
                             &comment.author,
                             parent,
                             jobs,
-                            &command_prefix,
-                            &ctx.commit_author,
-                            &ctx.try_build_check_run_name,
-                            &ctx.merge_commit_message_prefix,
+                            trybuild::TryBuildOptions {
+                                bot_prefix: &command_prefix,
+                                commit_author: &ctx.commit_author,
+                                check_run_name: &ctx.try_build_check_run_name,
+                                merge_commit_message_prefix: &ctx.merge_commit_message_prefix,
+                            },
                         )
                         .instrument(span)
                         .await
@@ -1527,19 +1529,14 @@ digest = "sha256:{}"
                             ResponseTemplate::new(200).set_body_json(state.get_response())
                         }
                     }
-                    "GetGraphGeneration" => {
-                        if state.retired
-                            || state.graph.is_none()
-                            || state.graph_id() != body["graphId"].as_str()
-                            || body["generation"].as_str()
-                                != Some(state.generation().to_string()).as_deref()
+                    "GetGraphGeneration" => match state.graph.as_ref() {
+                        Some(graph)
+                            if !state.retired
+                                && state.graph_id() == body["graphId"].as_str()
+                                && body["generation"].as_str()
+                                    == Some(state.generation().to_string()).as_deref() =>
                         {
-                            ResponseTemplate::new(404).set_body_json(json!({
-                                "code": "not_found",
-                                "message": "generation does not exist"
-                            }))
-                        } else {
-                            let components = state.graph.as_ref().unwrap()["componentSpecHashes"]
+                            let components = graph["componentSpecHashes"]
                                 .as_array()
                                 .unwrap()
                                 .iter()
@@ -1560,7 +1557,11 @@ digest = "sha256:{}"
                                 "currentLifecycle": "GRAPH_LIFECYCLE_ACTIVE"
                             }))
                         }
-                    }
+                        _ => ResponseTemplate::new(404).set_body_json(json!({
+                            "code": "not_found",
+                            "message": "generation does not exist"
+                        })),
+                    },
                     "CreateGraph" => {
                         state.retired = false;
                         state.report = MockCoreReport::Pending;

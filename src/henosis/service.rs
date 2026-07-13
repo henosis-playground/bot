@@ -11,8 +11,8 @@ use crate::henosis::core_client::{
 use crate::henosis::db::{PgEnvironmentStore, PgQueueStore};
 use crate::henosis::environment::{
     DeployRepoWriter, DeployWriteResult, EnvironmentChange, EnvironmentManager, EnvironmentStatus,
-    EnvironmentStore, PreviewPullRequest, PullRequestKey, RenderOutcome, RenderStatus,
-    environment_branch,
+    EnvironmentStore, JoinEnvironment, PreviewPullRequest, PullRequestKey, RenderOutcome,
+    RenderStatus, environment_branch,
 };
 use crate::henosis::gate::{CliGateExecutor, GateExecutor};
 use crate::henosis::github::{
@@ -22,8 +22,8 @@ use crate::henosis::github::{
 };
 use crate::henosis::queue::{
     ADVISORY_FAILED_STATUS, ADVISORY_PASSED_STATUS, AdvisoryGateStore, CheckConclusion,
-    GateCheckReporter, MERGED_STATUS, PrCommenter, QueueManager, QueuePullRequest, QueueStore,
-    RecordedGateRun, advisory_gate_external_id,
+    GateCheckReporter, MERGED_STATUS, PrCommenter, QueueHooks, QueueManager, QueuePullRequest,
+    QueueStore, RecordedGateRun, advisory_gate_external_id,
 };
 use crate::henosis::render_diagnostics::{
     DiagnosticPresentation, RenderFailureDiagnostic, fallback_render_failure_diagnostic,
@@ -273,7 +273,14 @@ pub async fn join_environment(
     let digest = GithubImageDigestResolver::new(&ctx.repositories);
 
     let change = manager
-        .join(&mut store, &mut writer, &packages, &dev, &digest, pr, name)
+        .join(
+            &mut store,
+            &mut writer,
+            &packages,
+            &dev,
+            &digest,
+            JoinEnvironment { pr, name },
+        )
         .await?;
     reconcile_status_for_change(ctx, &change).await?;
     Ok(Some(change))
@@ -346,8 +353,10 @@ pub async fn tick_queue(ctx: &BorsContext) -> anyhow::Result<Option<RecordedGate
             &reporter,
             &gate_executor,
             &merge_executor,
-            &commenter,
-            &repo_validation,
+            QueueHooks {
+                commenter: &commenter,
+                repo_validation: &repo_validation,
+            },
         )
         .await?;
     if let Some(gate_run) = &result {

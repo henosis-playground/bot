@@ -13,7 +13,7 @@ mod utils;
 
 pub use self::bors::process::{BorsProcess, create_bors_process};
 pub use bors::{
-    BorsContext, CommandParser, DEFAULT_AUTO_BUILD_CHECK_RUN_NAME,
+    BorsContext, BorsContextOptions, CommandParser, DEFAULT_AUTO_BUILD_CHECK_RUN_NAME,
     DEFAULT_MERGE_COMMIT_MESSAGE_PREFIX, DEFAULT_SERVICE_NAME, DEFAULT_TRY_BUILD_CHECK_RUN_NAME,
     Git, RepositoryStore, default_bors_commit_author, event::BorsGlobalEvent,
     event::BorsRepositoryEvent,

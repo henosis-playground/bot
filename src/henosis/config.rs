@@ -65,30 +65,20 @@ impl std::fmt::Debug for CoreApiToken {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ComponentMode {
+    #[default]
     GateOnly,
     Chained,
 }
 
-impl Default for ComponentMode {
-    fn default() -> Self {
-        Self::GateOnly
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PreviewMode {
     Auto,
+    #[default]
     OnDemand,
-}
-
-impl Default for PreviewMode {
-    fn default() -> Self {
-        Self::OnDemand
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

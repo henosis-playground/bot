@@ -7,7 +7,7 @@ use anyhow::Context;
 use bors::henosis::config::{HENOSIS_CONFIG_ENV, HenosisConfig};
 use bors::server::{ServerState, create_app};
 use bors::{
-    BorsContext, BorsGlobalEvent, BorsProcess, CommandParser, CommitAuthor,
+    BorsContext, BorsContextOptions, BorsGlobalEvent, BorsProcess, CommandParser, CommitAuthor,
     DEFAULT_AUTO_BUILD_CHECK_RUN_NAME, DEFAULT_MERGE_COMMIT_MESSAGE_PREFIX, DEFAULT_SERVICE_NAME,
     DEFAULT_TRY_BUILD_CHECK_RUN_NAME, Git, OAuthClient, OAuthConfig, PgDbClient, RepositoryStore,
     TeamApiClient, TreeState, WebhookSecret, create_bors_process, create_github_client,
@@ -212,16 +212,18 @@ fn try_main(opts: Opts) -> anyhow::Result<()> {
         db.clone(),
         repos.clone(),
         git,
-        &opts.web_url,
-        henosis_config,
-        CommitAuthor {
-            name: opts.commit_author_name,
-            email: opts.commit_author_email,
+        BorsContextOptions {
+            web_url: opts.web_url,
+            henosis_config,
+            commit_author: CommitAuthor {
+                name: opts.commit_author_name,
+                email: opts.commit_author_email,
+            },
+            auto_build_check_run_name: opts.auto_build_check_run_name,
+            try_build_check_run_name: opts.try_build_check_run_name,
+            merge_commit_message_prefix: opts.merge_commit_message_prefix,
+            service_name: opts.service_name,
         },
-        opts.auto_build_check_run_name,
-        opts.try_build_check_run_name,
-        opts.merge_commit_message_prefix,
-        opts.service_name,
     ));
     let BorsProcess {
         repository_tx,
