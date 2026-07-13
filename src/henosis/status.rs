@@ -16,17 +16,26 @@ pub struct StatusSnapshot {
     pub gate: Option<GateStatus>,
     pub render: Option<RenderOutcome>,
     pub last_publication: Option<RenderOutcome>,
+    pub borrowed_components: Vec<String>,
     pub ui_links: Vec<UiLink>,
 }
 
 pub fn render_status_section(snapshot: &StatusSnapshot) -> String {
+    let borrowed_row = if snapshot.borrowed_components.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "| Borrowed for preview | {} |\n",
+            snapshot.borrowed_components.join(" · ")
+        )
+    };
     let ui_row = if snapshot.ui_links.is_empty() {
         String::new()
     } else {
         format!("| UIs in this world | {} |\n", ui_links(&snapshot.ui_links))
     };
     format!(
-        "{STATUS_START}\n### Henosis status\n\n| | |\n|---|---|\n| Environment | {} |\n| Members | {} |\n| Merge gate | {} |\n| Render | {} |\n{}{STATUS_END}",
+        "{STATUS_START}\n### Henosis status\n\n| | |\n|---|---|\n| Environment | {} |\n| Members | {} |\n| Merge gate | {} |\n| Render | {} |\n{}{}{STATUS_END}",
         environment_cell(snapshot),
         member_list(&snapshot.environment.members, &snapshot.current_pr),
         merge_gate_row(
@@ -35,6 +44,7 @@ pub fn render_status_section(snapshot: &StatusSnapshot) -> String {
             snapshot.gate.as_ref(),
         ),
         render_row(snapshot.render.as_ref(), snapshot.graph_url.is_some()),
+        borrowed_row,
         ui_row,
     )
 }
@@ -319,6 +329,7 @@ mod tests {
                 publication: None,
             }),
             last_publication: None,
+            borrowed_components: Vec::new(),
             ui_links: Vec::new(),
         });
 

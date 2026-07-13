@@ -25,7 +25,7 @@ use crate::henosis::environment::{
 };
 use crate::henosis::gate_report::{GateFailure, GateReport};
 use crate::henosis::generation::{GenerationState, derive_generation};
-use crate::henosis::graph::{ComponentGraph, ComponentPackageReader, ComponentRef};
+use crate::henosis::graph::ComponentPackageReader;
 use crate::henosis::manifest::{self, ComponentEntry, Manifest, PinnedEntry};
 use crate::henosis::render_diagnostics::DiagnosticPresentation;
 
@@ -80,6 +80,28 @@ pub fn ui_links_from_generation(
 ) -> Vec<UiLink> {
     let value = serde_json::to_value(record).unwrap_or_default();
     ui_links_from_generation_json(&value, materialized_components)
+}
+
+pub fn borrowed_components_from_generation(record: &GetGraphGenerationResponse) -> Vec<String> {
+    let value = serde_json::to_value(record).unwrap_or_default();
+    let mut borrowed = value
+        .get("components")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|component| {
+            let name = component.pointer("/spec/name")?.as_str()?;
+            let encoded = component.pointer("/spec/connectorContext")?.as_str()?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()?;
+            let context: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            let from = context.pointer("/borrow/from")?.as_str()?;
+            Some(format!("{name} from `{from}`"))
+        })
+        .collect::<Vec<_>>();
+    borrowed.sort();
+    borrowed
 }
 
 fn ui_links_from_generation_json(
@@ -268,6 +290,8 @@ struct ComponentSpecInspection {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct InspectedComponentSpec {
     connector: String,
+    #[serde(default)]
+    dependencies: Vec<String>,
     outputs_schema: String,
     connector_context: String,
     #[serde(default)]
@@ -844,31 +868,21 @@ impl<R: ComponentPackageReader> DeployRepoWriter for CoreGraphWriter<'_, R> {
 async fn graph_component_specs<R: ComponentPackageReader>(
     manifest: &Manifest,
     registered: &[RegisteredComponent],
-    package_reader: &R,
+    _package_reader: &R,
     mut inspected_specs: BTreeMap<String, InspectedComponentSpec>,
 ) -> anyhow::Result<Vec<PlannedComponentSpec>> {
     let pins = resolved_pins(manifest)?;
-    let refs = registered
+    let registered_names = registered
         .iter()
-        .map(|component| {
-            let pin = pins.get(&component.name).with_context(|| {
-                format!("Core preview world omitted component `{}`", component.name)
-            })?;
-            Ok(ComponentRef::new(
-                component.name.clone(),
-                pin.repo.clone(),
-                pin.r#ref.clone(),
-            ))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let package_graph = ComponentGraph::read(&refs, package_reader).await?;
+        .map(|component| component.name.as_str())
+        .collect::<BTreeSet<_>>();
 
     let specs = registered
         .iter()
         .map(|registered| {
             validate_component_name(&registered.name)?;
-            let node = package_graph.node(&registered.name).with_context(|| {
-                format!("Package graph omitted component `{}`", registered.name)
+            pins.get(&registered.name).with_context(|| {
+                format!("Core preview world omitted component `{}`", registered.name)
             })?;
             let inspected = inspected_specs.remove(&registered.name).with_context(|| {
                 format!(
@@ -881,10 +895,22 @@ async fn graph_component_specs<R: ComponentPackageReader>(
                 "Component-spec inspector returned an empty connector for `{}`",
                 registered.name
             );
+            for dependency in &inspected.dependencies {
+                anyhow::ensure!(
+                    registered_names.contains(dependency.as_str()),
+                    "Component-spec inspector returned unknown dependency `{dependency}` for `{}`",
+                    registered.name
+                );
+                anyhow::ensure!(
+                    dependency != &registered.name,
+                    "Component-spec inspector returned a self-dependency for `{}`",
+                    registered.name
+                );
+            }
             Ok(PlannedComponentSpec {
                 name: registered.name.clone(),
                 connector: inspected.connector,
-                dependencies: node.dependencies.iter().cloned().collect(),
+                dependencies: inspected.dependencies,
                 outputs_schema: decode_inspected_bytes(
                     &registered.name,
                     "outputsSchema",
@@ -1262,11 +1288,16 @@ mod tests {
 
     fn inspected_spec(
         connector: &str,
+        dependencies: &[&str],
         outputs_schema: &[u8],
         connector_context: &[u8],
     ) -> InspectedComponentSpec {
         InspectedComponentSpec {
             connector: connector.to_string(),
+            dependencies: dependencies
+                .iter()
+                .map(|dependency| dependency.to_string())
+                .collect(),
             outputs_schema: base64::engine::general_purpose::STANDARD.encode(outputs_schema),
             connector_context: base64::engine::general_purpose::STANDARD.encode(connector_context),
             dependency_spec_hash_slots: Vec::new(),
@@ -1274,7 +1305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boundary_emits_context_v1_and_package_graph_edges() {
+    async fn boundary_uses_inspector_context_and_dependency_edges() {
         let environment_id = TypedUuid::<PreviewEnvironmentKind>::from_untyped_uuid(
             uuid::Uuid::from_u128(0x018f_1234_5678_7abc_8def_0123_4567_89ab),
         )
@@ -1345,11 +1376,11 @@ mod tests {
         let inspected = BTreeMap::from([
             (
                 "service-a".to_string(),
-                inspected_spec("k8s", br#"{"kind":"object"}"#, b"service-a"),
+                inspected_spec("k8s", &[], br#"{"kind":"object"}"#, b"service-a"),
             ),
             (
                 "service-b".to_string(),
-                inspected_spec("k8s", br#"{"kind":"object"}"#, &context),
+                inspected_spec("k8s", &["service-a"], br#"{"kind":"object"}"#, &context),
             ),
         ]);
 
@@ -1649,6 +1680,28 @@ mod tests {
         assert_eq!(
             graph_status(&state).unwrap_err().to_string(),
             "Graph state is not active"
+        );
+    }
+
+    #[test]
+    fn borrowed_components_are_exposed_for_status_presentation() {
+        let context = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::to_vec(&json!({
+                "borrow": {"from": "dev", "effectiveEnvironment": {"id": "dev"}}
+            }))
+            .unwrap(),
+        );
+        let record: GetGraphGenerationResponse = serde_json::from_value(json!({
+            "components": [
+                {"spec": {"name": "service-b", "connectorContext": context}},
+                {"spec": {"name": "service-a", "connectorContext": context}}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            borrowed_components_from_generation(&record),
+            ["service-a from `dev`", "service-b from `dev`"]
         );
     }
 

@@ -6,7 +6,7 @@ use crate::github::{GithubRepoName, PullRequest, PullRequestNumber};
 use crate::henosis::config::{HenosisConfig, PreviewMode};
 use crate::henosis::core_client::{
     CoreClient, CoreEnvironmentIdGenerator, CoreFailurePresentation, CoreGraphWriter,
-    ui_links_from_generation,
+    borrowed_components_from_generation, ui_links_from_generation,
 };
 use crate::henosis::db::{PgEnvironmentStore, PgQueueStore};
 use crate::henosis::environment::{
@@ -824,16 +824,21 @@ async fn reconcile_environment_status(
         .iter()
         .map(|member| member.component.clone())
         .collect::<BTreeSet<_>>();
-    let ui_links = match (
+    let (ui_links, borrowed_components) = match (
         config.core_api.as_ref(),
         render.as_ref().and_then(|render| render.generation),
     ) {
         (Some(core_api), Some(generation)) => CoreClient::new(core_api)?
             .get_graph_generation(environment_id, generation)
             .await?
-            .map(|record| ui_links_from_generation(&record, &materialized_components))
+            .map(|record| {
+                (
+                    ui_links_from_generation(&record, &materialized_components),
+                    borrowed_components_from_generation(&record),
+                )
+            })
             .unwrap_or_default(),
-        _ => Vec::new(),
+        _ => (Vec::new(), Vec::new()),
     };
     let queue_store = PgQueueStore::new(ctx.db.pool().clone());
 
@@ -871,6 +876,7 @@ async fn reconcile_environment_status(
             gate,
             render: render.clone(),
             last_publication: last_publication.clone(),
+            borrowed_components: borrowed_components.clone(),
             ui_links: ui_links.clone(),
         };
         let section = render_status_section(&snapshot);

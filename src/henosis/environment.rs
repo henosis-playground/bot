@@ -662,13 +662,16 @@ impl EnvironmentManager {
                 Ok((component.name.clone(), r#ref))
             })
             .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-        let graph_refs = ComponentGraph::from_registered_components(&self.components, &refs)?;
-        let graph = ComponentGraph::read(&graph_refs, package_reader).await?;
-        let changed_components = members
-            .iter()
-            .map(|member| member.component.as_str())
-            .collect::<Vec<_>>();
-        let closure = graph.preview_closure(changed_components);
+        let closure = if self.core_previews {
+            self.components
+                .iter()
+                .map(|component| component.name.clone())
+                .collect()
+        } else {
+            let graph_refs = ComponentGraph::from_registered_components(&self.components, &refs)?;
+            let graph = ComponentGraph::read(&graph_refs, package_reader).await?;
+            graph.preview_closure(members.iter().map(|member| member.component.as_str()))
+        };
 
         let mut components = IndexMap::new();
         for component in &self.components {
