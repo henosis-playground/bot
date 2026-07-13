@@ -38,7 +38,7 @@ impl GateReport {
     /// Format a legible check-run summary naming the failing consumer + contract break.
     pub fn check_run_summary(&self) -> String {
         if self.ok {
-            return "Henosis merge gate passed. The candidate world compiled and rendered."
+            return "Henosis merge gate passed. The candidate components passed their configured checks."
                 .to_string();
         }
 

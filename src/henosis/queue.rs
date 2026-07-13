@@ -1003,7 +1003,8 @@ mod tests {
             [(
                 external_id.clone(),
                 CheckConclusion::Success,
-                "Henosis merge gate passed. The candidate world compiled and rendered.".to_string()
+                "Henosis merge gate passed. The candidate components passed their configured checks."
+                    .to_string()
             )]
         );
         assert_eq!(
