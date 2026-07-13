@@ -1,3 +1,4 @@
+use crate::henosis::core_client::UiLink;
 use crate::henosis::environment::{
     EnvironmentStatus, PreviewPullRequest, PullRequestKey, RenderOutcome, RenderStatus,
 };
@@ -15,11 +16,17 @@ pub struct StatusSnapshot {
     pub gate: Option<GateStatus>,
     pub render: Option<RenderOutcome>,
     pub last_publication: Option<RenderOutcome>,
+    pub ui_links: Vec<UiLink>,
 }
 
 pub fn render_status_section(snapshot: &StatusSnapshot) -> String {
+    let ui_row = if snapshot.ui_links.is_empty() {
+        String::new()
+    } else {
+        format!("| UIs in this world | {} |\n", ui_links(&snapshot.ui_links))
+    };
     format!(
-        "{STATUS_START}\n### Henosis status\n\n| | |\n|---|---|\n| Environment | {} |\n| Members | {} |\n| Merge gate | {} |\n| Render | {} |\n{STATUS_END}",
+        "{STATUS_START}\n### Henosis status\n\n| | |\n|---|---|\n| Environment | {} |\n| Members | {} |\n| Merge gate | {} |\n| Render | {} |\n{}{STATUS_END}",
         environment_cell(snapshot),
         member_list(&snapshot.environment.members, &snapshot.current_pr),
         merge_gate_row(
@@ -27,8 +34,17 @@ pub fn render_status_section(snapshot: &StatusSnapshot) -> String {
             snapshot.advisory_gate.as_ref(),
             snapshot.gate.as_ref(),
         ),
-        render_row(snapshot.render.as_ref()),
+        render_row(snapshot.render.as_ref(), snapshot.graph_url.is_some()),
+        ui_row,
     )
+}
+
+fn ui_links(links: &[UiLink]) -> String {
+    links
+        .iter()
+        .map(|link| format!("[{}]({})", link.label, link.url))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn environment_link(snapshot: &StatusSnapshot) -> String {
@@ -184,8 +200,15 @@ fn gate_word(gate: &GateStatus) -> &'static str {
     }
 }
 
-fn render_row(render: Option<&RenderOutcome>) -> String {
+fn render_row(render: Option<&RenderOutcome>, explain_observation_lag: bool) -> String {
     match render {
+        Some(render) if render.status == RenderStatus::Pending && explain_observation_lag => {
+            format!(
+                "{} ([current generation]({})); the latest terminal result can take about a minute to appear here",
+                icon_word("running"),
+                render.run_url,
+            )
+        }
         Some(render) => format!(
             "{} ([run]({}))",
             icon_word(match render.status {
@@ -296,6 +319,7 @@ mod tests {
                 publication: None,
             }),
             last_publication: None,
+            ui_links: Vec::new(),
         });
 
         insta::assert_snapshot!(section, @r#"
@@ -310,5 +334,40 @@ mod tests {
 | Render | :x: failed ([run](https://github.com/henosis-playground/deploy/actions/runs/1)) |
 <!-- /henosis:status -->
 "#);
+    }
+
+    #[test]
+    fn pending_render_is_explicit_about_observation_lag() {
+        let render = RenderOutcome {
+            environment_id: "preview_test".to_string(),
+            commit_sha: "generation:4".to_string(),
+            status: RenderStatus::Pending,
+            run_url: "https://henosis.example/graphs/preview_test/generations/4".to_string(),
+            excerpt: None,
+            generation: Some(4),
+            publication: None,
+        };
+        let row = render_row(Some(&render), true);
+
+        assert_eq!(
+            row,
+            ":hourglass_flowing_sand: running ([current generation](https://henosis.example/graphs/preview_test/generations/4)); the latest terminal result can take about a minute to appear here"
+        );
+        assert_eq!(
+            render_row(Some(&render), false),
+            ":hourglass_flowing_sand: running ([run](https://henosis.example/graphs/preview_test/generations/4))"
+        );
+    }
+
+    #[test]
+    fn formats_named_ui_links_without_an_empty_placeholder() {
+        assert_eq!(ui_links(&[]), "");
+        assert_eq!(
+            ui_links(&[UiLink {
+                label: "service-b.app".to_string(),
+                url: "https://service-b.example/app".to_string(),
+            }]),
+            "[service-b.app](https://service-b.example/app)"
+        );
     }
 }

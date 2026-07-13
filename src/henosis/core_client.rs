@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
+use base64::Engine;
 use futures::StreamExt;
 use henosis_proto::proto::henosis::v1::__buffa::oneof::watch_graph_response::Item as WatchItem;
 use henosis_proto::proto::henosis::v1::{
@@ -68,9 +69,165 @@ pub struct CoreFailurePresentation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiLink {
+    pub label: String,
+    pub url: String,
+}
+
+pub fn ui_links_from_generation(
+    record: &GetGraphGenerationResponse,
+    materialized_components: &BTreeSet<String>,
+) -> Vec<UiLink> {
+    let value = serde_json::to_value(record).unwrap_or_default();
+    ui_links_from_generation_json(&value, materialized_components)
+}
+
+fn ui_links_from_generation_json(
+    record: &serde_json::Value,
+    changed_components: &BTreeSet<String>,
+) -> Vec<UiLink> {
+    let generation = json_u64(record.pointer("/state/durable/graph/generation"));
+    let components = record
+        .get("components")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let names_by_hash = components
+        .iter()
+        .filter_map(|component| {
+            Some((
+                component.get("hash")?.as_str()?.to_string(),
+                component.pointer("/spec/name")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut materialized = names_by_hash
+        .iter()
+        .filter(|(_, name)| changed_components.contains(*name))
+        .map(|(hash, _)| hash.clone())
+        .collect::<BTreeSet<_>>();
+    loop {
+        let before = materialized.len();
+        for component in &components {
+            let Some(hash) = component.get("hash").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if component
+                .pointer("/spec/dependsOn")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .any(|dependency| materialized.contains(dependency))
+            {
+                materialized.insert(hash.to_string());
+            }
+        }
+        if materialized.len() == before {
+            break;
+        }
+    }
+
+    let outputs = record
+        .pointer("/state/durable/publishedOutputs")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|level| {
+            level.get("connector").and_then(serde_json::Value::as_str) == Some(K8S_CONNECTOR)
+                && json_u64(level.get("generation")) == generation
+        })
+        .max_by_key(|level| json_u64(level.get("publicationSequence")).unwrap_or(0))
+        .and_then(|level| level.get("outputs"))
+        .and_then(serde_json::Value::as_array);
+    let values_by_hash = outputs
+        .into_iter()
+        .flatten()
+        .filter_map(|output| {
+            let hash = output.get("componentSpecHash")?.as_str()?.to_string();
+            let encoded = output.get("valuesJson")?.as_str()?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()?;
+            Some((
+                hash,
+                serde_json::from_slice::<serde_json::Value>(&bytes).ok()?,
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut links = Vec::new();
+    for component in &components {
+        let Some(hash) = component.get("hash").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !materialized.contains(hash) {
+            continue;
+        }
+        let Some(name) = names_by_hash.get(hash) else {
+            continue;
+        };
+        let Some(schema) = component
+            .pointer("/spec/outputsSchema")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|encoded| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .ok()
+            })
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        else {
+            continue;
+        };
+        let Some(values) = values_by_hash.get(hash) else {
+            continue;
+        };
+        collect_ui_links(name, &schema, values, &mut Vec::new(), &mut links);
+    }
+    links.sort_by(|left, right| left.label.cmp(&right.label).then(left.url.cmp(&right.url)));
+    links
+}
+
+fn collect_ui_links(
+    component: &str,
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+    path: &mut Vec<String>,
+    links: &mut Vec<UiLink>,
+) {
+    if schema.get("role").and_then(serde_json::Value::as_str) == Some("ui") {
+        if let Some(url) = value.as_str()
+            && url::Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+        {
+            links.push(UiLink {
+                label: format!("{component}.{}", path.join(".")),
+                url: url.to_string(),
+            });
+        }
+        return;
+    }
+    let Some(shape) = schema.get("shape").and_then(serde_json::Value::as_object) else {
+        return;
+    };
+    for (name, child_schema) in shape {
+        let Some(child_value) = value.get(name) else {
+            continue;
+        };
+        path.push(name.clone());
+        collect_ui_links(component, child_schema, child_value, path, links);
+        path.pop();
+    }
+}
+
+fn json_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    value.and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PlannedComponentSpec {
     name: String,
     dependencies: Vec<String>,
+    outputs_schema: Vec<u8>,
     connector_context: Vec<u8>,
 }
 
@@ -414,7 +571,7 @@ impl CoreClient {
             let spec = ComponentSpec {
                 name: Some(planned.name.clone()),
                 connector: Some(K8S_CONNECTOR.to_string()),
-                outputs_schema: Some(Vec::new()),
+                outputs_schema: Some(planned.outputs_schema),
                 depends_on,
                 connector_context: Some(planned.connector_context),
                 ..Default::default()
@@ -524,6 +681,7 @@ pub struct CoreGraphWriter<'a, R> {
     client: CoreClient,
     components: Vec<RegisteredComponent>,
     package_reader: &'a R,
+    output_schema_command: Option<String>,
 }
 
 impl<'a, R> CoreGraphWriter<'a, R> {
@@ -536,6 +694,7 @@ impl<'a, R> CoreGraphWriter<'a, R> {
             client: CoreClient::new(config)?,
             components,
             package_reader,
+            output_schema_command: config.output_schema_command.clone(),
         })
     }
 }
@@ -548,7 +707,17 @@ impl<R: ComponentPackageReader> DeployRepoWriter for CoreGraphWriter<'_, R> {
     ) -> anyhow::Result<DeployWriteResult> {
         let manifest = manifest::parse_toml(contents)
             .context("Cannot parse resolved preview world at core boundary")?;
-        let specs = graph_component_specs(&manifest, &self.components, self.package_reader).await?;
+        let output_schemas = match self.output_schema_command.as_deref() {
+            Some(command) => collect_output_schemas(command, contents).await?,
+            None => BTreeMap::new(),
+        };
+        let specs = graph_component_specs(
+            &manifest,
+            &self.components,
+            self.package_reader,
+            &output_schemas,
+        )
+        .await?;
         let generation = self
             .client
             .apply_graph(&manifest.environment.id, specs)
@@ -578,6 +747,7 @@ async fn graph_component_specs<R: ComponentPackageReader>(
     manifest: &Manifest,
     registered: &[RegisteredComponent],
     package_reader: &R,
+    output_schemas: &BTreeMap<String, Vec<u8>>,
 ) -> anyhow::Result<Vec<PlannedComponentSpec>> {
     let pins = resolved_pins(manifest)?;
     let refs = registered
@@ -608,8 +778,50 @@ async fn graph_component_specs<R: ComponentPackageReader>(
             Ok(PlannedComponentSpec {
                 name: registered.name.clone(),
                 dependencies: node.dependencies.iter().cloned().collect(),
+                outputs_schema: output_schemas
+                    .get(&registered.name)
+                    .cloned()
+                    .unwrap_or_default(),
                 connector_context: context,
             })
+        })
+        .collect()
+}
+
+async fn collect_output_schemas(
+    command: &str,
+    manifest: &str,
+) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
+    let directory = tempfile::tempdir().context("Cannot create output-schema workspace")?;
+    let manifest_path = directory.path().join("world.toml");
+    let output_path = directory.path().join("schemas.json");
+    tokio::fs::write(&manifest_path, manifest)
+        .await
+        .context("Cannot write output-schema manifest")?;
+    let output = tokio::process::Command::new(command)
+        .arg(&manifest_path)
+        .arg("--output")
+        .arg(&output_path)
+        .output()
+        .await
+        .with_context(|| format!("Cannot run output-schema collector `{command}`"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Output-schema collector `{command}` failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let schemas: BTreeMap<String, serde_json::Value> = serde_json::from_slice(
+        &tokio::fs::read(&output_path)
+            .await
+            .context("Output-schema collector omitted schemas.json")?,
+    )
+    .context("Cannot decode collected output schemas")?;
+    schemas
+        .into_iter()
+        .map(|(name, schema)| {
+            serde_json::to_vec(&schema)
+                .map(|schema| (name, schema))
+                .context("Cannot encode collected output schema")
         })
         .collect()
 }
@@ -1101,7 +1313,7 @@ mod tests {
             ]),
         };
 
-        let specs = graph_component_specs(&manifest, &registered, &reader)
+        let specs = graph_component_specs(&manifest, &registered, &reader, &BTreeMap::new())
             .await
             .unwrap();
         assert_eq!(specs[1].dependencies, vec!["service-a"]);
@@ -1135,6 +1347,14 @@ mod tests {
             .respond_with(move |request: &Request| {
                 let body: Value = request.body_json().unwrap();
                 let spec = body["spec"].clone();
+                assert_eq!(
+                    base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        spec["outputsSchema"].as_str().unwrap()
+                    )
+                    .unwrap(),
+                    br#"{"kind":"object"}"#
+                );
                 let hash = match spec["name"].as_str().unwrap() {
                     "service-a" => {
                         assert!(spec.get("dependsOn").is_none());
@@ -1201,11 +1421,13 @@ mod tests {
                     PlannedComponentSpec {
                         name: "service-b".to_string(),
                         dependencies: vec!["service-a".to_string()],
+                        outputs_schema: br#"{"kind":"object"}"#.to_vec(),
                         connector_context: b"service-b".to_vec(),
                     },
                     PlannedComponentSpec {
                         name: "service-a".to_string(),
                         dependencies: Vec::new(),
+                        outputs_schema: br#"{"kind":"object"}"#.to_vec(),
                         connector_context: b"service-a".to_vec(),
                     },
                 ],
@@ -1326,6 +1548,69 @@ mod tests {
         assert_eq!(
             graph_status(&state).unwrap_err().to_string(),
             "Graph state is not active"
+        );
+    }
+
+    #[test]
+    fn ui_links_use_published_outputs_from_materialized_preview_closure_only() {
+        let first = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1_u8; 32]);
+        let second = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [2_u8; 32]);
+        let schema = |name: &str| {
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                serde_json::to_vec(&json!({
+                    "kind": "object",
+                    "shape": {name: {"kind": "url", "role": "ui"}}
+                }))
+                .unwrap(),
+            )
+        };
+        let values = |value: Value| {
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                serde_json::to_vec(&value).unwrap(),
+            )
+        };
+        let record = json!({
+            "state": {
+                "durable": {
+                    "graph": {"generation": "3"},
+                    "publishedOutputs": [{
+                        "generation": "3",
+                        "connector": "k8s",
+                        "publicationSequence": "9",
+                        "outputs": [
+                            {"componentSpecHash": first, "valuesJson": values(json!({"admin": "https://a.example/admin"}))},
+                            {"componentSpecHash": second, "valuesJson": values(json!({"app": "https://b.example/app"}))}
+                        ]
+                    }]
+                }
+            },
+            "components": [
+                {"hash": first, "spec": {"name": "service-a", "outputsSchema": schema("admin")}},
+                {"hash": second, "spec": {"name": "service-b", "dependsOn": [first], "outputsSchema": schema("app")}}
+            ]
+        });
+
+        assert_eq!(
+            ui_links_from_generation_json(&record, &BTreeSet::from(["service-b".to_string()])),
+            vec![UiLink {
+                label: "service-b.app".to_string(),
+                url: "https://b.example/app".to_string(),
+            }]
+        );
+        assert_eq!(
+            ui_links_from_generation_json(&record, &BTreeSet::from(["service-a".to_string()])),
+            vec![
+                UiLink {
+                    label: "service-a.admin".to_string(),
+                    url: "https://a.example/admin".to_string(),
+                },
+                UiLink {
+                    label: "service-b.app".to_string(),
+                    url: "https://b.example/app".to_string(),
+                },
+            ]
         );
     }
 }

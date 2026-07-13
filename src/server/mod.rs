@@ -236,25 +236,37 @@ async fn graph_generation_handler(
     let Ok(client) = CoreClient::new(core_api) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let latest_generation = match client.get_graph(&environment_id).await {
-        Ok(Some(graph)) => serde_json::to_value(graph)
-            .ok()
-            .and_then(|value| json_u64(value.pointer("/durable/graph/generation"))),
-        Ok(None) | Err(_) => None,
+    let (latest_generation, current_lifecycle) = match client.get_graph(&environment_id).await {
+        Ok(Some(graph)) => {
+            let value = serde_json::to_value(graph).unwrap_or_default();
+            (
+                json_u64(value.pointer("/durable/graph/generation")),
+                Some(graph_lifecycle(&value)),
+            )
+        }
+        Ok(None) | Err(_) => (None, None),
     };
     graph_generation_response(
         &state,
         &client,
         &environment_id,
         generation,
-        GraphPageView::Generation { latest_generation },
+        GraphPageView::Generation {
+            latest_generation,
+            current_lifecycle,
+        },
     )
     .await
 }
 
 enum GraphPageView {
-    Latest { lifecycle: String },
-    Generation { latest_generation: Option<u64> },
+    Latest {
+        lifecycle: String,
+    },
+    Generation {
+        latest_generation: Option<u64>,
+        current_lifecycle: Option<String>,
+    },
 }
 
 async fn graph_generation_response(
@@ -352,9 +364,9 @@ fn render_generation_page(
     };
     let superseded_by = match view {
         GraphPageView::Latest { .. } => None,
-        GraphPageView::Generation { latest_generation } => {
-            superseded_generation(record, *latest_generation)
-        }
+        GraphPageView::Generation {
+            latest_generation, ..
+        } => superseded_generation(record, *latest_generation),
     };
     let last_published = json_u64(record.get("lastPublishedGeneration"));
     let title = label
@@ -462,6 +474,28 @@ fn render_generation_page(
             )
         })
         .collect::<String>();
+    let diagnostics = if diagnostics.is_empty() {
+        "none reported".to_string()
+    } else {
+        diagnostics
+    };
+    let current_graph_is_retired = match view {
+        GraphPageView::Latest { lifecycle } => lifecycle == "retired",
+        GraphPageView::Generation {
+            current_lifecycle, ..
+        } => current_lifecycle.as_deref() == Some("retired"),
+    };
+    let generation_status = if superseded_by.is_some() {
+        "superseded before a terminal report".to_string()
+    } else if publication.is_some() {
+        "published".to_string()
+    } else if generation_is_terminal(record) {
+        "terminal report received; not published".to_string()
+    } else if current_graph_is_retired {
+        "graph retired; no terminal connector report recorded for this generation".to_string()
+    } else {
+        "reconciling; no terminal connector report recorded yet".to_string()
+    };
     let audit_context = match view {
         GraphPageView::Latest { .. } => format!(
             "<a href=\"/graphs/{environment_id}/generations/{generation}\">last generation {generation}</a> (immutable as-of evidence) · <a href=\"/graphs/{environment_id}/latest.json\">current raw JSON</a>",
@@ -481,7 +515,7 @@ fn render_generation_page(
         })
         .unwrap_or_default();
     format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><title>Henosis generation {generation}</title><style>body{{font:16px system-ui;max-width:1100px;margin:3rem auto;padding:0 1rem;color:#202124}}table{{border-collapse:collapse;width:100%}}th,td{{text-align:left;vertical-align:top;border-bottom:1px solid #ddd;padding:.65rem}}code,pre{{font-family:ui-monospace,monospace}}pre{{white-space:pre-wrap;background:#f6f8fa;padding:1rem}}small{{color:#666}}aside{{margin:1rem 0;padding:1rem;border-left:4px solid #bf8700;background:#fff8c5}}</style></head><body><h1>{title}</h1>{superseded_notice}<table><tr><th>Lifecycle</th><td>{lifecycle}</td></tr><tr><th>Requested generation</th><td>{generation}</td></tr><tr><th>Last published generation</th><td>{last_published}</td></tr><tr><th>Publication</th><td>{publication_html}</td></tr><tr><th>Audit data</th><td>{audit_context}</td></tr></table><h2>Components</h2><table><thead><tr><th>Component</th><th>Source SHA</th><th>Disposition</th><th>Decoded outputs</th></tr></thead><tbody>{component_rows}</tbody></table><h2>Diagnostics</h2>{diagnostics}</body></html>"#,
+        r#"<!doctype html><html><head><meta charset="utf-8"><title>Henosis generation {generation}</title><style>body{{font:16px system-ui;max-width:1100px;margin:3rem auto;padding:0 1rem;color:#202124}}table{{border-collapse:collapse;width:100%}}th,td{{text-align:left;vertical-align:top;border-bottom:1px solid #ddd;padding:.65rem}}code,pre{{font-family:ui-monospace,monospace}}pre{{white-space:pre-wrap;background:#f6f8fa;padding:1rem}}small{{color:#666}}aside{{margin:1rem 0;padding:1rem;border-left:4px solid #bf8700;background:#fff8c5}}</style></head><body><h1>{title}</h1>{superseded_notice}<table><tr><th>Lifecycle</th><td>{lifecycle}</td></tr><tr><th>Requested generation</th><td>{generation}</td></tr><tr><th>Generation status</th><td>{generation_status}</td></tr><tr><th>Last published generation</th><td>{last_published}</td></tr><tr><th>Publication</th><td>{publication_html}</td></tr><tr><th>Audit data</th><td>{audit_context}</td></tr></table><h2>Components</h2><table><thead><tr><th>Component</th><th>Source SHA</th><th>Disposition</th><th>Reported outputs</th></tr></thead><tbody>{component_rows}</tbody></table><h2>Diagnostics</h2>{diagnostics}</body></html>"#,
         last_published = last_published
             .map(|value| value.to_string())
             .unwrap_or_else(|| "none".to_string()),
@@ -1064,6 +1098,8 @@ manifest_path = "dev.toml"
                     .assert_ok()
                     .into_body();
                 assert!(latest.contains("<th>Lifecycle</th><td>retired</td>"));
+                assert!(latest.contains("graph retired; no terminal connector report recorded"));
+                assert!(latest.contains("<h2>Diagnostics</h2>none reported"));
                 assert!(latest.contains("last generation 3"));
                 assert!(latest.contains("immutable as-of evidence"));
 
@@ -1075,6 +1111,7 @@ manifest_path = "dev.toml"
                     .assert_ok()
                     .into_body();
                 assert!(immutable.contains("<th>Lifecycle</th><td>active</td>"));
+                assert!(immutable.contains("graph retired; no terminal connector report recorded"));
                 assert!(!immutable.contains("immutable as-of evidence"));
 
                 let superseded = ctx

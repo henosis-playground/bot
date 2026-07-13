@@ -44,6 +44,8 @@ pub struct CoreApiConfig {
     pub endpoint: String,
     #[serde(default)]
     pub presentation_endpoint: Option<String>,
+    #[serde(default)]
+    pub output_schema_command: Option<String>,
     pub token: CoreApiToken,
 }
 
@@ -373,6 +375,7 @@ manifest_path = "dev.toml"
             core_api.presentation_endpoint.as_deref(),
             Some("https://henosis.skuld.systems")
         );
+        assert_eq!(core_api.output_schema_command, None);
         assert_eq!(core_api.token.expose(), "super-secret");
         assert_eq!(format!("{:?}", core_api.token), "[REDACTED]");
     }

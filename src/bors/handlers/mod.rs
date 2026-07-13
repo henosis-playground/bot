@@ -1527,6 +1527,40 @@ digest = "sha256:{}"
                             ResponseTemplate::new(200).set_body_json(state.get_response())
                         }
                     }
+                    "GetGraphGeneration" => {
+                        if state.retired
+                            || state.graph.is_none()
+                            || state.graph_id() != body["graphId"].as_str()
+                            || body["generation"].as_str()
+                                != Some(state.generation().to_string()).as_deref()
+                        {
+                            ResponseTemplate::new(404).set_body_json(json!({
+                                "code": "not_found",
+                                "message": "generation does not exist"
+                            }))
+                        } else {
+                            let components = state.graph.as_ref().unwrap()["componentSpecHashes"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter_map(|hash| {
+                                    let hash = hash.as_str()?;
+                                    Some(json!({
+                                        "hash": hash,
+                                        "spec": state.specs.get(hash)?
+                                    }))
+                                })
+                                .collect::<Vec<_>>();
+                            ResponseTemplate::new(200).set_body_json(json!({
+                                "state": {
+                                    "durable": state.durable(),
+                                    "reports": state.reports()
+                                },
+                                "components": components,
+                                "currentLifecycle": "GRAPH_LIFECYCLE_ACTIVE"
+                            }))
+                        }
+                    }
                     "CreateGraph" => {
                         state.retired = false;
                         state.report = MockCoreReport::Pending;
@@ -2156,6 +2190,11 @@ digest = "sha256:service-b"
                 );
 
                 let calls = core_state.lock().unwrap().calls.clone();
+                assert!(calls.iter().any(|call| call == "GetGraphGeneration"));
+                let calls = calls
+                    .into_iter()
+                    .filter(|call| call != "GetGraphGeneration")
+                    .collect::<Vec<_>>();
                 assert_eq!(
                     calls,
                     vec![
