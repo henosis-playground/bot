@@ -167,37 +167,59 @@ fn environment_id_from_manifest_path(path: &str) -> anyhow::Result<&str> {
         .with_context(|| format!("Invalid preview environment path `{path}`"))
 }
 
-async fn checkout_pull_request(request: &PreviewPullRequest) -> anyhow::Result<tempfile::TempDir> {
+struct RepositoryCheckout {
+    _root: tempfile::TempDir,
+    repository: PathBuf,
+}
+
+impl RepositoryCheckout {
+    fn path(&self) -> &Path {
+        &self.repository
+    }
+}
+
+async fn checkout_pull_request(request: &PreviewPullRequest) -> anyhow::Result<RepositoryCheckout> {
     checkout_repository(&request.key.repo, &request.head_sha).await
 }
 
-async fn checkout_repository(repo: &str, revision: &str) -> anyhow::Result<tempfile::TempDir> {
-    let checkout = tempfile::tempdir().context("Cannot create D26 repository checkout")?;
+async fn checkout_repository(repo: &str, revision: &str) -> anyhow::Result<RepositoryCheckout> {
+    let root = tempfile::tempdir().context("Cannot create D26 repository checkout")?;
+    let name = repo.rsplit_once('/').map_or(repo, |(_, name)| name);
+    let repository = root.path().join(name);
+    checkout_repository_into(repo, revision, &repository).await?;
+    Ok(RepositoryCheckout {
+        _root: root,
+        repository,
+    })
+}
+
+async fn checkout_repository_into(
+    repo: &str,
+    revision: &str,
+    checkout: &Path,
+) -> anyhow::Result<()> {
     let url = format!("https://github.com/{repo}.git");
     run_git_authenticated(
         None,
         [
             "init",
             "--quiet",
-            checkout
-                .path()
-                .to_str()
-                .context("Checkout path is not UTF-8")?,
+            checkout.to_str().context("Checkout path is not UTF-8")?,
         ],
     )
     .await?;
-    run_git_authenticated(Some(checkout.path()), ["remote", "add", "origin", &url]).await?;
+    run_git_authenticated(Some(checkout), ["remote", "add", "origin", &url]).await?;
     run_git_authenticated(
-        Some(checkout.path()),
+        Some(checkout),
         ["fetch", "--quiet", "--depth=1", "origin", revision],
     )
     .await?;
     run_git_authenticated(
-        Some(checkout.path()),
+        Some(checkout),
         ["checkout", "--quiet", "--detach", "FETCH_HEAD"],
     )
     .await?;
-    Ok(checkout)
+    Ok(())
 }
 
 async fn run_git_authenticated<'a>(
@@ -233,7 +255,47 @@ async fn run_git_authenticated<'a>(
     Ok(())
 }
 
+fn file_dependency_repositories(package: &serde_json::Value) -> BTreeSet<String> {
+    ["dependencies", "devDependencies", "optionalDependencies"]
+        .into_iter()
+        .filter_map(|section| package.get(section)?.as_object())
+        .flat_map(|dependencies| dependencies.values())
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(|dependency| dependency.strip_prefix("file:../"))
+        .filter_map(|path| path.split('/').next())
+        .filter(|repository| !repository.is_empty() && *repository != "." && *repository != "..")
+        .map(str::to_string)
+        .collect()
+}
+
 async fn install_checkout_dependencies(checkout: &Path) -> anyhow::Result<()> {
+    let package = tokio::fs::read(checkout.join("package.json"))
+        .await
+        .context("Cannot read D26 checkout package.json")?;
+    let package: serde_json::Value =
+        serde_json::from_slice(&package).context("Cannot parse D26 checkout package.json")?;
+    let parent = checkout
+        .parent()
+        .context("D26 checkout has no workspace parent")?;
+    for dependency in file_dependency_repositories(&package) {
+        let target = parent.join(&dependency);
+        if target.exists() {
+            continue;
+        }
+        let reference = if dependency == "platform" {
+            "d26-sdk"
+        } else {
+            "main"
+        };
+        checkout_repository_into(
+            &format!("henosis-playground/{dependency}"),
+            reference,
+            &target,
+        )
+        .await
+        .with_context(|| format!("Cannot checkout local dependency `{dependency}`"))?;
+    }
+
     let output = tokio::process::Command::new("corepack")
         .args(["pnpm", "install", "--frozen-lockfile", "--ignore-scripts"])
         .env("CI", "1")
