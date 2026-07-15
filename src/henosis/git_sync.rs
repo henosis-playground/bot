@@ -257,7 +257,7 @@ where
                     Ok(status)
                         if status.generation == intent.generation && status.bundles == bundles =>
                     {
-                        status
+                        continue;
                     }
                     Ok(_) => {
                         self.core
@@ -653,6 +653,10 @@ mod tests {
 
         assert_eq!(frontend.sync_from_main().await.unwrap(), 1);
         assert_eq!(frontend.repository.read(graph).generation, 1);
+
+        let repository = frontend.repository;
+        let mut frontend = GitSyncFrontend::new(repository, core.clone());
+        assert_eq!(frontend.sync_from_main().await.unwrap(), 0);
 
         let mut edited = frontend.repository.read(graph);
         edited.components[0].bundle_digest = vec![2];
