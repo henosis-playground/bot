@@ -379,7 +379,7 @@ async fn run_cycle(
             source,
         })?;
     let initial_source = repository_provenance(&repository, &fallback_watch_set(&repository)?);
-    let mut output = render_target_banner(&target, &initial_source);
+    emit_stdout(&render_target_banner(&target, &initial_source));
 
     run_typecheck(&repository).await?;
     let bundle_output = repository.join(BUNDLE_PATH);
@@ -389,7 +389,7 @@ async fn run_cycle(
     })?;
     let pins = bundle_pins(&repository, &bundles);
     let changed = changed_components(target.current.as_ref(), &pins);
-    output.push_str(&format!(
+    emit_stdout(&format!(
         "changed components: {}\n",
         if changed.is_empty() {
             "none".to_string()
@@ -404,11 +404,11 @@ async fn run_cycle(
             .current
             .as_ref()
             .map_or(0, |status| status.generation);
-        output.push_str(&format!(
+        emit_stdout(&format!(
             "no deployable changes — generation {generation} remains active\n"
         ));
         return Ok(CycleResult {
-            output,
+            output: String::new(),
             dependencies,
             generation,
         });
@@ -441,20 +441,16 @@ async fn run_cycle(
             core: target.core.clone(),
         },
     )?;
-    output.push_str(&format!("accepted generation {}\n", accepted.generation));
-    output.push_str(
-        &stream_generation(&core, &target.graph, accepted.generation, args.demo_targets).await?,
-    );
-    let terminal = core.status(&target.graph).await?;
+    emit_stdout(&format!("accepted generation {}\n", accepted.generation));
+    let terminal =
+        stream_generation(&core, &target.graph, accepted.generation, args.demo_targets).await?;
     if terminal.phase == GraphPhase::Failed {
-        print!("{output}");
-        std::io::stdout().flush().ok();
         return Err(CliError::DeploymentFailed {
             generation: terminal.generation,
         });
     }
     Ok(CycleResult {
-        output,
+        output: String::new(),
         dependencies,
         generation: terminal.generation,
     })
@@ -755,9 +751,8 @@ async fn stream_generation(
     graph: &str,
     generation: u64,
     demo_targets: bool,
-) -> Result<String, CliError> {
+) -> Result<GraphStatus, CliError> {
     let mut receiver = core.watch(graph).await?;
-    let mut rendered = String::new();
     let mut previous = None;
     loop {
         let status = receiver.borrow_and_update().clone();
@@ -769,20 +764,24 @@ async fn stream_generation(
         }
         let event = render_status_event(&status, demo_targets);
         if previous.as_ref() != Some(&event) {
-            rendered.push_str(&event);
+            emit_stdout(&event);
             previous = Some(event);
         }
         if matches!(
             status.phase,
             GraphPhase::Ready | GraphPhase::Failed | GraphPhase::Retired
         ) {
-            break;
+            return Ok(status);
         }
         receiver.changed().await.map_err(|_| {
             CoreBoundaryError::Transport("core watch closed before a terminal status".into())
         })?;
     }
-    Ok(rendered)
+}
+
+fn emit_stdout(text: &str) {
+    print!("{text}");
+    std::io::stdout().flush().ok();
 }
 
 fn render_target_banner(target: &SelectedTarget, source: &SourceProvenance) -> String {
