@@ -821,6 +821,11 @@ pub fn is_preview_environment_id(id: &str) -> bool {
     true
 }
 
+pub fn presentation_identity(name: Option<&str>, graph: &str) -> String {
+    let name = name.unwrap_or("unnamed");
+    format!("{name} ({graph})")
+}
+
 pub fn environment_manifest_path(environment_id: &str) -> String {
     format!("{environment_id}.toml")
 }

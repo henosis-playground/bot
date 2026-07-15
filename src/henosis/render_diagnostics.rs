@@ -53,6 +53,7 @@ pub fn fallback_render_failure_diagnostic(
 }
 
 pub fn render_failure_comment(
+    environment: &str,
     outcome: &RenderOutcome,
     presentation: DiagnosticPresentation,
 ) -> String {
@@ -68,11 +69,11 @@ pub fn render_failure_comment(
     match presentation {
         DiagnosticPresentation::Markdown => format!(
             "couldn't materialise environment `{}` {revision}.\n\n{}\n\n[render run]({})",
-            outcome.environment_id, diagnostic, outcome.run_url
+            environment, diagnostic, outcome.run_url
         ),
         DiagnosticPresentation::RawText => format!(
             "couldn't materialise environment `{}` {revision}.\n\n<details><summary>render log</summary>\n\n```text\n{}\n```\n\n</details>\n\n[render run]({})",
-            outcome.environment_id, diagnostic, outcome.run_url
+            environment, diagnostic, outcome.run_url
         ),
     }
 }
@@ -327,6 +328,7 @@ mod tests {
     fn rich_render_failure_comment_is_not_wrapped_as_raw_log() {
         let diagnostic = "**Henosis component validation failed — `service-a` could not compile.**\n\n```text\nerror: unsupported field\n```\n\n[source](https://example.com/source)\n\nhelp: fix it";
         let body = render_failure_comment(
+            "dev (graph_01k00000000000000000000000)",
             &RenderOutcome {
                 environment_id: "dev".to_string(),
                 commit_sha: "aaaaaaaa".to_string(),
@@ -367,6 +369,7 @@ mod tests {
         }
         .pr_comment();
         let original = render_failure_comment(
+            "shared-demo (graph_01k00000000000000000000001)",
             &RenderOutcome {
                 environment_id: "preview_test".to_string(),
                 commit_sha: "generation:1".to_string(),

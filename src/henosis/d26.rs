@@ -107,13 +107,17 @@ where
             .map_err(Into::into)
     }
 
-    pub async fn status_section(&self, environment: &str) -> Result<String, PreviewError> {
-        let status = self.core.status(environment).await?;
-        Ok(render_core_status(&status))
+    pub async fn status_section(
+        &self,
+        environment_name: &str,
+        graph: &str,
+    ) -> Result<String, PreviewError> {
+        let status = self.core.status(graph).await?;
+        Ok(render_core_status(environment_name, &status))
     }
 }
 
-pub fn render_core_status(status: &GraphStatus) -> String {
+pub fn render_core_status(environment_name: &str, status: &GraphStatus) -> String {
     let phase = match status.phase {
         GraphPhase::Planning => ":hourglass_flowing_sand: planning",
         GraphPhase::Blocked => ":pause_button: blocked",
@@ -133,7 +137,8 @@ pub fn render_core_status(status: &GraphStatus) -> String {
             .join(" · ")
     };
     format!(
-        "{STATUS_START}\n### Henosis status\n\n| | |\n|---|---|\n| Environment | `{}` |\n| Plan | generation {} · {} resource(s) |\n| Blocked on | {} |\n| Observed ready | {} |\n| Status | {} |\n{STATUS_END}",
+        "{STATUS_START}\n### Henosis status\n\n| | |\n|---|---|\n| Environment | **{}** (`{}`) |\n| Plan | generation {} · {} resource(s) |\n| Blocked on | {} |\n| Observed ready | {} |\n| Status | {} |\n{STATUS_END}",
+        environment_name,
         status.graph,
         status.generation,
         status.planned_resources,
@@ -219,14 +224,17 @@ mod tests {
             }]
         );
 
-        let status = workflow.status_section(&request.environment).await.unwrap();
+        let status = workflow
+            .status_section("shared-demo", &request.environment)
+            .await
+            .unwrap();
         insta::assert_snapshot!(status, @r#"
 <!-- henosis:status -->
 ### Henosis status
 
 | | |
 |---|---|
-| Environment | `preview_01k00000000000000000000000` |
+| Environment | **shared-demo** (`preview_01k00000000000000000000000`) |
 | Plan | generation 1 · 0 resource(s) |
 | Blocked on | none |
 | Observed ready | 0 |

@@ -12,7 +12,7 @@ use crate::henosis::db::{PgEnvironmentStore, PgQueueStore};
 use crate::henosis::environment::{
     DeployRepoWriter, DeployWriteResult, EnvironmentChange, EnvironmentIdGenerator,
     EnvironmentManager, EnvironmentStatus, EnvironmentStore, JoinEnvironment, PreviewPullRequest,
-    PullRequestKey, RenderOutcome, RenderStatus, environment_branch,
+    PullRequestKey, RenderOutcome, RenderStatus, environment_branch, presentation_identity,
 };
 use crate::henosis::gate::{CliGateExecutor, GateExecutor};
 use crate::henosis::github::{
@@ -965,9 +965,17 @@ async fn reconcile_environment_status(
         return Ok(());
     };
     let environment_store = PgEnvironmentStore::new(ctx.db.pool().clone());
-    let Some(environment) = environment_store.active_environment(environment_id).await? else {
+    let Some(mut environment) = environment_store.active_environment(environment_id).await? else {
         return Ok(());
     };
+    let deploy_repository = deploy_repo(ctx, config)?;
+    let graph_files = crate::henosis::git_sync::GithubGraphFileRepository::new(
+        deploy_repository,
+        &config.manifest_branch,
+    );
+    if let Some(pin) = crate::henosis::git_sync::graph_file(&graph_files, environment_id).await? {
+        environment.display_label = Some(pin.name);
+    }
     let members = environment_store.active_members(environment_id).await?;
     let core_status = if let Some(core_api) = config.core_api.as_ref() {
         let core = ConnectCoreBoundary::new(&core_api.endpoint);
@@ -1250,6 +1258,27 @@ fn should_post_render_failure(previous: &Option<RenderOutcome>, outcome: &Render
             .unwrap_or(true)
 }
 
+async fn environment_identity(
+    ctx: &BorsContext,
+    store: &PgEnvironmentStore,
+    graph: &str,
+) -> anyhow::Result<String> {
+    let environment = store.active_environment(graph).await?;
+    let mut name = environment
+        .as_ref()
+        .and_then(|environment| environment.display_label.clone());
+    if let Some(config) = ctx.henosis_config.as_ref() {
+        let repository = crate::henosis::git_sync::GithubGraphFileRepository::new(
+            deploy_repo(ctx, config)?,
+            &config.manifest_branch,
+        );
+        if let Some(pin) = crate::henosis::git_sync::graph_file(&repository, graph).await? {
+            name = Some(pin.name);
+        }
+    }
+    Ok(presentation_identity(name.as_deref(), graph))
+}
+
 async fn post_render_failure_comment(
     ctx: &BorsContext,
     store: &PgEnvironmentStore,
@@ -1266,7 +1295,8 @@ async fn post_render_failure_comment(
         .repositories
         .get(&repo_name)
         .with_context(|| format!("Repository `{repo_name}` is not loaded"))?;
-    let body = render_failure_comment(outcome, presentation);
+    let identity = environment_identity(ctx, store, &outcome.environment_id).await?;
+    let body = render_failure_comment(&identity, outcome, presentation);
     let comment = repo
         .client
         .post_comment(

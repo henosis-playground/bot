@@ -164,7 +164,12 @@ async fn graph_handler(
     State(ServerStateRef(state)): State<ServerStateRef>,
 ) -> Response {
     match current_graph_status(&state, &environment_id).await {
-        Ok(status) => Html(render_d26_graph_page(&status)).into_response(),
+        Ok(status) => {
+            let name = current_environment_name(&state, &environment_id)
+                .await
+                .unwrap_or_else(|| "unnamed".to_string());
+            Html(render_d26_graph_page(&name, &status)).into_response()
+        }
         Err(status) => status.into_response(),
     }
 }
@@ -185,7 +190,10 @@ async fn graph_generation_handler(
 ) -> Response {
     match current_graph_status(&state, &environment_id).await {
         Ok(status) if status.generation == generation => {
-            Html(render_d26_graph_page(&status)).into_response()
+            let name = current_environment_name(&state, &environment_id)
+                .await
+                .unwrap_or_else(|| "unnamed".to_string());
+            Html(render_d26_graph_page(&name, &status)).into_response()
         }
         Ok(_) | Err(StatusCode::NOT_FOUND) => StatusCode::NOT_FOUND.into_response(),
         Err(status) => status.into_response(),
@@ -225,11 +233,31 @@ async fn current_graph_status(
     }
 }
 
-fn render_d26_graph_page(status: &crate::henosis::core_client::GraphStatus) -> String {
+async fn current_environment_name(state: &ServerState, graph: &str) -> Option<String> {
+    let config = state.ctx.henosis_config.as_ref()?;
+    let deploy_repo = config.deploy_repo.parse().ok()?;
+    let repository = state.ctx.get_repo(&deploy_repo).ok()?;
+    let files = crate::henosis::git_sync::GithubGraphFileRepository::new(
+        repository,
+        &config.manifest_branch,
+    );
+    crate::henosis::git_sync::graph_file(&files, graph)
+        .await
+        .ok()
+        .flatten()
+        .map(|pin| pin.name)
+}
+
+fn render_d26_graph_page(
+    environment_name: &str,
+    status: &crate::henosis::core_client::GraphStatus,
+) -> String {
     let json = serde_json::to_string_pretty(status).unwrap_or_else(|_| "{}".to_string());
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Henosis graph {}</title></head><body><h1>Henosis graph <code>{}</code></h1><pre>{}</pre></body></html>",
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Henosis environment {} ({})</title></head><body><h1>Henosis environment {} (<code>{}</code>)</h1><pre>{}</pre></body></html>",
+        escape_html(environment_name),
         escape_html(&status.graph),
+        escape_html(environment_name),
         escape_html(&status.graph),
         escape_html(&json),
     )

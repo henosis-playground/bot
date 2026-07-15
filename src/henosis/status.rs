@@ -67,11 +67,11 @@ fn environment_link(snapshot: &StatusSnapshot) -> String {
 
 fn environment_cell(snapshot: &StatusSnapshot) -> String {
     let environment = &snapshot.environment.environment;
-    let identity = environment
-        .display_label
-        .as_ref()
-        .map(|label| format!("**{label}** · `{}`", environment.id))
-        .unwrap_or_else(|| format!("`{}`", environment.id));
+    let identity = format!(
+        "**{}** (`{}`)",
+        environment.display_label.as_deref().unwrap_or("unnamed"),
+        environment.id
+    );
     let mut links = vec![environment_link(snapshot)];
     if let Some(render) = snapshot.render.as_ref()
         && let Some(generation) = render.generation
@@ -358,7 +358,7 @@ mod tests {
 
 | | |
 |---|---|
-| Environment | **shared-demo** · `preview-00000000-0000-4000-8000-000000000001`<br>[manifest](https://github.com/henosis-playground/deploy/blob/main/preview.toml) · [rendered branch](https://github.com/henosis-playground/deploy/tree/env/preview-00000000-0000-4000-8000-000000000001) |
+| Environment | **shared-demo** (`preview-00000000-0000-4000-8000-000000000001`)<br>[manifest](https://github.com/henosis-playground/deploy/blob/main/preview.toml) · [rendered branch](https://github.com/henosis-playground/deploy/tree/env/preview-00000000-0000-4000-8000-000000000001) |
 | Members | [henosis-playground/service-a#12](https://github.com/henosis-playground/service-a/pull/12) (this PR), [henosis-playground/service-b#34](https://github.com/henosis-playground/service-b/pull/34) |
 | Merge gate | final: :x: failed ([details](https://github.com/henosis-playground/service-a/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/checks))<br>advisory: :white_check_mark: passed ([details](https://github.com/henosis-playground/service-a/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/checks)) |
 | Render | :x: failed ([run](https://github.com/henosis-playground/deploy/actions/runs/1)) |
