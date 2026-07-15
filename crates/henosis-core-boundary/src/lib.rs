@@ -80,6 +80,15 @@ pub enum GraphPhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphSummary {
+    pub graph: String,
+    pub generation: u64,
+    pub phase: GraphPhase,
+    pub created: bool,
+    pub retired: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockedOn {
     pub component: String,
     pub input: String,
@@ -153,6 +162,10 @@ pub trait CoreBoundary: Send + Sync {
         &self,
         graph: &str,
     ) -> impl Future<Output = Result<GraphStatus, CoreBoundaryError>> + Send;
+    fn list(
+        &self,
+        include_retired: bool,
+    ) -> impl Future<Output = Result<Vec<GraphSummary>, CoreBoundaryError>> + Send;
     fn watch(
         &self,
         graph: &str,
@@ -169,6 +182,13 @@ impl ConnectCoreBoundary {
         Self {
             endpoint: endpoint.into(),
         }
+    }
+
+    fn rpc_url(&self, method: &str) -> String {
+        format!(
+            "{}/henosis.v1.GraphService/{method}",
+            self.endpoint.trim_end_matches('/')
+        )
     }
 
     fn client(&self) -> Result<GraphServiceClient<HttpClient>, CoreBoundaryError> {
@@ -331,6 +351,65 @@ impl CoreBoundary for ConnectCoreBoundary {
             })?
             .into_owned();
         status_from_response(response.status.into_option())
+    }
+
+    async fn list(&self, include_retired: bool) -> Result<Vec<GraphSummary>, CoreBoundaryError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Request {
+            include_retired: bool,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            #[serde(default)]
+            graphs: Vec<Summary>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Summary {
+            graph_id: String,
+            #[serde(default)]
+            current_generation: u64,
+            phase: String,
+            #[serde(default)]
+            created: bool,
+            #[serde(default)]
+            retired: bool,
+        }
+
+        let response = reqwest::Client::new()
+            .post(self.rpc_url("ListGraphs"))
+            .header("connect-protocol-version", "1")
+            .json(&Request { include_retired })
+            .send()
+            .await
+            .map_err(|error| CoreBoundaryError::Transport(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(CoreBoundaryError::Transport(format!(
+                "ListGraphs returned HTTP {}",
+                response.status()
+            )));
+        }
+        let response: Response = response
+            .json()
+            .await
+            .map_err(|error| CoreBoundaryError::Transport(error.to_string()))?;
+        response
+            .graphs
+            .into_iter()
+            .map(|summary| {
+                Ok(GraphSummary {
+                    graph: summary.graph_id,
+                    generation: summary.current_generation,
+                    phase: graph_phase_from_wire(&summary.phase)?,
+                    created: summary.created,
+                    retired: summary.retired,
+                })
+            })
+            .collect()
     }
 
     async fn watch(&self, graph: &str) -> Result<watch::Receiver<GraphStatus>, CoreBoundaryError> {
@@ -520,6 +599,20 @@ fn status_from_response(
     })
 }
 
+fn graph_phase_from_wire(value: &str) -> Result<GraphPhase, CoreBoundaryError> {
+    match value {
+        "GRAPH_PHASE_PLANNING" => Ok(GraphPhase::Planning),
+        "GRAPH_PHASE_BLOCKED" => Ok(GraphPhase::Blocked),
+        "GRAPH_PHASE_RECONCILING" => Ok(GraphPhase::Reconciling),
+        "GRAPH_PHASE_READY" => Ok(GraphPhase::Ready),
+        "GRAPH_PHASE_FAILED" => Ok(GraphPhase::Failed),
+        "GRAPH_PHASE_RETIRED" => Ok(GraphPhase::Retired),
+        other => Err(CoreBoundaryError::Rejected(format!(
+            "ListGraphs returned unknown phase {other:?}"
+        ))),
+    }
+}
+
 fn transport(error: connectrpc::ConnectError) -> CoreBoundaryError {
     if error.code == connectrpc::ErrorCode::InvalidArgument {
         CoreBoundaryError::Rejected(error.message.clone().unwrap_or_else(|| error.to_string()))
@@ -597,6 +690,25 @@ impl CoreBoundary for FakeCoreBoundary {
             .get(graph)
             .map(|sender| sender.borrow().clone())
             .ok_or_else(|| CoreBoundaryError::GraphNotFound(graph.to_string()))
+    }
+
+    async fn list(&self, include_retired: bool) -> Result<Vec<GraphSummary>, CoreBoundaryError> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .statuses
+            .values()
+            .map(|sender| sender.borrow().clone())
+            .filter(|status| include_retired || status.phase != GraphPhase::Retired)
+            .map(|status| GraphSummary {
+                graph: status.graph,
+                generation: status.generation,
+                created: true,
+                retired: status.phase == GraphPhase::Retired,
+                phase: status.phase,
+            })
+            .collect())
     }
 
     async fn watch(&self, graph: &str) -> Result<watch::Receiver<GraphStatus>, CoreBoundaryError> {

@@ -98,6 +98,8 @@ pub trait GraphFileRepository: Send + Sync {
         &self,
     ) -> impl Future<Output = anyhow::Result<BTreeMap<String, Vec<u8>>>> + Send;
 
+    fn owned_graphs(&self) -> impl Future<Output = anyhow::Result<BTreeSet<String>>> + Send;
+
     fn write_graph_file(
         &self,
         path: &str,
@@ -129,6 +131,17 @@ impl GraphFileRepository for GithubGraphFileRepository {
             .await?
             .into_iter()
             .map(|file| (file.path, file.content.into_bytes()))
+            .collect())
+    }
+
+    async fn owned_graphs(&self) -> anyhow::Result<BTreeSet<String>> {
+        Ok(self
+            .repository
+            .client
+            .paths_ever_changed_under(GRAPH_DIRECTORY, &self.branch)
+            .await?
+            .into_iter()
+            .filter_map(|path| graph_from_path(&path))
             .collect())
     }
 
@@ -283,15 +296,20 @@ where
         }
 
         let incoming_graphs = incoming.keys().cloned().collect::<BTreeSet<_>>();
-        let retired = self
-            .seen
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .difference(&incoming_graphs)
+        let owned_graphs = self.repository.owned_graphs().await?;
+        let live_graphs = self
+            .core
+            .list(false)
+            .await?
+            .into_iter()
+            .map(|summary| summary.graph)
+            .collect::<BTreeSet<_>>();
+        let orphaned = owned_graphs
+            .intersection(&live_graphs)
+            .filter(|graph| !incoming_graphs.contains(*graph))
             .cloned()
             .collect::<Vec<_>>();
-        for graph in retired {
+        for graph in orphaned {
             self.core.apply(GraphIntent::Retire { graph }).await?;
             changes += 1;
         }
@@ -329,6 +347,20 @@ pub async fn named_graph<R: GraphFileRepository>(
     repository: &R,
     name: &str,
 ) -> Result<Option<GraphIntentFile>, GitSyncError> {
+    find_graph(repository, |intent| intent.name == name).await
+}
+
+pub async fn graph_file<R: GraphFileRepository>(
+    repository: &R,
+    graph: &str,
+) -> Result<Option<GraphIntentFile>, GitSyncError> {
+    find_graph(repository, |intent| intent.graph == graph).await
+}
+
+async fn find_graph<R: GraphFileRepository>(
+    repository: &R,
+    predicate: impl Fn(&GraphIntentFile) -> bool,
+) -> Result<Option<GraphIntentFile>, GitSyncError> {
     for (path, bytes) in repository.read_graph_files().await? {
         if !path.ends_with(".toml") {
             continue;
@@ -338,7 +370,7 @@ pub async fn named_graph<R: GraphFileRepository>(
         let intent: GraphIntentFile = toml::from_str(text)
             .map_err(|error| GitSyncError::Decode(format!("{path}: {error}")))?;
         validate(&path, &intent)?;
-        if intent.name == name {
+        if predicate(&intent) {
             return Ok(Some(intent));
         }
     }
@@ -347,6 +379,13 @@ pub async fn named_graph<R: GraphFileRepository>(
 
 pub fn graph_path(graph: &str) -> String {
     format!("{GRAPH_DIRECTORY}/{graph}.toml")
+}
+
+fn graph_from_path(path: &str) -> Option<String> {
+    path.strip_prefix(&format!("{GRAPH_DIRECTORY}/"))?
+        .strip_suffix(".toml")
+        .filter(|graph| !graph.is_empty() && !graph.contains('/'))
+        .map(str::to_owned)
 }
 
 fn acknowledge(intent: &mut GraphIntentFile, status: &GraphStatus) -> Result<(), GitSyncError> {
@@ -626,6 +665,26 @@ mod tests {
                 .collect()
         }
 
+        async fn owned_graphs(&self) -> anyhow::Result<BTreeSet<String>> {
+            let checkout = self.checkout();
+            let output = Command::new("git")
+                .current_dir(checkout.path())
+                .args([
+                    "log",
+                    "--format=",
+                    "--name-only",
+                    "--all",
+                    "--",
+                    GRAPH_DIRECTORY,
+                ])
+                .output()?;
+            anyhow::ensure!(output.status.success(), "git log failed");
+            Ok(String::from_utf8(output.stdout)?
+                .lines()
+                .filter_map(graph_from_path)
+                .collect())
+        }
+
         async fn write_graph_file(
             &self,
             path: &str,
@@ -669,7 +728,9 @@ mod tests {
         ));
 
         frontend.repository.edit(graph, None);
-        assert_eq!(frontend.sync_from_main().await.unwrap(), 1);
+        let repository = frontend.repository;
+        let mut restarted_frontend = GitSyncFrontend::new(repository, core.clone());
+        assert_eq!(restarted_frontend.sync_from_main().await.unwrap(), 1);
         assert!(matches!(
             core.intents().await.last(),
             Some(GraphIntent::Retire { graph: retired }) if retired == graph

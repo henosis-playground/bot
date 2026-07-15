@@ -1563,6 +1563,7 @@ dependencies = [
  "connectrpc",
  "henosis-proto 0.0.0 (git+https://github.com/henosis-playground/core.git?branch=d26-core)",
  "hex",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

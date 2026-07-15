@@ -12,7 +12,7 @@ use henosis_bundle::{
 };
 use henosis_core_boundary::{
     BundlePin, ConnectCoreBoundary, CoreBoundary, CoreBoundaryError, GraphIntent, GraphPhase,
-    GraphSourcePolicy, GraphStatus, SourceProvenance,
+    GraphSourcePolicy, GraphStatus, GraphSummary, SourceProvenance,
 };
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +69,9 @@ pub struct PipelineArgs {
     /// Select this graph and save it in .henosis/context.
     #[arg(long)]
     pub graph: Option<String>,
+    /// Frontend-owned environment name to present with --graph (saved in context).
+    #[arg(long, requires = "graph")]
+    pub name: Option<String>,
     /// Core GraphService URL (saved with --graph).
     #[arg(long)]
     pub core: Option<String>,
@@ -88,6 +91,9 @@ pub struct TargetArgs {
     /// Select this graph and save it in .henosis/context.
     #[arg(long)]
     pub graph: Option<String>,
+    /// Frontend-owned environment name to present with --graph (saved in context).
+    #[arg(long, requires = "graph")]
+    pub name: Option<String>,
     /// Core GraphService URL (saved with --graph).
     #[arg(long)]
     pub core: Option<String>,
@@ -129,9 +135,16 @@ pub enum CliError {
     #[error(transparent)]
     Core(#[from] CoreBoundaryError),
     #[error("no graph is selected")]
-    ContextMissing,
+    ContextMissing {
+        core: String,
+        graphs: Vec<GraphSummary>,
+    },
     #[error("the selected graph `{graph}` no longer exists at {core}")]
-    ContextStale { graph: String, core: String },
+    ContextStale {
+        graph: String,
+        core: String,
+        graphs: Vec<GraphSummary>,
+    },
     #[error("graph `{graph}` does not exist at {core}")]
     GraphMissing { graph: String, core: String },
     #[error("deployment generation {generation} failed")]
@@ -154,7 +167,7 @@ impl CliError {
             | Self::Write { .. }
             | Self::Decode { .. }
             | Self::Core(_)
-            | Self::ContextMissing
+            | Self::ContextMissing { .. }
             | Self::ContextStale { .. }
             | Self::GraphMissing { .. } => ErrorClass::FatalSetup,
         }
@@ -170,14 +183,24 @@ impl CliError {
 
     pub fn diagnostic(&self) -> String {
         let (code, summary, help) = match self {
-            Self::ContextMissing => (
+            Self::ContextMissing { core, graphs } => (
                 "HENOSIS_CONTEXT_MISSING",
-                "no graph is selected for this repository".to_string(),
+                format!(
+                    "no graph is selected for this repository{}",
+                    render_graph_discovery(core, graphs)
+                ),
                 "Select an existing graph with `henosis deploy --graph <graph-id>`, or explicitly create one with `henosis deploy --graph <graph-id> --create`.",
             ),
-            Self::ContextStale { graph, core } => (
+            Self::ContextStale {
+                graph,
+                core,
+                graphs,
+            } => (
                 "HENOSIS_CONTEXT_STALE",
-                format!("selected graph `{graph}` no longer exists at {core}"),
+                format!(
+                    "selected graph `{graph}` no longer exists at {core}{}",
+                    render_graph_discovery(core, graphs)
+                ),
                 "Select another existing graph with `henosis deploy --graph <graph-id>`. Add `--create` only when you intend to create a new graph.",
             ),
             Self::GraphMissing { graph, core } => (
@@ -233,15 +256,44 @@ impl CliError {
     }
 }
 
+fn render_graph_discovery(core: &str, graphs: &[GraphSummary]) -> String {
+    if graphs.is_empty() {
+        return format!("; no live graphs were found at {core}");
+    }
+    let discovered = graphs
+        .iter()
+        .map(|graph| {
+            format!(
+                "  {} (generation {}, {})",
+                graph.graph,
+                graph.generation,
+                match graph.phase {
+                    GraphPhase::Planning => "planning",
+                    GraphPhase::Blocked => "blocked",
+                    GraphPhase::Reconciling => "reconciling",
+                    GraphPhase::Ready => "ready",
+                    GraphPhase::Failed => "failed",
+                    GraphPhase::Retired => "retired",
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("\n\nLive graphs at {core}:\n{discovered}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalContext {
     graph: String,
+    #[serde(default)]
+    name: Option<String>,
     core: String,
 }
 
 #[derive(Debug, Clone)]
 struct SelectedTarget {
     graph: String,
+    name: Option<String>,
     core: String,
     current: Option<GraphStatus>,
     create: bool,
@@ -266,9 +318,17 @@ pub async fn run(cli: Cli) -> Result<String, CliError> {
         Command::Deploy(args) => deploy(args).await,
         Command::Dev(args) => dev(args).await,
         Command::Status(args) => {
-            let target =
-                select_target(Path::new("."), &args.graph, &args.core, false, false).await?;
+            let target = select_target(
+                Path::new("."),
+                &args.graph,
+                &args.name,
+                &args.core,
+                false,
+                false,
+            )
+            .await?;
             Ok(render_status(
+                target.name.as_deref(),
                 target
                     .current
                     .as_ref()
@@ -277,8 +337,15 @@ pub async fn run(cli: Cli) -> Result<String, CliError> {
             ))
         }
         Command::Retire(args) => {
-            let target =
-                select_target(Path::new("."), &args.graph, &args.core, false, false).await?;
+            let target = select_target(
+                Path::new("."),
+                &args.graph,
+                &args.name,
+                &args.core,
+                false,
+                false,
+            )
+            .await?;
             let current = target.current.expect("retire selection requires graph");
             let core = ConnectCoreBoundary::new(&target.core);
             let status = core
@@ -287,10 +354,11 @@ pub async fn run(cli: Cli) -> Result<String, CliError> {
                 })
                 .await?;
             Ok(format!(
-                "retired graph at generation {} (previous generation {})\n{}",
+                "retired environment {} at generation {} (previous generation {})\n{}",
+                environment_identity(target.name.as_deref(), &status.graph),
                 status.generation,
                 current.generation,
-                render_status(&status, args.demo_targets)
+                render_status(target.name.as_deref(), &status, args.demo_targets)
             ))
         }
     }
@@ -300,6 +368,7 @@ async fn deploy(args: PipelineArgs) -> Result<String, CliError> {
     let target = select_target(
         &args.repository,
         &args.graph,
+        &args.name,
         &args.core,
         args.create,
         args.require_vcs,
@@ -312,6 +381,7 @@ async fn dev(args: PipelineArgs) -> Result<String, CliError> {
     let mut target = select_target(
         &args.repository,
         &args.graph,
+        &args.name,
         &args.core,
         args.create,
         args.require_vcs,
@@ -332,7 +402,7 @@ async fn dev(args: PipelineArgs) -> Result<String, CliError> {
                 dependencies = cycle.dependencies;
                 active_generation = cycle.generation;
                 transient_attempt = 0;
-                target = select_target(&args.repository, &None, &None, false, false).await?;
+                target = select_target(&args.repository, &None, &None, &None, false, false).await?;
             }
             Err(error) => match error.classify() {
                 ErrorClass::FixSource => {
@@ -444,12 +514,19 @@ async fn run_cycle(
         &repository,
         &LocalContext {
             graph: target.graph.clone(),
+            name: target.name.clone(),
             core: target.core.clone(),
         },
     )?;
     emit_stdout(&format!("accepted generation {}\n", accepted.generation));
-    let terminal =
-        stream_generation(&core, &target.graph, accepted.generation, args.demo_targets).await?;
+    let terminal = stream_generation(
+        &core,
+        target.name.as_deref(),
+        &target.graph,
+        accepted.generation,
+        args.demo_targets,
+    )
+    .await?;
     if terminal.phase == GraphPhase::Failed {
         return Err(CliError::DeploymentFailed {
             generation: terminal.generation,
@@ -465,6 +542,7 @@ async fn run_cycle(
 async fn select_target(
     repository: &Path,
     graph: &Option<String>,
+    name: &Option<String>,
     core: &Option<String>,
     create: bool,
     require_vcs: bool,
@@ -475,20 +553,31 @@ async fn select_target(
     })?;
     let explicit = graph.as_ref().map(|graph| LocalContext {
         graph: graph.clone(),
+        name: name.clone(),
         core: core.clone().unwrap_or_else(|| DEFAULT_CORE.to_string()),
     });
     let (context, from_file) = match explicit {
         Some(context) => (context, false),
-        None => (read_context(&repository)?, true),
+        None => match read_context(&repository) {
+            Ok(context) => (context, true),
+            Err(CliError::ContextMissing { .. }) => {
+                let core = DEFAULT_CORE.to_string();
+                let graphs = ConnectCoreBoundary::new(&core).list(false).await?;
+                return Err(CliError::ContextMissing { core, graphs });
+            }
+            Err(error) => return Err(error),
+        },
     };
     let boundary = ConnectCoreBoundary::new(&context.core);
     let current = match boundary.status(&context.graph).await {
         Ok(status) => Some(status),
         Err(CoreBoundaryError::GraphNotFound(_)) if create && !from_file => None,
         Err(CoreBoundaryError::GraphNotFound(_)) if from_file => {
+            let graphs = boundary.list(false).await?;
             return Err(CliError::ContextStale {
                 graph: context.graph,
                 core: context.core,
+                graphs,
             });
         }
         Err(CoreBoundaryError::GraphNotFound(_)) => {
@@ -504,6 +593,7 @@ async fn select_target(
     }
     Ok(SelectedTarget {
         graph: context.graph,
+        name: context.name,
         core: context.core,
         current,
         create,
@@ -520,7 +610,10 @@ fn read_context(repository: &Path) -> Result<LocalContext, CliError> {
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(CliError::ContextMissing);
+            return Err(CliError::ContextMissing {
+                core: DEFAULT_CORE.to_string(),
+                graphs: Vec::new(),
+            });
         }
         Err(source) => return Err(CliError::Read { path, source }),
     };
@@ -782,6 +875,7 @@ fn changed_components(current: Option<&GraphStatus>, pins: &[BundlePin]) -> Vec<
 
 async fn stream_generation(
     core: &ConnectCoreBoundary,
+    name: Option<&str>,
     graph: &str,
     generation: u64,
     demo_targets: bool,
@@ -796,7 +890,7 @@ async fn stream_generation(
             })?;
             continue;
         }
-        let event = render_status_event(&status, demo_targets);
+        let event = render_status_event(name, &status, demo_targets);
         if previous.as_ref() != Some(&event) {
             emit_stdout(&event);
             previous = Some(event);
@@ -818,10 +912,14 @@ fn emit_stdout(text: &str) {
     std::io::stdout().flush().ok();
 }
 
+fn environment_identity(name: Option<&str>, graph: &str) -> String {
+    format!("{} ({graph})", name.unwrap_or("unnamed"))
+}
+
 fn render_target_banner(target: &SelectedTarget, source: &SourceProvenance) -> String {
     format!(
-        "graph: {}\nsource: {}\ncore: {}\n\n",
-        target.graph,
+        "environment: {}\nsource: {}\ncore: {}\n\n",
+        environment_identity(target.name.as_deref(), &target.graph),
         render_provenance(source),
         target.core
     )
@@ -902,7 +1000,7 @@ fn render_artifact_result(artifacts: &[BuiltArtifact]) -> String {
     rendered
 }
 
-fn render_status_event(status: &GraphStatus, demo_targets: bool) -> String {
+fn render_status_event(name: Option<&str>, status: &GraphStatus, demo_targets: bool) -> String {
     let mut rendered = match status.phase {
         GraphPhase::Planning => format!("planning generation {}\n", status.generation),
         GraphPhase::Blocked => {
@@ -973,6 +1071,7 @@ fn render_status_event(status: &GraphStatus, demo_targets: bool) -> String {
         }
         GraphPhase::Retired => format!("retired: generation {}\n", status.generation),
     };
+    rendered = format!("{}: {rendered}", environment_identity(name, &status.graph));
     if status.phase == GraphPhase::Ready {
         for output in &status.outputs {
             let value = output
@@ -995,12 +1094,15 @@ fn render_status_event(status: &GraphStatus, demo_targets: bool) -> String {
     rendered
 }
 
-fn render_status(status: &GraphStatus, demo_targets: bool) -> String {
+fn render_status(name: Option<&str>, status: &GraphStatus, demo_targets: bool) -> String {
     let mut rendered = format!(
-        "graph: {}\ngeneration: {}\nplan: {} resource(s)\nobserved-ready: {}\n",
-        status.graph, status.generation, status.planned_resources, status.observed_ready
+        "environment: {}\ngeneration: {}\nplan: {} resource(s)\nobserved-ready: {}\n",
+        environment_identity(name, &status.graph),
+        status.generation,
+        status.planned_resources,
+        status.observed_ready
     );
-    rendered.push_str(&render_status_event(status, demo_targets));
+    rendered.push_str(&render_status_event(name, status, demo_targets));
     rendered
 }
 
@@ -1089,6 +1191,13 @@ mod tests {
             CliError::ContextStale {
                 graph: "graph_070w3ge1r70w3ge1r70w3ge1r7".to_string(),
                 core: "http://127.0.0.1:4481".to_string(),
+                graphs: vec![GraphSummary {
+                    graph: "graph_01k00000000000000000000000".to_string(),
+                    generation: 3,
+                    phase: GraphPhase::Ready,
+                    created: true,
+                    retired: false,
+                }],
             }
             .diagnostic()
         );
@@ -1146,7 +1255,14 @@ mod tests {
             CliError::Core(CoreBoundaryError::Transport("offline".to_string())).classify(),
             ErrorClass::Transient
         );
-        assert_eq!(CliError::ContextMissing.classify(), ErrorClass::FatalSetup);
+        assert_eq!(
+            CliError::ContextMissing {
+                core: DEFAULT_CORE.to_string(),
+                graphs: Vec::new(),
+            }
+            .classify(),
+            ErrorClass::FatalSetup
+        );
     }
 
     #[test]

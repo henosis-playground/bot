@@ -261,6 +261,61 @@ impl GithubRepositoryClient {
             .collect())
     }
 
+    pub async fn paths_ever_changed_under(
+        &self,
+        path: &str,
+        branch: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let repo = self
+            .client
+            .repos(self.repository().owner(), self.repository().name());
+        let mut page_number = 1_u32;
+        let mut paths = Vec::new();
+        loop {
+            let page = repo
+                .list_commits()
+                .branch(branch)
+                .path(path)
+                .per_page(100_u8)
+                .page(page_number)
+                .send()
+                .await?;
+            if page.items.is_empty() {
+                break;
+            }
+            let has_next = page.next.is_some();
+            for commit in page.items {
+                let route = format!(
+                    "/repos/{}/{}/commits/{}",
+                    self.repository().owner(),
+                    self.repository().name(),
+                    commit.sha
+                );
+                let detail: octocrab::models::repos::RepoCommit =
+                    self.client.get(route, None::<&()>).await?;
+                paths.extend(
+                    detail
+                        .files
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|file| {
+                            [Some(file.filename), file.previous_filename]
+                                .into_iter()
+                                .flatten()
+                        })
+                        .filter(|filename| filename.starts_with(path)),
+                );
+            }
+            if !has_next {
+                break;
+            }
+            page_number += 1;
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
     pub async fn write_file_to_branch(
         &self,
         path: &str,
