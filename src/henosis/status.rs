@@ -98,7 +98,10 @@ fn environment_cell(snapshot: &StatusSnapshot) -> String {
                 links.push(format!("{prefix}: [{generation}]({})", link.url));
             }
         }
-        None => links.push("rendered manifest: not published".to_string()),
+        None => links.push(format!(
+            "[rendered branch]({})",
+            deploy_branch_url(&snapshot.manifest_url, &snapshot.environment.branch)
+        )),
     }
     format!("{identity}<br>{}", links.join(" · "))
 }
@@ -108,6 +111,13 @@ fn rendered_manifest_url(publication_url: &str, revision: &str) -> String {
         .strip_suffix(&format!("/commit/{revision}"))
         .map(|repo| format!("{repo}/blob/{revision}/manifest.json"))
         .unwrap_or_else(|| publication_url.to_string())
+}
+
+fn deploy_branch_url(manifest_url: &str, branch: &str) -> String {
+    manifest_url
+        .split_once("/blob/")
+        .map(|(repo, _)| format!("{repo}/tree/{branch}"))
+        .unwrap_or_else(|| manifest_url.to_string())
 }
 
 pub fn upsert_status_section(body: &str, section: &str) -> String {
@@ -348,7 +358,7 @@ mod tests {
 
 | | |
 |---|---|
-| Environment | **shared-demo** · `preview-00000000-0000-4000-8000-000000000001`<br>[manifest](https://github.com/henosis-playground/deploy/blob/main/preview.toml) · rendered manifest: not published |
+| Environment | **shared-demo** · `preview-00000000-0000-4000-8000-000000000001`<br>[manifest](https://github.com/henosis-playground/deploy/blob/main/preview.toml) · [rendered branch](https://github.com/henosis-playground/deploy/tree/env/preview-00000000-0000-4000-8000-000000000001) |
 | Members | [henosis-playground/service-a#12](https://github.com/henosis-playground/service-a/pull/12) (this PR), [henosis-playground/service-b#34](https://github.com/henosis-playground/service-b/pull/34) |
 | Merge gate | final: :x: failed ([details](https://github.com/henosis-playground/service-a/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/checks))<br>advisory: :white_check_mark: passed ([details](https://github.com/henosis-playground/service-a/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/checks)) |
 | Render | :x: failed ([run](https://github.com/henosis-playground/deploy/actions/runs/1)) |

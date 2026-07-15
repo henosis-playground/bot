@@ -1023,7 +1023,11 @@ fn ui_links_from_status(status: &GraphStatus) -> Vec<UiLink> {
             url::Url::parse(url)
                 .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
                 .then(|| UiLink {
-                    label: output.reference.clone(),
+                    label: if output.reference.starts_with("database.outputs.") {
+                        format!("{} (fake/local)", output.reference)
+                    } else {
+                        output.reference.clone()
+                    },
                     url: url.to_string(),
                 })
         })
