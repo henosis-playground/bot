@@ -50,6 +50,8 @@ pub async fn wait_for_core_status_wake() {
 struct D26PreviewWriter {
     core: ConnectCoreBoundary,
     request: PreviewPullRequest,
+    deploy_repo: Arc<crate::bors::RepositoryState>,
+    manifest_branch: String,
     checkout_subdir: Option<PathBuf>,
     bundle_root: PathBuf,
     artifact_root: PathBuf,
@@ -152,6 +154,14 @@ impl DeployRepoWriter for D26PreviewWriter {
         )
         .p_minus(environment)
         .await?;
+        self.deploy_repo
+            .client
+            .delete_file_from_branch(
+                &crate::henosis::git_sync::graph_path(environment),
+                &self.manifest_branch,
+                "Retire Henosis graph",
+            )
+            .await?;
         Ok(())
     }
 
@@ -435,13 +445,15 @@ fn environment_manager(config: &HenosisConfig) -> EnvironmentManager {
 
 fn preview_writer<'a>(
     config: &HenosisConfig,
-    _deploy_repo: &'a crate::bors::RepositoryState,
+    deploy_repo: &'a Arc<crate::bors::RepositoryState>,
     request: PreviewPullRequest,
 ) -> anyhow::Result<PreviewWriter<'a>> {
     if let Some(core_api) = config.core_api.as_ref() {
         return Ok(PreviewWriter::D26(D26PreviewWriter {
             core: ConnectCoreBoundary::new(&core_api.endpoint),
             request,
+            deploy_repo: deploy_repo.clone(),
+            manifest_branch: config.manifest_branch.clone(),
             checkout_subdir: core_api
                 .preview_checkout_subdir
                 .as_deref()
@@ -453,7 +465,7 @@ fn preview_writer<'a>(
     #[cfg(test)]
     {
         Ok(PreviewWriter::LegacyTest(GithubDeployRepoWriter::new(
-            &_deploy_repo.client,
+            &deploy_repo.client,
             &config.manifest_branch,
         )))
     }
@@ -1128,11 +1140,12 @@ async fn reconcile_environment_status(
     };
     let deploy_repository = deploy_repo(ctx, config)?;
     let graph_files = crate::henosis::git_sync::GithubGraphFileRepository::new(
-        deploy_repository,
+        deploy_repository.clone(),
         &config.manifest_branch,
     );
-    if let Some(pin) = crate::henosis::git_sync::graph_file(&graph_files, environment_id).await? {
-        environment.display_label = Some(pin.name);
+    let graph_file = crate::henosis::git_sync::graph_file(&graph_files, environment_id).await?;
+    if let Some(pin) = graph_file.as_ref() {
+        environment.display_label = Some(pin.name.clone());
     }
     let members = environment_store.active_members(environment_id).await?;
     let core_status = if let Some(core_api) = config.core_api.as_ref() {
@@ -1145,6 +1158,22 @@ async fn reconcile_environment_status(
     } else {
         None
     };
+    if let (Some(core_api), Some(status)) = (config.core_api.as_ref(), core_status.as_ref())
+        && graph_file.as_ref().is_none_or(|file| {
+            file.name != presentation_name(&environment) || file.generation != status.generation
+        })
+    {
+        let mut frontend = crate::henosis::git_sync::GitSyncFrontend::new(
+            crate::henosis::git_sync::GithubGraphFileRepository::new(
+                deploy_repository,
+                &config.manifest_branch,
+            ),
+            ConnectCoreBoundary::new(&core_api.endpoint),
+        );
+        frontend
+            .publish_graph(presentation_name(&environment), status)
+            .await?;
+    }
     let render =
         if let (Some(core_api), Some(status)) = (config.core_api.as_ref(), core_status.as_ref()) {
             let outcome = outcome_from_core_status(core_api, status);
