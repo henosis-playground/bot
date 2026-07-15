@@ -19,6 +19,8 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY askama.toml .
 COPY Cargo.toml .
 COPY Cargo.lock .
+COPY crates crates
+COPY tools tools
 COPY migrations migrations
 COPY .sqlx .sqlx
 COPY src src
@@ -32,35 +34,20 @@ ENV GIT_VERSION=${GIT_VERSION}
 
 RUN cargo build --release --locked
 
-FROM node:22-trixie-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 WORKDIR /
-
-ARG PLATFORM_REPO=https://github.com/henosis-playground/platform.git
-ARG PLATFORM_REF=main
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         git \
-        jq \
         openssl \
     && rm -rf /var/lib/apt/lists/*
 
-ADD https://api.github.com/repos/henosis-playground/platform/commits/main /tmp/platform-main.json
-
-RUN corepack enable \
-    && corepack prepare pnpm@11.3.0 --activate \
-    && git clone --depth=1 --branch "$PLATFORM_REF" "$PLATFORM_REPO" /opt/henosis-platform \
-    && cd /opt/henosis-platform \
-    && pnpm install --frozen-lockfile \
-    && pnpm build \
-    && printf '#!/bin/sh\nexec node /opt/henosis-platform/packages/renderer/dist/gate.js "$@"\n' > /usr/local/bin/henosis-gate \
-    && chmod +x /usr/local/bin/henosis-gate \
-    && pnpm store prune
-
 COPY --from=build /app/target/release/bors .
+COPY --from=build /app/target/release/henosis /usr/local/bin/henosis
 
 EXPOSE 8080
 

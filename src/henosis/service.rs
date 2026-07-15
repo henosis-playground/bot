@@ -1,7 +1,6 @@
 use crate::BorsContext;
 use crate::bors::Comment;
 use crate::bors::event::{PushToBranch, WorkflowRunCompleted};
-use crate::database::WorkflowStatus;
 use crate::github::{GithubRepoName, PullRequest, PullRequestNumber};
 use crate::henosis::config::{HenosisConfig, PreviewMode};
 use crate::henosis::core_client::{
@@ -16,19 +15,16 @@ use crate::henosis::environment::{
 };
 use crate::henosis::gate::{CliGateExecutor, GateExecutor};
 use crate::henosis::github::{
-    GitHubMergeExecutor, GithubComponentPackageReader, GithubDeployRepoWriter,
-    GithubDevManifestBumper, GithubDevManifestReader, GithubGateCheckReporter,
-    GithubImageDigestResolver, GithubPrCommenter, GithubRepoValidationChecker, deploy_manifest_url,
+    GitHubMergeExecutor, GithubComponentPackageReader, GithubDevManifestReader,
+    GithubGateCheckReporter, GithubImageDigestResolver, GithubPrCommenter,
+    GithubRepoValidationChecker, deploy_manifest_url,
 };
 use crate::henosis::queue::{
     ADVISORY_FAILED_STATUS, ADVISORY_PASSED_STATUS, AdvisoryGateStore, CheckConclusion,
     GateCheckReporter, MERGED_STATUS, PrCommenter, QueueHooks, QueueManager, QueuePullRequest,
     QueueStore, RecordedGateRun, advisory_gate_external_id,
 };
-use crate::henosis::render_diagnostics::{
-    DiagnosticPresentation, RenderFailureDiagnostic, fallback_render_failure_diagnostic,
-    generate_render_failure_diagnostic, render_failure_comment,
-};
+use crate::henosis::render_diagnostics::{DiagnosticPresentation, render_failure_comment};
 use crate::henosis::status::{
     StatusSnapshot, remove_status_section, render_status_section, upsert_status_section,
 };
@@ -44,10 +40,7 @@ pub async fn wait_for_core_status_wake() {
     CORE_STATUS_WAKE.notified().await;
 }
 
-enum PreviewWriter<'a> {
-    Deploy(GithubDeployRepoWriter<'a>),
-    Core(CoreGraphWriter<'a, GithubComponentPackageReader<'a>>),
-}
+struct PreviewWriter<'a>(CoreGraphWriter<'a, GithubComponentPackageReader<'a>>);
 
 impl DeployRepoWriter for PreviewWriter<'_> {
     async fn write_manifest(
@@ -55,31 +48,19 @@ impl DeployRepoWriter for PreviewWriter<'_> {
         path: &str,
         contents: &str,
     ) -> anyhow::Result<DeployWriteResult> {
-        match self {
-            Self::Deploy(writer) => writer.write_manifest(path, contents).await,
-            Self::Core(writer) => writer.write_manifest(path, contents).await,
-        }
+        self.0.write_manifest(path, contents).await
     }
 
     async fn delete_manifest(&mut self, path: &str) -> anyhow::Result<()> {
-        match self {
-            Self::Deploy(writer) => writer.delete_manifest(path).await,
-            Self::Core(writer) => writer.delete_manifest(path).await,
-        }
+        self.0.delete_manifest(path).await
     }
 
     async fn create_branch(&mut self, branch: &str) -> anyhow::Result<()> {
-        match self {
-            Self::Deploy(writer) => writer.create_branch(branch).await,
-            Self::Core(writer) => writer.create_branch(branch).await,
-        }
+        self.0.create_branch(branch).await
     }
 
     async fn delete_branch(&mut self, branch: &str) -> anyhow::Result<()> {
-        match self {
-            Self::Deploy(writer) => writer.delete_branch(branch).await,
-            Self::Core(writer) => writer.delete_branch(branch).await,
-        }
+        self.0.delete_branch(branch).await
     }
 }
 
@@ -94,20 +75,17 @@ fn environment_manager(config: &HenosisConfig) -> EnvironmentManager {
 
 fn preview_writer<'a>(
     config: &HenosisConfig,
-    deploy_repo: &'a crate::bors::RepositoryState,
+    _deploy_repo: &'a crate::bors::RepositoryState,
     packages: &'a GithubComponentPackageReader<'a>,
 ) -> anyhow::Result<PreviewWriter<'a>> {
-    match config.core_api.as_ref() {
-        Some(core_api) => Ok(PreviewWriter::Core(CoreGraphWriter::new(
-            core_api,
-            config.registered_components(),
-            packages,
-        )?)),
-        None => Ok(PreviewWriter::Deploy(GithubDeployRepoWriter::new(
-            &deploy_repo.client,
-            &config.manifest_branch,
-        ))),
-    }
+    let core_api = config.core_api.as_ref().context(
+        "D26 previews require the Henosis core boundary; deploy-repo manifest writing was removed",
+    )?;
+    Ok(PreviewWriter(CoreGraphWriter::new(
+        core_api,
+        config.registered_components(),
+        packages,
+    )?))
 }
 
 pub fn is_henosis_component_repo(ctx: &BorsContext, repo: &GithubRepoName) -> bool {
@@ -606,142 +584,20 @@ pub async fn reconcile_status_for_pr(
 }
 
 pub async fn reconcile_dev_pin_after_component_push(
-    ctx: &BorsContext,
-    payload: &PushToBranch,
+    _ctx: &BorsContext,
+    _payload: &PushToBranch,
 ) -> anyhow::Result<bool> {
-    let Some(config) = ctx.henosis_config.as_ref() else {
-        return Ok(false);
-    };
-    let Some(component) = config.component_for_repo(&payload.repository.to_string()) else {
-        return Ok(false);
-    };
-    if payload.branch != component.main_branch {
-        return Ok(false);
-    }
-
-    let queue_store = PgQueueStore::new(ctx.db.pool().clone());
-    if queue_store
-        .has_gate_run_for_merge_commit_sha(&payload.sha)
-        .await?
-    {
-        return Ok(true);
-    }
-
-    let bump = GithubDevManifestBumper::new(&ctx.repositories, config)
-        .bump_component(&component.name, &component.repo, &payload.sha)
-        .await?;
-    tracing::info!(
-        component = component.name,
-        source_sha = payload.sha,
-        dev_bump = bump.commit_sha,
-        "Reconciled dev pin after component main-branch push"
-    );
-    Ok(true)
+    // D26 graph intent replaces deploy-repo dev-pin mutation.
+    Ok(false)
 }
 
 pub async fn handle_render_workflow_completed(
-    ctx: &BorsContext,
-    payload: &WorkflowRunCompleted,
+    _ctx: &BorsContext,
+    _payload: &WorkflowRunCompleted,
 ) -> anyhow::Result<bool> {
-    let Some(config) = ctx.henosis_config.as_ref() else {
-        return Ok(false);
-    };
-    if config.deploy_repo != payload.repository.to_string()
-        || config.render_workflow_name != payload.name
-        || config.manifest_branch != payload.branch
-    {
-        return Ok(false);
-    }
-
-    let status = match payload.status {
-        WorkflowStatus::Success => RenderStatus::Success,
-        WorkflowStatus::Failure => RenderStatus::Failure,
-        WorkflowStatus::Pending => return Ok(true),
-    };
-    let diagnostic = if status == RenderStatus::Failure {
-        Some(render_failure_diagnostic(ctx, payload).await)
-    } else {
-        None
-    };
-    let excerpt = diagnostic
-        .as_ref()
-        .map(|diagnostic| diagnostic.body.clone());
-    let presentation = diagnostic
-        .as_ref()
-        .map(|diagnostic| diagnostic.presentation)
-        .unwrap_or(DiagnosticPresentation::RawText);
-
-    let environment_store = PgEnvironmentStore::new(ctx.db.pool().clone());
-    let environments = if config.core_api.is_some() {
-        Vec::new()
-    } else {
-        environment_store
-            .active_preview_environments_for_commit_sha(&payload.commit_sha.0)
-            .await?
-    };
-    for environment in environments {
-        let outcome = RenderOutcome {
-            environment_id: environment.id.clone(),
-            commit_sha: payload.commit_sha.0.clone(),
-            status,
-            run_url: payload.url.clone(),
-            excerpt: excerpt.clone(),
-            generation: None,
-            publication: None,
-        };
-        let previous = environment_store
-            .latest_render_outcome(&environment.id)
-            .await?;
-        environment_store.record_render_outcome(&outcome).await?;
-        if should_post_render_failure(&previous, &outcome) {
-            for member in environment_store.active_members(&environment.id).await? {
-                post_render_failure_comment(
-                    ctx,
-                    &environment_store,
-                    &member.key,
-                    &outcome,
-                    "environment",
-                    presentation,
-                )
-                .await?;
-            }
-        }
-        reconcile_environment_status(ctx, &environment.id).await?;
-    }
-
-    let queue_store = PgQueueStore::new(ctx.db.pool().clone());
-    let merged_prs = queue_store
-        .pull_requests_for_dev_bump_commit_sha(&payload.commit_sha.0)
-        .await?;
-    if !merged_prs.is_empty() {
-        let outcome = RenderOutcome {
-            environment_id: "dev".to_string(),
-            commit_sha: payload.commit_sha.0.clone(),
-            status,
-            run_url: payload.url.clone(),
-            excerpt,
-            generation: None,
-            publication: None,
-        };
-        let previous = environment_store.latest_render_outcome("dev").await?;
-        environment_store.record_render_outcome(&outcome).await?;
-        if should_post_render_failure(&previous, &outcome) {
-            for key in &merged_prs {
-                post_render_failure_comment(
-                    ctx,
-                    &environment_store,
-                    key,
-                    &outcome,
-                    "environment",
-                    presentation,
-                )
-                .await?;
-            }
-        }
-        reconcile_status_for_keys(ctx, merged_prs).await?;
-    }
-
-    Ok(true)
+    // D26 moved rendering and target convergence into core controllers. Deploy-repo
+    // workflow completions are no longer a Henosis workflow input.
+    Ok(false)
 }
 
 async fn reconcile_status_for_change(
@@ -1058,25 +914,6 @@ fn should_post_render_failure(previous: &Option<RenderOutcome>, outcome: &Render
                     || previous.commit_sha != outcome.commit_sha
             })
             .unwrap_or(true)
-}
-
-async fn render_failure_diagnostic(
-    ctx: &BorsContext,
-    payload: &WorkflowRunCompleted,
-) -> RenderFailureDiagnostic {
-    let Some(repo) = ctx.repositories.get(&payload.repository) else {
-        return fallback_render_failure_diagnostic(payload);
-    };
-    match generate_render_failure_diagnostic(&repo.client, payload).await {
-        Ok(diagnostic) => diagnostic,
-        Err(error) => {
-            tracing::warn!(
-                "Could not build render failure diagnostic for workflow run {}: {error:?}",
-                payload.run_id
-            );
-            fallback_render_failure_diagnostic(payload)
-        }
-    }
 }
 
 async fn post_render_failure_comment(

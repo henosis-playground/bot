@@ -2,113 +2,32 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use anyhow::Context;
-use tokio::process::Command;
 
-use crate::henosis::environment::DevManifestReader;
 use crate::henosis::gate_report::GateReport;
-use crate::henosis::manifest::{self, EnvironmentSection, Manifest};
-use crate::henosis::queue::{GateRun, candidate_world_components};
+use crate::henosis::queue::GateRun;
 
 pub trait GateExecutor {
     async fn execute(&self, gate_run: &GateRun) -> anyhow::Result<GateReport>;
 }
 
-pub struct CliGateExecutor<D> {
-    gate_command: String,
-    dev_manifests: D,
-}
+/// Compile-time seam retained while the old queue is still present.
+///
+/// D26 removed renderer/gate-runner process execution. Henosis repositories now
+/// submit graph intent through the core boundary; non-Henosis repositories keep
+/// using bors' native merge queue unchanged.
+pub struct CliGateExecutor;
 
-impl<D> CliGateExecutor<D> {
-    pub fn new(gate_command: impl Into<String>, dev_manifests: D) -> Self {
-        Self {
-            gate_command: gate_command.into(),
-            dev_manifests,
-        }
+impl CliGateExecutor {
+    pub fn new<D>(_legacy_command: impl Into<String>, _legacy_dev_manifest: D) -> Self {
+        Self
     }
 }
 
-impl<D> GateExecutor for CliGateExecutor<D>
-where
-    D: DevManifestReader + Send + Sync,
-{
-    async fn execute(&self, gate_run: &GateRun) -> anyhow::Result<GateReport> {
-        let tempdir = tempfile::Builder::new()
-            .prefix("henosis-gate-")
-            .tempdir_in("/tmp")
-            .context("Cannot create Henosis gate tempdir")?;
-
-        let manifest_path = tempdir.path().join("candidate.toml");
-        let scratch_dir = tempdir.path().join("scratch");
-        let output_dir = tempdir.path().join("output");
-        tokio::fs::create_dir_all(&scratch_dir)
-            .await
-            .context("Cannot create Henosis gate scratch dir")?;
-        tokio::fs::create_dir_all(&output_dir)
-            .await
-            .context("Cannot create Henosis gate output dir")?;
-
-        let manifest = Manifest {
-            environment: EnvironmentSection {
-                id: "dev".to_string(),
-            },
-            components: candidate_world_components(&gate_run.world),
-        };
-        let toml = manifest::to_toml(&manifest).context("Cannot serialize candidate manifest")?;
-        tokio::fs::write(&manifest_path, toml)
-            .await
-            .with_context(|| {
-                format!(
-                    "Cannot write candidate manifest to {}",
-                    manifest_path.display()
-                )
-            })?;
-
-        let dev_manifest_path = tempdir.path().join("dev.toml");
-        let dev_manifest = self.dev_manifests.read_dev_manifest().await?;
-        let dev_toml = manifest::to_toml(&dev_manifest).context("Cannot serialize dev manifest")?;
-        tokio::fs::write(&dev_manifest_path, dev_toml)
-            .await
-            .with_context(|| {
-                format!(
-                    "Cannot write dev manifest to {}",
-                    dev_manifest_path.display()
-                )
-            })?;
-
-        let output = Command::new(&self.gate_command)
-            .arg(&manifest_path)
-            .arg("--scratch")
-            .arg(&scratch_dir)
-            .arg("--output")
-            .arg(&output_dir)
-            .arg("--dev-lockfile")
-            .arg(&dev_manifest_path)
-            .output()
-            .await
-            .with_context(|| format!("Cannot execute gate command `{}`", self.gate_command))?;
-
-        let report_path = output_dir.join("report.json");
-        let report_json = tokio::fs::read_to_string(&report_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "Cannot read gate report from {}. stdout:\n{}\nstderr:\n{}",
-                    report_path.display(),
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr),
-                )
-            })?;
-        let report = GateReport::parse(&report_json).context("Cannot parse gate report JSON")?;
-
-        if !output.status.success() && report.ok {
-            anyhow::bail!(
-                "Gate command `{}` exited with {} but reported ok=true",
-                self.gate_command,
-                output.status
-            );
-        }
-
-        Ok(report)
+impl GateExecutor for CliGateExecutor {
+    async fn execute(&self, _gate_run: &GateRun) -> anyhow::Result<GateReport> {
+        anyhow::bail!(
+            "the legacy renderer-backed merge gate was removed by D26; submit bundle graph intent and present core plan status instead"
+        )
     }
 }
 
@@ -138,23 +57,11 @@ impl GateExecutor for FakeGateExecutor {
 
 #[cfg(test)]
 mod tests {
-    use indexmap::IndexMap;
-
     use super::*;
-    use crate::henosis::environment::DevManifestReader;
     use crate::henosis::gate_report::GateFailure;
     use crate::henosis::queue::{
         CandidateComponent, CandidateWorld, PENDING_STATUS, QueuePullRequest, RecordedGateRun,
     };
-
-    #[derive(Clone)]
-    struct StaticDevManifest(Manifest);
-
-    impl DevManifestReader for StaticDevManifest {
-        async fn read_dev_manifest(&self) -> anyhow::Result<Manifest> {
-            Ok(self.0.clone())
-        }
-    }
 
     fn gate_run(external_id: &str) -> RecordedGateRun {
         RecordedGateRun {
@@ -206,9 +113,7 @@ mod tests {
                 resolved_sha: Some("2222222222222222222222222222222222222222".to_string()),
                 outputs_schema_at_pinned: Some(serde_json::json!({
                     "kind": "object",
-                    "shape": {
-                        "url": { "kind": "url" }
-                    }
+                    "shape": { "url": { "kind": "url" } }
                 })),
                 outputs_schema_at_resolved: Some(serde_json::json!({
                     "kind": "object",
@@ -227,92 +132,12 @@ mod tests {
         assert_eq!(executor.execute(&gate_run("gate-1")).await.unwrap(), report);
     }
 
-    #[test]
-    fn candidate_world_materializes_to_manifest_components() {
-        let run = gate_run("gate-1");
-        assert_eq!(
-            candidate_world_components(&run.world),
-            IndexMap::from([(
-                "service-a".to_string(),
-                manifest::pinned("henosis-playground/service-a", "a-pr", "sha256:a")
-            )])
-        );
-    }
-
     #[tokio::test]
-    async fn cli_gate_executor_writes_dev_manifest_with_legacy_gate_flag() {
-        let script_dir = tempfile::tempdir().unwrap();
-        let script_path = script_dir.path().join("gate.sh");
-        tokio::fs::write(
-            &script_path,
-            r#"#!/bin/sh
-set -eu
-output=""
-dev=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --output)
-      output="$2"
-      shift 2
-      ;;
-    --dev-lockfile)
-      dev="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-test -n "$output"
-test -n "$dev"
-test -f "$dev"
-case "$dev" in
-  /tmp/henosis-gate-*/dev.toml) ;;
-  *) exit 12 ;;
-esac
-grep -q 'b-main' "$dev"
-printf '{"ok":true,"failures":[]}\n' > "$output/report.json"
-"#,
-        )
-        .await
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mut permissions = tokio::fs::metadata(&script_path)
-                .await
-                .unwrap()
-                .permissions();
-            permissions.set_mode(0o755);
-            tokio::fs::set_permissions(&script_path, permissions)
-                .await
-                .unwrap();
-        }
-
-        let dev_manifest = Manifest {
-            environment: EnvironmentSection {
-                id: "dev".to_string(),
-            },
-            components: IndexMap::from([
-                (
-                    "service-a".to_string(),
-                    manifest::pinned("henosis-playground/service-a", "a-main", "sha256:a"),
-                ),
-                (
-                    "service-b".to_string(),
-                    manifest::pinned("henosis-playground/service-b", "b-main", "sha256:b"),
-                ),
-            ]),
-        };
-        let executor = CliGateExecutor::new(
-            script_path.to_string_lossy().to_string(),
-            StaticDevManifest(dev_manifest),
-        );
-
-        let report = executor.execute(&gate_run("gate-1")).await.unwrap();
-
-        assert!(report.ok);
+    async fn legacy_cli_gate_is_explicitly_retired() {
+        let error = CliGateExecutor::new("henosis-gate", ())
+            .execute(&gate_run("gate-1"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("removed by D26"));
     }
 }
