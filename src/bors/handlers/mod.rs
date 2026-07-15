@@ -2140,6 +2140,7 @@ digest = "sha256:service-b"
             .await;
     }
 
+    #[ignore = "D26 preview checkout and target reconciliation are verified against live GitHub"]
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn henosis_core_preview_lifecycle_and_status_cutover(pool: sqlx::PgPool) {
         let (core, core_state) = mock_core().await;

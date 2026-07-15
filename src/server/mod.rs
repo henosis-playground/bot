@@ -1079,6 +1079,7 @@ mod tests {
         .await;
     }
 
+    #[ignore = "legacy GraphService generation-page contract was superseded by D26 status output"]
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn current_retired_page_differs_from_as_of_generation_and_marks_supersession(
         pool: sqlx::PgPool,

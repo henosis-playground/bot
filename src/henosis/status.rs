@@ -371,11 +371,11 @@ mod tests {
 
         assert_eq!(
             row,
-            ":hourglass_flowing_sand: running ([current generation](https://henosis.example/graphs/preview_test/generations/4)); the latest terminal result can take about a minute to appear here"
+            ":hourglass_flowing_sand: running — waiting for the current generation to converge ([current generation](https://henosis.example/graphs/preview_test/generations/4))"
         );
         assert_eq!(
             render_row(Some(&render), false),
-            ":hourglass_flowing_sand: running ([run](https://henosis.example/graphs/preview_test/generations/4))"
+            ":hourglass_flowing_sand: running — reconciling ([current generation](https://henosis.example/graphs/preview_test/generations/4))"
         );
     }
 
