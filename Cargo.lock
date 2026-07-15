@@ -410,7 +410,7 @@ dependencies = [
  "graphql-parser",
  "henosis-bundle",
  "henosis-core-boundary",
- "henosis-proto",
+ "henosis-proto 0.0.0 (git+https://github.com/henosis-playground/core.git?branch=fix%2Fverification-loop-1)",
  "hex",
  "hmac 0.13.0",
  "http",
@@ -559,6 +559,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "castaway"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.60"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -667,6 +676,21 @@ checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
  "memchr",
+]
+
+[[package]]
+name = "compact_str"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9dfdd1c2274d9aa354115b09dc9a901d6c5576818cdf70d14cae2bdb47df00ab"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "rustversion",
+ "ryu",
+ "serde",
+ "static_assertions",
 ]
 
 [[package]]
@@ -1480,6 +1504,9 @@ name = "hashbrown"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
+dependencies = [
+ "allocator-api2",
+]
 
 [[package]]
 name = "hashlink"
@@ -1530,10 +1557,23 @@ dependencies = [
 name = "henosis-core-boundary"
 version = "0.1.0"
 dependencies = [
+ "connectrpc",
+ "henosis-proto 0.0.0",
+ "hex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "henosis-proto"
+version = "0.0.0"
+dependencies = [
+ "buffa",
+ "connectrpc",
+ "serde",
+ "workspace-hack 0.0.0",
 ]
 
 [[package]]
@@ -1550,7 +1590,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "workspace-hack",
+ "workspace-hack 0.0.0 (git+https://github.com/henosis-playground/core.git?branch=fix%2Fverification-loop-1)",
 ]
 
 [[package]]
@@ -1563,7 +1603,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "uuid",
- "workspace-hack",
+ "workspace-hack 0.0.0 (git+https://github.com/henosis-playground/core.git?branch=fix%2Fverification-loop-1)",
 ]
 
 [[package]]
@@ -1915,6 +1955,7 @@ checksum = "7b4a6248eb93a4401ed2f37dfe8ea592d3cf05b7cf4f8efa867b6895af7e094e"
 dependencies = [
  "console",
  "once_cell",
+ "serde",
  "similar",
  "tempfile",
 ]
@@ -2402,6 +2443,49 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "phf"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "010378780309880b08997fae13be7834dba947d36393bd372f2b1556deb2a2f6"
+dependencies = [
+ "phf_macros",
+ "phf_shared",
+ "serde",
+]
+
+[[package]]
+name = "phf_generator"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aeb62e0959d5a1bebc965f4d15d9e2b7cea002b6b0f5ba8cde6cc26738467100"
+dependencies = [
+ "fastrand",
+ "phf_shared",
+]
+
+[[package]]
+name = "phf_macros"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fa8d0ca26d424d27630da600c6624696e7dec8bf7b3b492b383c5dc49e5e085"
+dependencies = [
+ "phf_generator",
+ "phf_shared",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6fd9027e2d9319be6349febd1db4e8d02aa544921200c9b777720ac34a3aa89"
+dependencies = [
+ "siphasher",
+]
 
 [[package]]
 name = "pin-project"
@@ -3080,6 +3164,7 @@ version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -3216,6 +3301,12 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
 ]
+
+[[package]]
+name = "siphasher"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "slab"
@@ -3525,6 +3616,12 @@ dependencies = [
  "psm",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stringprep"
@@ -4632,6 +4729,50 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "workspace-hack"
+version = "0.0.0"
+dependencies = [
+ "allocator-api2",
+ "bitflags",
+ "bytes",
+ "cc",
+ "compact_str",
+ "either",
+ "errno",
+ "fastrand",
+ "flate2",
+ "form_urlencoded",
+ "futures-channel",
+ "futures-core",
+ "futures-sink",
+ "futures-util",
+ "getrandom 0.4.2",
+ "hashbrown 0.17.0",
+ "hyper",
+ "hyper-util",
+ "indexmap",
+ "insta",
+ "libc",
+ "memchr",
+ "miniz_oxide",
+ "once_cell",
+ "percent-encoding",
+ "phf",
+ "phf_shared",
+ "regex-syntax",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "slab",
+ "smallvec",
+ "syn",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
+use connectrpc::client::{ClientConfig, HttpClient};
+use henosis_proto::connect::henosis::v1::GraphServiceClient;
+use henosis_proto::proto::henosis::v1 as proto;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
 
@@ -87,6 +90,8 @@ pub enum CoreBoundaryError {
     GraphNotFound(String),
     #[error("core boundary rejected graph intent: {0}")]
     Rejected(String),
+    #[error("cannot reach core GraphService: {0}")]
+    Transport(String),
 }
 
 pub trait CoreBoundary: Send + Sync {
@@ -102,6 +107,205 @@ pub trait CoreBoundary: Send + Sync {
         &self,
         graph: &str,
     ) -> impl Future<Output = Result<watch::Receiver<GraphStatus>, CoreBoundaryError>> + Send;
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectCoreBoundary {
+    endpoint: String,
+}
+
+impl ConnectCoreBoundary {
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+        }
+    }
+
+    fn client(&self) -> Result<GraphServiceClient<HttpClient>, CoreBoundaryError> {
+        let endpoint = self
+            .endpoint
+            .parse()
+            .map_err(|error| CoreBoundaryError::Transport(format!("invalid core URL: {error}")))?;
+        Ok(GraphServiceClient::new(
+            HttpClient::plaintext(),
+            ClientConfig::new(endpoint),
+        ))
+    }
+
+    fn component(pin: BundlePin) -> Result<proto::ComponentIntent, CoreBoundaryError> {
+        let digest = hex::decode(&pin.bundle_id).map_err(|error| {
+            CoreBoundaryError::Rejected(format!(
+                "bundle {} has invalid hexadecimal identity: {error}",
+                pin.bundle_id
+            ))
+        })?;
+        Ok(proto::ComponentIntent {
+            name: Some(pin.component),
+            bundle_digest: Some(digest),
+            ..Default::default()
+        })
+    }
+}
+
+impl CoreBoundary for ConnectCoreBoundary {
+    async fn apply(&self, intent: GraphIntent) -> Result<GraphStatus, CoreBoundaryError> {
+        let client = self.client()?;
+        match intent {
+            GraphIntent::Create { graph, bundles } => {
+                let response = client
+                    .create_graph(proto::CreateGraphRequest {
+                        graph_id: Some(graph.clone()),
+                        name: Some(graph),
+                        components: bundles
+                            .into_iter()
+                            .map(Self::component)
+                            .collect::<Result<_, _>>()?,
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(transport)?
+                    .into_owned();
+                status_from_response(response.status.into_option())
+            }
+            GraphIntent::Update { graph, bundles } => {
+                let current = self.status(&graph).await?;
+                let response = client
+                    .update_graph(proto::UpdateGraphRequest {
+                        graph_id: Some(graph),
+                        expected_generation: Some(current.generation),
+                        components: bundles
+                            .into_iter()
+                            .map(Self::component)
+                            .collect::<Result<_, _>>()?,
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(transport)?
+                    .into_owned();
+                status_from_response(response.status.into_option())
+            }
+            GraphIntent::Retire { graph } => {
+                let current = self.status(&graph).await?;
+                let response = client
+                    .retire_graph(proto::RetireGraphRequest {
+                        graph_id: Some(graph),
+                        expected_generation: Some(current.generation),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(transport)?
+                    .into_owned();
+                status_from_response(response.status.into_option())
+            }
+        }
+    }
+
+    async fn status(&self, graph: &str) -> Result<GraphStatus, CoreBoundaryError> {
+        let response = self
+            .client()?
+            .get_graph(proto::GetGraphRequest {
+                graph_id: Some(graph.to_string()),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| {
+                if error.code == connectrpc::ErrorCode::NotFound {
+                    CoreBoundaryError::GraphNotFound(graph.to_string())
+                } else {
+                    transport(error)
+                }
+            })?
+            .into_owned();
+        status_from_response(response.status.into_option())
+    }
+
+    async fn watch(&self, graph: &str) -> Result<watch::Receiver<GraphStatus>, CoreBoundaryError> {
+        let mut stream = self
+            .client()?
+            .watch_graph(proto::WatchGraphRequest {
+                graph_id: Some(graph.to_string()),
+                after_sequence: Some(0),
+                ..Default::default()
+            })
+            .await
+            .map_err(transport)?;
+        let first = stream
+            .message::<proto::WatchGraphResponse>()
+            .await
+            .map_err(transport)?
+            .ok_or_else(|| {
+                CoreBoundaryError::Transport("core watch ended before its first status".into())
+            })?
+            .to_owned_message();
+        let initial = status_from_response(first.status.into_option())?;
+        let (sender, receiver) = watch::channel(initial);
+        tokio::spawn(async move {
+            loop {
+                let message = match stream.message::<proto::WatchGraphResponse>().await {
+                    Ok(Some(message)) => message.to_owned_message(),
+                    Ok(None) | Err(_) => break,
+                };
+                let Ok(status) = status_from_response(message.status.into_option()) else {
+                    break;
+                };
+                sender.send_replace(status);
+            }
+        });
+        Ok(receiver)
+    }
+}
+
+fn status_from_response(
+    status: Option<proto::GraphStatus>,
+) -> Result<GraphStatus, CoreBoundaryError> {
+    let status = status.ok_or_else(|| {
+        CoreBoundaryError::Rejected("GraphService response omitted status".into())
+    })?;
+    let graph = status.graph_id.ok_or_else(|| {
+        CoreBoundaryError::Rejected("GraphService status omitted graph_id".into())
+    })?;
+    let generation = status.generation.unwrap_or_default();
+    let plan = status.plan.into_option();
+    let blocked_on = plan
+        .as_ref()
+        .into_iter()
+        .flat_map(|plan| &plan.blocked)
+        .flat_map(|blocked| {
+            blocked.inputs.iter().map(|input| BlockedOn {
+                component: blocked.component.clone().unwrap_or_default(),
+                input: input.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let phase = if status.retired.unwrap_or(false) {
+        GraphPhase::Retired
+    } else if !status.stall_cycle.is_empty() {
+        GraphPhase::Failed
+    } else if plan.is_none() {
+        GraphPhase::Planning
+    } else if !blocked_on.is_empty() {
+        GraphPhase::Blocked
+    } else {
+        GraphPhase::Ready
+    };
+    Ok(GraphStatus {
+        graph,
+        generation,
+        phase,
+        blocked_on,
+        observed_ready: status.outputs.len(),
+        planned_resources: plan.map_or(0, |plan| plan.resources.len()),
+        diagnostic: (!status.stall_cycle.is_empty())
+            .then(|| format!("stall: {}", status.stall_cycle.join(" -> "))),
+    })
+}
+
+fn transport(error: connectrpc::ConnectError) -> CoreBoundaryError {
+    if error.code == connectrpc::ErrorCode::InvalidArgument {
+        CoreBoundaryError::Rejected(error.message.clone().unwrap_or_else(|| error.to_string()))
+    } else {
+        CoreBoundaryError::Transport(error.to_string())
+    }
 }
 
 #[derive(Debug, Default)]

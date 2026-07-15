@@ -1,14 +1,11 @@
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use henosis_bundle::{BundleError, BundleRequest, BundleSetManifest, Bundler, EsbuildBundler};
 use henosis_core_boundary::{
-    BundlePin, CoreBoundary, CoreBoundaryError, GraphIntent, GraphPhase, GraphStatus,
+    BundlePin, ConnectCoreBoundary, CoreBoundary, CoreBoundaryError, GraphIntent, GraphPhase,
+    GraphStatus,
 };
-use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, watch};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,20 +31,29 @@ pub enum Command {
         graph: String,
         #[arg(short, long, default_value = ".henosis/bundles/manifest.json")]
         manifest: PathBuf,
-        #[arg(long, default_value = ".henosis/fake-core.json")]
-        state: PathBuf,
+        #[arg(long, default_value = "http://127.0.0.1:4481")]
+        core: String,
+        /// Label the local recorded/fake controller targets in status output.
+        #[arg(long)]
+        demo_targets: bool,
     },
     /// Print the latest graph status.
     Status {
         graph: String,
-        #[arg(long, default_value = ".henosis/fake-core.json")]
-        state: PathBuf,
+        #[arg(long, default_value = "http://127.0.0.1:4481")]
+        core: String,
+        /// Label the local recorded/fake controller targets in status output.
+        #[arg(long)]
+        demo_targets: bool,
     },
-    /// Watch graph status. The local fake emits its current value once.
+    /// Watch graph status until it is complete, failed, or retired.
     Watch {
         graph: String,
-        #[arg(long, default_value = ".henosis/fake-core.json")]
-        state: PathBuf,
+        #[arg(long, default_value = "http://127.0.0.1:4481")]
+        core: String,
+        /// Label the local recorded/fake controller targets in status output.
+        #[arg(long)]
+        demo_targets: bool,
     },
 }
 
@@ -85,7 +91,7 @@ impl CliError {
             Self::Core(CoreBoundaryError::GraphNotFound(graph)) => (
                 "HENOSIS_GRAPH_NOT_FOUND",
                 format!("graph `{graph}` does not exist in the configured core boundary"),
-                "Run `henosis submit <graph>` first, or point the command at the state created by submit.",
+                "Run `henosis submit <graph>` first, or point `--core` at the server that accepted it.",
             ),
             error => (
                 "HENOSIS_COMMAND_FAILED",
@@ -106,10 +112,11 @@ pub async fn run(cli: Cli) -> Result<String, CliError> {
         Command::Submit {
             graph,
             manifest,
-            state,
+            core,
+            demo_targets,
         } => {
             let bundles = read_bundle_manifest(&manifest).await?;
-            let core = FileFakeCore::open(state).await?;
+            let core = ConnectCoreBoundary::new(core);
             let existing = core.status(&graph).await.ok();
             let pins = bundles
                 .bundles
@@ -131,16 +138,41 @@ pub async fn run(cli: Cli) -> Result<String, CliError> {
                 }
             };
             let status = core.apply(intent).await?;
-            Ok(render_status(&status))
+            Ok(render_status(&status, demo_targets))
         }
-        Command::Status { graph, state } => {
-            let core = FileFakeCore::open(state).await?;
-            Ok(render_status(&core.status(&graph).await?))
+        Command::Status {
+            graph,
+            core,
+            demo_targets,
+        } => {
+            let core = ConnectCoreBoundary::new(core);
+            Ok(render_status(&core.status(&graph).await?, demo_targets))
         }
-        Command::Watch { graph, state } => {
-            let core = FileFakeCore::open(state).await?;
-            let receiver = core.watch(&graph).await?;
-            Ok(render_status(&receiver.borrow().clone()))
+        Command::Watch {
+            graph,
+            core,
+            demo_targets,
+        } => {
+            let core = ConnectCoreBoundary::new(core);
+            let mut receiver = core.watch(&graph).await?;
+            let mut rendered = String::new();
+            loop {
+                let status = receiver.borrow_and_update().clone();
+                rendered.push_str(&render_status(&status, demo_targets));
+                if matches!(
+                    status.phase,
+                    GraphPhase::Ready | GraphPhase::Failed | GraphPhase::Retired
+                ) {
+                    break;
+                }
+                rendered.push_str("---\n");
+                receiver.changed().await.map_err(|_| {
+                    CoreBoundaryError::Transport(
+                        "core watch closed before a terminal status".into(),
+                    )
+                })?;
+            }
+            Ok(rendered)
         }
     }
 }
@@ -158,7 +190,7 @@ fn render_bundle_result(bundles: &BundleSetManifest) -> String {
     rendered
 }
 
-fn render_status(status: &GraphStatus) -> String {
+fn render_status(status: &GraphStatus, demo_targets: bool) -> String {
     let phase = match status.phase {
         GraphPhase::Planning => "planning",
         GraphPhase::Blocked => "blocked",
@@ -177,7 +209,7 @@ fn render_status(status: &GraphStatus) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    format!(
+    let mut rendered = format!(
         "graph: {}\ngeneration: {}\nplan: {} resource(s)\nblocked-on: {}\nobserved-ready: {}\nstatus: {}\n",
         status.graph,
         status.generation,
@@ -185,7 +217,13 @@ fn render_status(status: &GraphStatus) -> String {
         blocked,
         status.observed_ready,
         phase
-    )
+    );
+    if demo_targets {
+        rendered.push_str(
+            "targets: k8s=file:// Git; supabase=fake; cloudflare=recorded/fake (no live credentials)\n",
+        );
+    }
+    rendered
 }
 
 async fn read_bundle_manifest(path: &Path) -> Result<BundleSetManifest, CliError> {
@@ -201,92 +239,6 @@ async fn read_bundle_manifest(path: &Path) -> Result<BundleSetManifest, CliError
     })
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct PersistedFakeCore {
-    statuses: BTreeMap<String, GraphStatus>,
-    intents: Vec<GraphIntent>,
-}
-
-#[derive(Debug, Clone)]
-struct FileFakeCore {
-    path: PathBuf,
-    state: Arc<Mutex<PersistedFakeCore>>,
-}
-
-impl FileFakeCore {
-    async fn open(path: PathBuf) -> Result<Self, CliError> {
-        let state = match tokio::fs::read(&path).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|source| CliError::Decode {
-                path: path.clone(),
-                source,
-            })?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                PersistedFakeCore::default()
-            }
-            Err(source) => {
-                return Err(CliError::Read {
-                    path: path.clone(),
-                    source,
-                });
-            }
-        };
-        Ok(Self {
-            path,
-            state: Arc::new(Mutex::new(state)),
-        })
-    }
-
-    async fn persist(&self, state: &PersistedFakeCore) -> Result<(), CoreBoundaryError> {
-        if let Some(parent) = self.path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|error| CoreBoundaryError::Rejected(error.to_string()))?;
-        }
-        let mut bytes = serde_json::to_vec_pretty(state)
-            .map_err(|error| CoreBoundaryError::Rejected(error.to_string()))?;
-        bytes.push(b'\n');
-        tokio::fs::write(&self.path, bytes)
-            .await
-            .map_err(|error| CoreBoundaryError::Rejected(error.to_string()))
-    }
-}
-
-impl CoreBoundary for FileFakeCore {
-    async fn apply(&self, intent: GraphIntent) -> Result<GraphStatus, CoreBoundaryError> {
-        let graph = intent.graph().to_string();
-        let mut state = self.state.lock().await;
-        let generation = state
-            .statuses
-            .get(&graph)
-            .map(|status| status.generation + 1)
-            .unwrap_or(1);
-        let mut status = GraphStatus::planning(graph.clone(), generation);
-        if matches!(intent, GraphIntent::Retire { .. }) {
-            status.phase = GraphPhase::Retired;
-        }
-        state.intents.push(intent);
-        state.statuses.insert(graph, status.clone());
-        self.persist(&state).await?;
-        Ok(status)
-    }
-
-    async fn status(&self, graph: &str) -> Result<GraphStatus, CoreBoundaryError> {
-        self.state
-            .lock()
-            .await
-            .statuses
-            .get(graph)
-            .cloned()
-            .ok_or_else(|| CoreBoundaryError::GraphNotFound(graph.to_string()))
-    }
-
-    async fn watch(&self, graph: &str) -> Result<watch::Receiver<GraphStatus>, CoreBoundaryError> {
-        let status = self.status(graph).await?;
-        let (_, receiver) = watch::channel(status);
-        Ok(receiver)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,7 +248,7 @@ mod tests {
         insta::assert_snapshot!(CliError::Core(CoreBoundaryError::GraphNotFound("preview_demo".to_string())).diagnostic(), @r#"
 error[HENOSIS_GRAPH_NOT_FOUND]: graph `preview_demo` does not exist in the configured core boundary
   |
-  = help: Run `henosis submit <graph>` first, or point the command at the state created by submit.
+  = help: Run `henosis submit <graph>` first, or point `--core` at the server that accepted it.
 "#);
     }
 

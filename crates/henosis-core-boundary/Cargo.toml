@@ -6,7 +6,10 @@ rust-version = "1.96.0"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+connectrpc = { version = "0.8.1", features = ["client"] }
+henosis-proto = { path = "../../../core/crates/proto" }
+hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["rt", "sync"] }
