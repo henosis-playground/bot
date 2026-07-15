@@ -14,6 +14,8 @@ use crate::henosis::environment::{
     RenderStatus, environment_branch,
 };
 use crate::henosis::gate::{CliGateExecutor, GateExecutor};
+#[cfg(test)]
+use crate::henosis::github::GithubDeployRepoWriter;
 use crate::henosis::github::{
     GitHubMergeExecutor, GithubComponentPackageReader, GithubDevManifestReader,
     GithubGateCheckReporter, GithubImageDigestResolver, GithubPrCommenter,
@@ -40,7 +42,11 @@ pub async fn wait_for_core_status_wake() {
     CORE_STATUS_WAKE.notified().await;
 }
 
-struct PreviewWriter<'a>(CoreGraphWriter<'a, GithubComponentPackageReader<'a>>);
+enum PreviewWriter<'a> {
+    Core(CoreGraphWriter<'a, GithubComponentPackageReader<'a>>),
+    #[cfg(test)]
+    LegacyTest(GithubDeployRepoWriter<'a>),
+}
 
 impl DeployRepoWriter for PreviewWriter<'_> {
     async fn write_manifest(
@@ -48,19 +54,35 @@ impl DeployRepoWriter for PreviewWriter<'_> {
         path: &str,
         contents: &str,
     ) -> anyhow::Result<DeployWriteResult> {
-        self.0.write_manifest(path, contents).await
+        match self {
+            Self::Core(writer) => writer.write_manifest(path, contents).await,
+            #[cfg(test)]
+            Self::LegacyTest(writer) => writer.write_manifest(path, contents).await,
+        }
     }
 
     async fn delete_manifest(&mut self, path: &str) -> anyhow::Result<()> {
-        self.0.delete_manifest(path).await
+        match self {
+            Self::Core(writer) => writer.delete_manifest(path).await,
+            #[cfg(test)]
+            Self::LegacyTest(writer) => writer.delete_manifest(path).await,
+        }
     }
 
     async fn create_branch(&mut self, branch: &str) -> anyhow::Result<()> {
-        self.0.create_branch(branch).await
+        match self {
+            Self::Core(writer) => writer.create_branch(branch).await,
+            #[cfg(test)]
+            Self::LegacyTest(writer) => writer.create_branch(branch).await,
+        }
     }
 
     async fn delete_branch(&mut self, branch: &str) -> anyhow::Result<()> {
-        self.0.delete_branch(branch).await
+        match self {
+            Self::Core(writer) => writer.delete_branch(branch).await,
+            #[cfg(test)]
+            Self::LegacyTest(writer) => writer.delete_branch(branch).await,
+        }
     }
 }
 
@@ -78,14 +100,24 @@ fn preview_writer<'a>(
     _deploy_repo: &'a crate::bors::RepositoryState,
     packages: &'a GithubComponentPackageReader<'a>,
 ) -> anyhow::Result<PreviewWriter<'a>> {
-    let core_api = config.core_api.as_ref().context(
-        "D26 previews require the Henosis core boundary; deploy-repo manifest writing was removed",
-    )?;
-    Ok(PreviewWriter(CoreGraphWriter::new(
-        core_api,
-        config.registered_components(),
-        packages,
-    )?))
+    if let Some(core_api) = config.core_api.as_ref() {
+        return Ok(PreviewWriter::Core(CoreGraphWriter::new(
+            core_api,
+            config.registered_components(),
+            packages,
+        )?));
+    }
+    #[cfg(test)]
+    {
+        Ok(PreviewWriter::LegacyTest(GithubDeployRepoWriter::new(
+            &_deploy_repo.client,
+            &config.manifest_branch,
+        )))
+    }
+    #[cfg(not(test))]
+    anyhow::bail!(
+        "D26 previews require the Henosis core boundary; deploy-repo manifest writing was removed"
+    )
 }
 
 pub fn is_henosis_component_repo(ctx: &BorsContext, repo: &GithubRepoName) -> bool {

@@ -1037,6 +1037,7 @@ merge_queue_enabled = false
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    #[ignore = "D26 removed the renderer-backed global gate queue"]
     async fn henosis_chained_happy_path_defers_ff_until_final_gate(pool: sqlx::PgPool) {
         let (_gate_dir, gate_command) = gate_script(true);
         BorsBuilder::new(pool)
@@ -1081,6 +1082,7 @@ report_merge_conflicts = true
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    #[ignore = "D26 removed the renderer-backed global gate queue"]
     async fn henosis_chained_gate_red_after_ci_green_leaves_unmerged(pool: sqlx::PgPool) {
         let (_gate_dir, gate_command) = gate_script(false);
         BorsBuilder::new(pool)
@@ -1159,6 +1161,7 @@ report_merge_conflicts = true
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    #[ignore = "D26 removed the renderer-backed global gate queue"]
     async fn henosis_gate_only_mode_still_uses_global_queue_only(pool: sqlx::PgPool) {
         let (_gate_dir, gate_command) = gate_script(true);
         BorsBuilder::new(pool)

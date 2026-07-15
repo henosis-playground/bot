@@ -2044,6 +2044,7 @@ digest = "sha256:service-b"
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    #[ignore = "D26 removed deploy-repo dev-pin mutation"]
     async fn henosis_component_main_push_reconciles_dev_pin(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(henosis_github())
@@ -2360,6 +2361,7 @@ digest = "sha256:service-b"
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    #[ignore = "D26 removed the renderer-backed global gate queue"]
     async fn henosis_merge_gate_merge_leaves_and_retires_preview(pool: sqlx::PgPool) {
         let (_gate_dir, gate_command) = passing_gate_script();
         BorsBuilder::new(pool)
@@ -2428,6 +2430,7 @@ digest = "sha256:service-b"
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    #[ignore = "D26 removed deploy-repo render workflow handling"]
     async fn henosis_render_failure_comments_and_updates_status(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(henosis_github())
@@ -2466,6 +2469,7 @@ digest = "sha256:service-b"
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    #[ignore = "D26 removed deploy-repo render workflow handling"]
     async fn henosis_render_failure_comments_for_each_new_failing_commit(pool: sqlx::PgPool) {
         BorsBuilder::new(pool)
             .github(henosis_github())
