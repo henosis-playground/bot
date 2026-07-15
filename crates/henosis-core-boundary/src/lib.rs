@@ -184,13 +184,6 @@ impl ConnectCoreBoundary {
         }
     }
 
-    fn rpc_url(&self, method: &str) -> String {
-        format!(
-            "{}/henosis.v1.GraphService/{method}",
-            self.endpoint.trim_end_matches('/')
-        )
-    }
-
     fn client(&self) -> Result<GraphServiceClient<HttpClient>, CoreBoundaryError> {
         let endpoint = self
             .endpoint
@@ -274,8 +267,7 @@ impl CoreBoundary for ConnectCoreBoundary {
             } => {
                 let response = client
                     .create_graph(proto::CreateGraphRequest {
-                        graph_id: Some(graph.clone()),
-                        name: Some(graph),
+                        graph_id: Some(graph),
                         components: bundles
                             .into_iter()
                             .map(Self::component)
@@ -354,59 +346,25 @@ impl CoreBoundary for ConnectCoreBoundary {
     }
 
     async fn list(&self, include_retired: bool) -> Result<Vec<GraphSummary>, CoreBoundaryError> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Request {
-            include_retired: bool,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Response {
-            #[serde(default)]
-            graphs: Vec<Summary>,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Summary {
-            graph_id: String,
-            #[serde(default)]
-            current_generation: u64,
-            phase: String,
-            #[serde(default)]
-            created: bool,
-            #[serde(default)]
-            retired: bool,
-        }
-
-        let response = reqwest::Client::new()
-            .post(self.rpc_url("ListGraphs"))
-            .header("connect-protocol-version", "1")
-            .json(&Request { include_retired })
-            .send()
+        let response = self
+            .client()?
+            .list_graphs(proto::ListGraphsRequest {
+                include_retired: Some(include_retired),
+                ..Default::default()
+            })
             .await
-            .map_err(|error| CoreBoundaryError::Transport(error.to_string()))?;
-        if !response.status().is_success() {
-            return Err(CoreBoundaryError::Transport(format!(
-                "ListGraphs returned HTTP {}",
-                response.status()
-            )));
-        }
-        let response: Response = response
-            .json()
-            .await
-            .map_err(|error| CoreBoundaryError::Transport(error.to_string()))?;
+            .map_err(transport)?
+            .into_owned();
         response
             .graphs
             .into_iter()
             .map(|summary| {
                 Ok(GraphSummary {
-                    graph: summary.graph_id,
-                    generation: summary.current_generation,
-                    phase: graph_phase_from_wire(&summary.phase)?,
-                    created: summary.created,
-                    retired: summary.retired,
+                    graph: summary.graph_id.unwrap_or_default(),
+                    generation: summary.current_generation.unwrap_or_default(),
+                    phase: graph_phase_from_proto(summary.phase.as_ref())?,
+                    created: summary.created.unwrap_or_default(),
+                    retired: summary.retired.unwrap_or_default(),
                 })
             })
             .collect()
@@ -599,14 +557,16 @@ fn status_from_response(
     })
 }
 
-fn graph_phase_from_wire(value: &str) -> Result<GraphPhase, CoreBoundaryError> {
-    match value {
-        "GRAPH_PHASE_PLANNING" => Ok(GraphPhase::Planning),
-        "GRAPH_PHASE_BLOCKED" => Ok(GraphPhase::Blocked),
-        "GRAPH_PHASE_RECONCILING" => Ok(GraphPhase::Reconciling),
-        "GRAPH_PHASE_READY" => Ok(GraphPhase::Ready),
-        "GRAPH_PHASE_FAILED" => Ok(GraphPhase::Failed),
-        "GRAPH_PHASE_RETIRED" => Ok(GraphPhase::Retired),
+fn graph_phase_from_proto(
+    value: Option<&buffa::EnumValue<proto::GraphPhase>>,
+) -> Result<GraphPhase, CoreBoundaryError> {
+    match value.and_then(buffa::EnumValue::as_known) {
+        Some(proto::GraphPhase::Planning) => Ok(GraphPhase::Planning),
+        Some(proto::GraphPhase::Blocked) => Ok(GraphPhase::Blocked),
+        Some(proto::GraphPhase::Reconciling) => Ok(GraphPhase::Reconciling),
+        Some(proto::GraphPhase::Ready) => Ok(GraphPhase::Ready),
+        Some(proto::GraphPhase::Failed) => Ok(GraphPhase::Failed),
+        Some(proto::GraphPhase::Retired) => Ok(GraphPhase::Retired),
         other => Err(CoreBoundaryError::Rejected(format!(
             "ListGraphs returned unknown phase {other:?}"
         ))),
