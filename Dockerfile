@@ -34,7 +34,7 @@ ENV GIT_VERSION=${GIT_VERSION}
 
 RUN cargo build --release --locked
 
-FROM node:22-bookworm-slim AS runtime
+FROM node:22-trixie-slim AS runtime
 
 WORKDIR /
 
