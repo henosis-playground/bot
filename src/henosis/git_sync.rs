@@ -212,6 +212,8 @@ pub struct GitSyncFrontend<R, C> {
     repository: R,
     core: C,
     seen: BTreeMap<String, GraphIntentFile>,
+    owned_graphs: BTreeSet<String>,
+    ownership_loaded: bool,
 }
 
 impl<R, C> GitSyncFrontend<R, C>
@@ -224,6 +226,8 @@ where
             repository,
             core,
             seen: BTreeMap::new(),
+            owned_graphs: BTreeSet::new(),
+            ownership_loaded: false,
         }
     }
 
@@ -296,7 +300,12 @@ where
         }
 
         let incoming_graphs = incoming.keys().cloned().collect::<BTreeSet<_>>();
-        let owned_graphs = self.repository.owned_graphs().await?;
+        if !self.ownership_loaded {
+            self.owned_graphs
+                .extend(self.repository.owned_graphs().await?);
+            self.ownership_loaded = true;
+        }
+        self.owned_graphs.extend(incoming_graphs.iter().cloned());
         let live_graphs = self
             .core
             .list(false)
@@ -304,7 +313,8 @@ where
             .into_iter()
             .map(|summary| summary.graph)
             .collect::<BTreeSet<_>>();
-        let orphaned = owned_graphs
+        let orphaned = self
+            .owned_graphs
             .intersection(&live_graphs)
             .filter(|graph| !incoming_graphs.contains(*graph))
             .cloned()
@@ -326,6 +336,7 @@ where
     ) -> Result<(), GitSyncError> {
         let intent = file_from_status(display_name.into(), status)?;
         self.write_intent_file(&intent).await?;
+        self.owned_graphs.insert(intent.graph.clone());
         self.seen.insert(intent.graph.clone(), intent);
         Ok(())
     }
