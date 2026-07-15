@@ -534,12 +534,11 @@ fn write_context(repository: &Path, context: &LocalContext) -> Result<(), CliErr
 }
 
 async fn run_typecheck(repository: &Path) -> Result<(), CliError> {
-    let local = repository.join("node_modules/.bin/tsc");
-    let executable = if local.is_file() {
-        local
-    } else {
-        PathBuf::from("tsc")
-    };
+    let executable = repository
+        .ancestors()
+        .map(|directory| directory.join("node_modules/.bin/tsc"))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from("tsc"));
     let output = tokio::process::Command::new(&executable)
         .current_dir(repository)
         .arg("--noEmit")
