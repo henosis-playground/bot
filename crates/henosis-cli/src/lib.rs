@@ -632,16 +632,15 @@ fn repository_provenance(repository: &Path, dependencies: &[PathBuf]) -> SourceP
             .ok()
             .filter(|output| output.status.success())
             .is_some_and(|output| output.stdout.is_empty());
-    if clean {
-        if let (Some(revision), Some((reference, repository_url))) =
+    if clean
+        && let (Some(revision), Some((reference, repository_url))) =
             (revision.clone(), verified_remote_reference(&root))
-        {
-            return SourceProvenance::Vcs {
-                repository: repository_url,
-                revision,
-                reference: Some(reference),
-            };
-        }
+    {
+        return SourceProvenance::Vcs {
+            repository: repository_url,
+            revision,
+            reference: Some(reference),
+        };
     }
     SourceProvenance::Local {
         repository: remote_url,
@@ -699,11 +698,12 @@ fn sanitize_repository(value: &str) -> String {
         url.set_fragment(None);
         return url.to_string().trim_end_matches('/').to_string();
     }
-    if let Some((user_host, path)) = value.split_once(':') {
-        if user_host.contains('@') && !path.starts_with('/') {
-            let host = user_host.rsplit('@').next().unwrap_or(user_host);
-            return format!("ssh://{host}/{}", path.trim_start_matches('/'));
-        }
+    if let Some((user_host, path)) = value.split_once(':')
+        && user_host.contains('@')
+        && !path.starts_with('/')
+    {
+        let host = user_host.rsplit('@').next().unwrap_or(user_host);
+        return format!("ssh://{host}/{}", path.trim_start_matches('/'));
     }
     value.to_string()
 }
