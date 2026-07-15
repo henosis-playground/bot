@@ -1,3 +1,8 @@
+[workspace]
+resolver = "3"
+members = [".", "crates/henosis-bundle", "crates/henosis-cli", "crates/henosis-core-boundary"]
+default-members = [".", "crates/henosis-bundle", "crates/henosis-cli", "crates/henosis-core-boundary"]
+
 [package]
 name = "bors"
 version = "0.1.0"
@@ -46,7 +51,9 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], defau
 http = "1"
 askama = "0.16"
 
-# Henosis core boundary
+# Henosis boundaries
+henosis-bundle = { path = "crates/henosis-bundle" }
+henosis-core-boundary = { path = "crates/henosis-core-boundary" }
 henosis-proto = { git = "https://github.com/henosis-playground/core.git", branch = "fix/verification-loop-1" }
 newtype-uuid = { git = "https://github.com/henosis-playground/newtype-uuid.git", features = ["v4", "v7"] }
 uuid = { version = "1.18.1", features = ["v4", "v7"] }

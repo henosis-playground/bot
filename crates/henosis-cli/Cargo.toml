@@ -1,0 +1,23 @@
+[package]
+name = "henosis-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.0"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "henosis"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+henosis-bundle = { path = "../henosis-bundle" }
+henosis-core-boundary = { path = "../henosis-core-boundary" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "sync"] }
+
+[dev-dependencies]
+insta = "1.26"
+tempfile = "3"

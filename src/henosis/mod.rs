@@ -1,5 +1,6 @@
 pub mod config;
 pub mod core_client;
+pub mod d26;
 pub mod db;
 #[cfg(test)]
 mod db_tests;
