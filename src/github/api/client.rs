@@ -36,6 +36,12 @@ pub struct RepositoryFile {
     pub content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryDirectoryFile {
+    pub path: String,
+    pub content: String,
+}
+
 /// Provides access to a single app installation (repository) using the GitHub API.
 pub struct GithubRepositoryClient {
     /// HTML URL of the author, to recognize
@@ -223,6 +229,36 @@ impl GithubRepositoryClient {
         })
         .await?;
         Ok(file)
+    }
+
+    pub async fn read_directory_at_ref(
+        &self,
+        path: &str,
+        r#ref: &str,
+    ) -> anyhow::Result<Vec<RepositoryDirectoryFile>> {
+        let response = self
+            .client
+            .repos(self.repository().owner(), self.repository().name())
+            .get_content()
+            .path(path)
+            .r#ref(r#ref)
+            .send()
+            .await;
+        let mut response = match response {
+            Ok(response) => response,
+            Err(octocrab::Error::GitHub { source, .. })
+                if source.status_code == http::StatusCode::NOT_FOUND =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(response
+            .take_items()
+            .into_iter()
+            .filter_map(|item| item.decoded_content().map(|content| (item.path, content)))
+            .map(|(path, content)| RepositoryDirectoryFile { path, content })
+            .collect())
     }
 
     pub async fn write_file_to_branch(

@@ -240,6 +240,13 @@ pub async fn handle_bors_repository_event(
             let span =
                 tracing::info_span!("Pushed to branch", repo = payload.repository.to_string());
 
+            if let Some(config) = ctx.henosis_config.as_ref() {
+                crate::henosis::git_sync::wake_on_deploy_push(
+                    config,
+                    &payload.repository,
+                    &payload.branch,
+                );
+            }
             reconcile_dev_pin_after_component_push(&ctx, &payload)
                 .instrument(span.clone())
                 .await?;

@@ -107,6 +107,9 @@ pub fn create_bors_process(
                 _ = consume_henosis_core_status(ctx.clone()) => {
                     tracing::error!("Henosis core status scheduler has ended")
                 }
+                result = crate::henosis::git_sync::consume_deploy_main(ctx.clone()) => {
+                    tracing::error!(?result, "Henosis deploy-main graph sync has ended")
+                }
                 _ = merge_queue_fut => {
                     tracing::error!("Merge queue handling process has ended");
                 }

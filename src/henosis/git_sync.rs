@@ -5,8 +5,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::sync::{Arc, LazyLock};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 
 use crate::henosis::core_client::{
     BundlePin, CoreBoundary, CoreBoundaryError, GraphIntent, GraphStatus, SourceProvenance,
@@ -14,6 +16,8 @@ use crate::henosis::core_client::{
 use henosis_core_boundary::GraphSourcePolicy;
 
 pub const GRAPH_DIRECTORY: &str = "henosis/graphs";
+
+static GIT_SYNC_WAKE: LazyLock<Notify> = LazyLock::new(Notify::new);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,6 +104,95 @@ pub trait GraphFileRepository: Send + Sync {
         contents: &str,
         message: &str,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+}
+
+pub struct GithubGraphFileRepository {
+    repository: Arc<crate::bors::RepositoryState>,
+    branch: String,
+}
+
+impl GithubGraphFileRepository {
+    pub fn new(repository: Arc<crate::bors::RepositoryState>, branch: impl Into<String>) -> Self {
+        Self {
+            repository,
+            branch: branch.into(),
+        }
+    }
+}
+
+impl GraphFileRepository for GithubGraphFileRepository {
+    async fn read_graph_files(&self) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
+        Ok(self
+            .repository
+            .client
+            .read_directory_at_ref(GRAPH_DIRECTORY, &self.branch)
+            .await?
+            .into_iter()
+            .map(|file| (file.path, file.content.into_bytes()))
+            .collect())
+    }
+
+    async fn write_graph_file(
+        &self,
+        path: &str,
+        contents: &str,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        self.repository
+            .client
+            .write_file_to_branch(path, &self.branch, message, contents)
+            .await?;
+        Ok(())
+    }
+}
+
+pub fn wake_on_deploy_push(
+    config: &crate::henosis::config::HenosisConfig,
+    repository: &crate::github::GithubRepoName,
+    branch: &str,
+) -> bool {
+    if repository.to_string() != config.deploy_repo || branch != config.manifest_branch {
+        return false;
+    }
+    GIT_SYNC_WAKE.notify_one();
+    true
+}
+
+pub async fn consume_deploy_main(ctx: Arc<crate::BorsContext>) -> anyhow::Result<()> {
+    let Some(config) = ctx.henosis_config.as_ref() else {
+        std::future::pending::<()>().await;
+        return Ok(());
+    };
+    let Some(core_api) = config.core_api.as_ref() else {
+        tracing::debug!("Henosis deploy-main graph sync disabled");
+        std::future::pending::<()>().await;
+        return Ok(());
+    };
+    let deploy_repo = config.deploy_repo.parse().map_err(|error| {
+        anyhow::anyhow!("Invalid deploy repo `{}`: {error}", config.deploy_repo)
+    })?;
+    let repository = ctx.get_repo(&deploy_repo)?;
+    let mut frontend = GitSyncFrontend::new(
+        GithubGraphFileRepository::new(repository, &config.manifest_branch),
+        crate::henosis::core_client::ConnectCoreBoundary::new(&core_api.endpoint),
+    );
+    let mut interval = tokio::time::interval(config.queue_tick_interval());
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            () = GIT_SYNC_WAKE.notified() => {}
+        }
+        match frontend.sync_from_main().await {
+            Ok(changes) if changes > 0 => {
+                tracing::info!(changes, "Applied deploy-main Henosis graph intent");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(error = ?error, "Cannot synchronize deploy-main graph intent")
+            }
+        }
+    }
 }
 
 pub struct GitSyncFrontend<R, C> {
@@ -230,6 +323,26 @@ where
             .await?;
         Ok(())
     }
+}
+
+pub async fn named_graph<R: GraphFileRepository>(
+    repository: &R,
+    name: &str,
+) -> Result<Option<GraphIntentFile>, GitSyncError> {
+    for (path, bytes) in repository.read_graph_files().await? {
+        if !path.ends_with(".toml") {
+            continue;
+        }
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|error| GitSyncError::Decode(format!("{path}: {error}")))?;
+        let intent: GraphIntentFile = toml::from_str(text)
+            .map_err(|error| GitSyncError::Decode(format!("{path}: {error}")))?;
+        validate(&path, &intent)?;
+        if intent.name == name {
+            return Ok(Some(intent));
+        }
+    }
+    Ok(None)
 }
 
 pub fn graph_path(graph: &str) -> String {
