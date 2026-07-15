@@ -2,8 +2,6 @@ use crate::bors::event::BorsEvent;
 use crate::bors::{CommandPrefix, RepositoryState, format_help};
 use crate::database::{ApprovalStatus, QueueStatus};
 use crate::github::{GithubRepoName, PullRequestNumber, rollup};
-use crate::henosis::core_client::CoreClient;
-use crate::henosis::generation::{GenerationState, derive_generation};
 use crate::templates::{
     HelpTemplate, HtmlTemplate, NotFoundTemplate, PullRequestStats, QueueTemplate, RepositoryView,
     RollupsInfo,
@@ -18,17 +16,14 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_embed::ServeEmbed;
-use base64::Engine as _;
 use chrono::Utc;
-use henosis_proto::proto::henosis::v1::{ComponentDispositionKind, SliceReport};
 use http::{Request, StatusCode};
 use pulldown_cmark::Parser;
 use rust_embed::Embed;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer};
-use sqlx::Row as _;
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -168,36 +163,9 @@ async fn graph_handler(
     Path(environment_id): Path<String>,
     State(ServerStateRef(state)): State<ServerStateRef>,
 ) -> Response {
-    let Some(core_api) = state
-        .ctx
-        .henosis_config
-        .as_ref()
-        .and_then(|config| config.core_api.as_ref())
-    else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let Ok(client) = CoreClient::new(core_api) else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    match client.get_graph(&environment_id).await {
-        Ok(Some(graph)) => {
-            let value = serde_json::to_value(&graph).unwrap_or_default();
-            let Some(generation) = json_u64(value.pointer("/durable/graph/generation")) else {
-                return StatusCode::BAD_GATEWAY.into_response();
-            };
-            graph_generation_response(
-                &state,
-                &client,
-                &environment_id,
-                generation,
-                GraphPageView::Latest {
-                    lifecycle: graph_lifecycle(&value),
-                },
-            )
-            .await
-        }
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    match current_graph_status(&state, &environment_id).await {
+        Ok(status) => Html(render_d26_graph_page(&status)).into_response(),
+        Err(status) => status.into_response(),
     }
 }
 
@@ -205,21 +173,9 @@ async fn graph_json_handler(
     Path(environment_id): Path<String>,
     State(ServerStateRef(state)): State<ServerStateRef>,
 ) -> Response {
-    let Some(core_api) = state
-        .ctx
-        .henosis_config
-        .as_ref()
-        .and_then(|config| config.core_api.as_ref())
-    else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let Ok(client) = CoreClient::new(core_api) else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    match client.get_graph(&environment_id).await {
-        Ok(Some(graph)) => Json(graph).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    match current_graph_status(&state, &environment_id).await {
+        Ok(status) => Json(status).into_response(),
+        Err(status) => status.into_response(),
     }
 }
 
@@ -227,98 +183,12 @@ async fn graph_generation_handler(
     Path((environment_id, generation)): Path<(String, u64)>,
     State(ServerStateRef(state)): State<ServerStateRef>,
 ) -> Response {
-    let Some(core_api) = state
-        .ctx
-        .henosis_config
-        .as_ref()
-        .and_then(|config| config.core_api.as_ref())
-    else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let Ok(client) = CoreClient::new(core_api) else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    let (latest_generation, current_lifecycle) = match client.get_graph(&environment_id).await {
-        Ok(Some(graph)) => {
-            let value = serde_json::to_value(graph).unwrap_or_default();
-            (
-                json_u64(value.pointer("/durable/graph/generation")),
-                Some(graph_lifecycle(&value)),
-            )
+    match current_graph_status(&state, &environment_id).await {
+        Ok(status) if status.generation == generation => {
+            Html(render_d26_graph_page(&status)).into_response()
         }
-        Ok(None) | Err(_) => (None, None),
-    };
-    graph_generation_response(
-        &state,
-        &client,
-        &environment_id,
-        generation,
-        GraphPageView::Generation {
-            latest_generation,
-            current_lifecycle,
-        },
-    )
-    .await
-}
-
-enum GraphPageView {
-    Latest {
-        lifecycle: String,
-    },
-    Generation {
-        latest_generation: Option<u64>,
-        current_lifecycle: Option<String>,
-    },
-}
-
-async fn graph_generation_response(
-    state: &ServerState,
-    client: &CoreClient,
-    environment_id: &str,
-    generation: u64,
-    view: GraphPageView,
-) -> Response {
-    match client
-        .get_graph_generation(environment_id, generation)
-        .await
-    {
-        Ok(Some(record)) => {
-            let label = sqlx::query_scalar::<_, Option<String>>(
-                "SELECT display_label FROM environment WHERE id = $1",
-            )
-            .bind(environment_id)
-            .fetch_optional(state.ctx.db.pool())
-            .await
-            .ok()
-            .flatten()
-            .flatten();
-            let value = serde_json::to_value(record).unwrap_or_default();
-            let members = sqlx::query(
-                "SELECT component, repo, pr_number, head_sha FROM environment_member WHERE environment_id = $1",
-            )
-            .bind(environment_id)
-            .fetch_all(state.ctx.db.pool())
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|row| {
-                Some((
-                    (row.try_get::<Option<String>, _>("component").ok()??, row.try_get::<Option<String>, _>("head_sha").ok()??),
-                    (row.try_get::<String, _>("repo").ok()?, row.try_get::<i64, _>("pr_number").ok()? as u64),
-                ))
-            })
-            .collect::<HashMap<_, _>>();
-            Html(render_generation_page(
-                environment_id,
-                label.as_deref(),
-                &value,
-                &members,
-                &view,
-            ))
-            .into_response()
-        }
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+        Ok(_) | Err(StatusCode::NOT_FOUND) => StatusCode::NOT_FOUND.into_response(),
+        Err(status) => status.into_response(),
     }
 }
 
@@ -326,318 +196,43 @@ async fn graph_generation_json_handler(
     Path((environment_id, generation)): Path<(String, u64)>,
     State(ServerStateRef(state)): State<ServerStateRef>,
 ) -> Response {
+    match current_graph_status(&state, &environment_id).await {
+        Ok(status) if status.generation == generation => Json(status).into_response(),
+        Ok(_) | Err(StatusCode::NOT_FOUND) => StatusCode::NOT_FOUND.into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn current_graph_status(
+    state: &ServerState,
+    environment_id: &str,
+) -> Result<crate::henosis::core_client::GraphStatus, StatusCode> {
     let Some(core_api) = state
         .ctx
         .henosis_config
         .as_ref()
         .and_then(|config| config.core_api.as_ref())
     else {
-        return StatusCode::NOT_FOUND.into_response();
+        return Err(StatusCode::NOT_FOUND);
     };
-    let Ok(client) = CoreClient::new(core_api) else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    match client
-        .get_graph_generation(&environment_id, generation)
-        .await
-    {
-        Ok(Some(record)) => Json(record).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
-    }
-}
-
-fn render_generation_page(
-    environment_id: &str,
-    label: Option<&str>,
-    record: &serde_json::Value,
-    members: &HashMap<(String, String), (String, u64)>,
-    view: &GraphPageView,
-) -> String {
-    let generation = json_u64(record.pointer("/state/durable/graph/generation")).unwrap_or(0);
-    let reports = record
-        .pointer("/state/reports")
-        .cloned()
-        .and_then(|reports| serde_json::from_value::<Vec<SliceReport>>(reports).ok())
-        .unwrap_or_default();
-    let expected_components = record
-        .pointer("/state/durable/graph/componentSpecHashes")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .filter_map(|hash| base64::engine::general_purpose::STANDARD.decode(hash).ok())
-        .collect::<BTreeSet<_>>();
-    let presentation = derive_generation(generation, &expected_components, &reports).ok();
-    let generation_state = presentation
-        .as_ref()
-        .map(|presentation| presentation.state)
-        .unwrap_or(GenerationState::Reconciling);
-    let selected_reports = presentation
-        .as_ref()
-        .map(|presentation| presentation.reports.as_slice())
-        .unwrap_or_default();
-    let as_of_lifecycle = record
-        .get("currentLifecycle")
-        .and_then(serde_json::Value::as_str)
-        .map(display_lifecycle)
-        .unwrap_or_else(|| "unknown".to_string());
-    let lifecycle = match view {
-        GraphPageView::Latest { lifecycle } => lifecycle.clone(),
-        GraphPageView::Generation { .. } => as_of_lifecycle,
-    };
-    let superseded_by = match view {
-        GraphPageView::Latest { .. } => None,
-        GraphPageView::Generation {
-            latest_generation, ..
-        } => superseded_generation(generation, generation_state, *latest_generation),
-    };
-    let last_published = json_u64(record.get("lastPublishedGeneration"));
-    let title = label
-        .map(|label| {
-            format!(
-                "{} · <code>{}</code>",
-                escape_html(label),
-                escape_html(environment_id)
-            )
-        })
-        .unwrap_or_else(|| format!("<code>{}</code>", escape_html(environment_id)));
-    let mut component_rows = String::new();
-    for component in record
-        .get("components")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let hash = component
-            .get("hash")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let spec = component.get("spec").unwrap_or(&serde_json::Value::Null);
-        let name = spec
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-        let context = spec
-            .get("connectorContext")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|encoded| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(encoded)
-                    .ok()
-            })
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .unwrap_or_default();
-        let source = component_source(&context, name, members);
-        component_rows.push_str(&format!(
-            "<tr><td><strong>{}</strong><br><small>{}</small></td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            escape_html(name),
-            escape_html(hash),
-            source,
-            disposition_for(selected_reports, hash, superseded_by.is_some()),
-            outputs_for(selected_reports, hash)
-        ));
-    }
-    let publication_html = connector_publications(selected_reports);
-    let diagnostics = selected_reports
-        .iter()
-        .flat_map(|report| &report.diagnostics)
-        .map(|diagnostic| {
-            format!(
-                "<details><summary>{}: {}</summary><pre>{}</pre></details>",
-                escape_html(diagnostic.code.as_deref().unwrap_or("diagnostic")),
-                escape_html(diagnostic.message.as_deref().unwrap_or("")),
-                escape_html(&serde_json::to_string_pretty(diagnostic).unwrap_or_default())
-            )
-        })
-        .collect::<String>();
-    let diagnostics = if diagnostics.is_empty() {
-        "none reported".to_string()
-    } else {
-        diagnostics
-    };
-    let current_graph_is_retired = match view {
-        GraphPageView::Latest { lifecycle } => lifecycle == "retired",
-        GraphPageView::Generation {
-            current_lifecycle, ..
-        } => current_lifecycle.as_deref() == Some("retired"),
-    };
-    let generation_status = if superseded_by.is_some() {
-        "superseded before convergence".to_string()
-    } else {
-        match (generation_state, current_graph_is_retired) {
-            (GenerationState::Reconciling, true) => "graph retired; not converged".to_string(),
-            (GenerationState::PartiallyPublished, true) => {
-                "partially published; graph retired before convergence".to_string()
-            }
-            (state, _) => state.as_str().to_string(),
+    let core = crate::henosis::core_client::ConnectCoreBoundary::new(&core_api.endpoint);
+    match crate::henosis::core_client::CoreBoundary::status(&core, environment_id).await {
+        Ok(status) => Ok(status),
+        Err(crate::henosis::core_client::CoreBoundaryError::GraphNotFound(_)) => {
+            Err(StatusCode::NOT_FOUND)
         }
-    };
-    let audit_context = match view {
-        GraphPageView::Latest { .. } => format!(
-            "<a href=\"/graphs/{environment_id}/generations/{generation}\">last generation {generation}</a> (immutable as-of evidence) · <a href=\"/graphs/{environment_id}/latest.json\">current raw JSON</a>",
-            environment_id = escape_html(environment_id),
-        ),
-        GraphPageView::Generation { .. } => format!(
-            "<a href=\"/graphs/{environment_id}/generations/{generation}/raw.json\">raw JSON</a> · <a href=\"/graphs/{environment_id}\">current graph</a>",
-            environment_id = escape_html(environment_id),
-        ),
-    };
-    let superseded_notice = superseded_by
-        .map(|latest| {
-            format!(
-                "<aside><strong>Superseded by <a href=\"/graphs/{environment_id}/generations/{latest}\">generation {latest}</a></strong> before convergence.<br><small>This is current audit context; the component rows retain the last observation recorded for generation {generation}.</small></aside>",
-                environment_id = escape_html(environment_id),
-            )
-        })
-        .unwrap_or_default();
-    format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><title>Henosis generation {generation}</title><style>body{{font:16px system-ui;max-width:1100px;margin:3rem auto;padding:0 1rem;color:#202124}}table{{border-collapse:collapse;width:100%}}th,td{{text-align:left;vertical-align:top;border-bottom:1px solid #ddd;padding:.65rem}}code,pre{{font-family:ui-monospace,monospace}}pre{{white-space:pre-wrap;background:#f6f8fa;padding:1rem}}small{{color:#666}}aside{{margin:1rem 0;padding:1rem;border-left:4px solid #bf8700;background:#fff8c5}}</style></head><body><h1>{title}</h1>{superseded_notice}<table><tr><th>Lifecycle</th><td>{lifecycle}</td></tr><tr><th>Requested generation</th><td>{generation}</td></tr><tr><th>Generation status</th><td>{generation_status}</td></tr><tr><th>Last connector publication generation</th><td>{last_published}</td></tr><tr><th>Connector publications</th><td>{publication_html}</td></tr><tr><th>Audit data</th><td>{audit_context}</td></tr></table><h2>Components</h2><table><thead><tr><th>Component</th><th>Source SHA</th><th>Disposition</th><th>Reported outputs</th></tr></thead><tbody>{component_rows}</tbody></table><h2>Diagnostics</h2>{diagnostics}</body></html>"#,
-        last_published = last_published
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_string()),
-    )
-}
-
-fn component_source(
-    context: &serde_json::Value,
-    name: &str,
-    members: &HashMap<(String, String), (String, u64)>,
-) -> String {
-    let Some(repo) = context
-        .pointer("/source/repository")
-        .and_then(serde_json::Value::as_str)
-    else {
-        return "not reported by connector".to_string();
-    };
-    let Some(revision) = context
-        .pointer("/source/revision")
-        .and_then(serde_json::Value::as_str)
-    else {
-        return "not reported by connector".to_string();
-    };
-    let pull_request = members
-        .get(&(name.to_string(), revision.to_string()))
-        .map(|(repo, number)| {
-            format!(
-                " · <a href=\"https://github.com/{}/pull/{}\">PR #{}</a>",
-                escape_html(repo),
-                number,
-                number
-            )
-        })
-        .unwrap_or_default();
-    format!(
-        "<a href=\"https://github.com/{}/tree/{}\"><code>{}</code></a>{}",
-        escape_html(repo),
-        escape_html(revision),
-        escape_html(short_revision(revision)),
-        pull_request
-    )
-}
-
-fn disposition_for(reports: &[&SliceReport], hash: &str, superseded: bool) -> String {
-    let hash = base64::engine::general_purpose::STANDARD.decode(hash).ok();
-    let observed = reports
-        .iter()
-        .flat_map(|report| &report.dispositions)
-        .find(|disposition| disposition.component_spec_hash.as_deref() == hash.as_deref())
-        .and_then(|disposition| disposition.kind.as_ref()?.as_known())
-        .map(|kind| match kind {
-            ComponentDispositionKind::Pending => "pending",
-            ComponentDispositionKind::Reconciling => "reconciling",
-            ComponentDispositionKind::Ready => "ready",
-            ComponentDispositionKind::Failed => "failed",
-            _ => "pending",
-        })
-        .unwrap_or("pending");
-    if superseded {
-        format!(
-            "superseded<br><small>last report: {}</small>",
-            escape_html(observed)
-        )
-    } else {
-        observed.to_string()
+        Err(_) => Err(StatusCode::BAD_GATEWAY),
     }
 }
 
-fn graph_lifecycle(graph: &serde_json::Value) -> String {
-    graph
-        .pointer("/durable/lifecycle")
-        .and_then(serde_json::Value::as_str)
-        .map(display_lifecycle)
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn display_lifecycle(lifecycle: &str) -> String {
-    lifecycle
-        .trim_start_matches("GRAPH_LIFECYCLE_")
-        .to_ascii_lowercase()
-}
-
-fn superseded_generation(
-    generation: u64,
-    state: GenerationState,
-    latest_generation: Option<u64>,
-) -> Option<u64> {
-    latest_generation.filter(|latest| *latest > generation && !state.is_terminal())
-}
-
-fn connector_publications(reports: &[&SliceReport]) -> String {
-    let publications = reports
-        .iter()
-        .filter_map(|report| {
-            let connector = report.connector.as_deref()?;
-            let publication = report.publication.as_option()?;
-            Some((
-                connector,
-                (
-                    publication.revision.as_deref()?,
-                    publication.uri.as_deref()?,
-                ),
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
-    if publications.is_empty() {
-        return "none reported".to_string();
-    }
-    publications
-        .into_iter()
-        .map(|(connector, (revision, uri))| {
-            format!(
-                "<strong>{}</strong>: <a href=\"{}\"><code>{}</code></a>",
-                escape_html(connector),
-                escape_html(uri),
-                escape_html(short_revision(revision))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
-fn outputs_for(reports: &[&SliceReport], hash: &str) -> String {
-    let hash = base64::engine::general_purpose::STANDARD.decode(hash).ok();
-    reports
-        .iter()
-        .flat_map(|report| &report.outputs)
-        .find(|output| output.component_spec_hash.as_deref() == hash.as_deref())
-        .and_then(|output| output.values_json.as_deref())
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-        .map(|value| {
-            format!(
-                "<pre>{}</pre>",
-                escape_html(&serde_json::to_string_pretty(&value).unwrap_or_default())
-            )
-        })
-        .unwrap_or_else(|| "none".to_string())
-}
-
-fn json_u64(value: Option<&serde_json::Value>) -> Option<u64> {
-    value.and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
-}
-
-fn short_revision(revision: &str) -> &str {
-    revision.get(..revision.len().min(8)).unwrap_or(revision)
+fn render_d26_graph_page(status: &crate::henosis::core_client::GraphStatus) -> String {
+    let json = serde_json::to_string_pretty(status).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Henosis graph {}</title></head><body><h1>Henosis graph <code>{}</code></h1><pre>{}</pre></body></html>",
+        escape_html(&status.graph),
+        escape_html(&status.graph),
+        escape_html(&json),
+    )
 }
 
 fn escape_html(value: &str) -> String {
@@ -986,83 +581,7 @@ pub async fn github_webhook_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::henosis::config::HenosisConfig;
-    use crate::tests::{ApiRequest, BorsBuilder, BorsTester, default_repo_name, run_test};
-    use serde_json::{Value, json};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-
-    #[test]
-    fn mixed_generation_page_never_presents_partial_publication_as_success() {
-        let first = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1_u8; 32]);
-        let second = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [2_u8; 32]);
-        let record = json!({
-            "state": {
-                "durable": {
-                    "graph": {
-                        "generation": "2",
-                        "componentSpecHashes": [&first, &second]
-                    },
-                    "lifecycle": "GRAPH_LIFECYCLE_ACTIVE"
-                },
-                "reports": [
-                    {
-                        "generation": "2",
-                        "connector": "k8s",
-                        "sequence": "7",
-                        "dispositions": [{
-                            "componentSpecHash": &first,
-                            "kind": "COMPONENT_DISPOSITION_KIND_READY"
-                        }],
-                        "publication": {
-                            "revision": "8b47754200000000000000000000000000000000",
-                            "uri": "https://example.test/k8s"
-                        }
-                    },
-                    {
-                        "generation": "2",
-                        "connector": "supabase",
-                        "sequence": "9",
-                        "dispositions": [{
-                            "componentSpecHash": &second,
-                            "kind": "COMPONENT_DISPOSITION_KIND_FAILED"
-                        }],
-                        "diagnostics": [{
-                            "code": "supabase.plan.migration-checksum",
-                            "message": "migration checksum does not match",
-                            "severity": "DIAGNOSTIC_SEVERITY_ERROR"
-                        }]
-                    }
-                ]
-            },
-            "components": [
-                {"hash": &first, "spec": {"name": "service-a", "connector": "k8s"}},
-                {"hash": &second, "spec": {"name": "service-d", "connector": "supabase"}}
-            ],
-            "currentLifecycle": "GRAPH_LIFECYCLE_ACTIVE",
-            "lastPublishedGeneration": "2"
-        });
-
-        let page = render_generation_page(
-            "preview_test",
-            None,
-            &record,
-            &HashMap::new(),
-            &GraphPageView::Latest {
-                lifecycle: "active".to_string(),
-            },
-        );
-
-        assert!(page.contains("<th>Generation status</th><td>failed</td>"));
-        assert!(page.contains("<th>Connector publications</th><td><strong>k8s</strong>:"));
-        assert!(page.contains("service-d"));
-        assert!(page.contains("<td>failed</td>"));
-        assert!(page.contains("supabase.plan.migration-checksum"));
-        assert!(page.contains("not reported by connector"));
-        assert!(!page.contains("https://github.com/unknown/tree/unknown"));
-        assert!(!page.contains("<th>Generation status</th><td>published</td>"));
-    }
+    use crate::tests::{ApiRequest, BorsTester, default_repo_name, run_test};
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn api_queue_page(pool: sqlx::PgPool) {
@@ -1077,122 +596,5 @@ mod tests {
             Ok(())
         })
         .await;
-    }
-
-    #[ignore = "legacy GraphService generation-page contract was superseded by D26 status output"]
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn current_retired_page_differs_from_as_of_generation_and_marks_supersession(
-        pool: sqlx::PgPool,
-    ) {
-        let core = MockServer::start().await;
-        let environment_id = "preview_01kxc714rpftsts2nbgqax3hw2";
-        let graph_id = "AZ9YcJMWfrOsiquF1dHHgg==";
-        Mock::given(method("POST"))
-            .and(path("/henosis.v1.GraphService/GetGraph"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "state": {
-                    "durable": {
-                        "graph": {
-                            "id": graph_id,
-                            "generation": "3",
-                            "componentSpecHashes": []
-                        },
-                        "lifecycle": "GRAPH_LIFECYCLE_RETIRED"
-                    },
-                    "reports": []
-                }
-            })))
-            .mount(&core)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/henosis.v1.GraphService/GetGraphGeneration"))
-            .respond_with(move |request: &Request| {
-                let body: Value = request.body_json().unwrap();
-                let generation = body["generation"].as_str().unwrap();
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "state": {
-                        "durable": {
-                            "graph": {
-                                "id": graph_id,
-                                "generation": generation,
-                                "componentSpecHashes": []
-                            },
-                            "lifecycle": "GRAPH_LIFECYCLE_ACTIVE"
-                        },
-                        "reports": [{
-                            "graphId": graph_id,
-                            "generation": generation,
-                            "connector": "k8s",
-                            "dispositions": [],
-                            "sequence": "1"
-                        }]
-                    },
-                    "components": [],
-                    "currentLifecycle": "GRAPH_LIFECYCLE_ACTIVE",
-                    "lastPublishedGeneration": "1"
-                }))
-            })
-            .mount(&core)
-            .await;
-        let config: HenosisConfig = toml::from_str(&format!(
-            r#"
-deploy_repo = "rust-lang/borstest"
-preview_mode = "on-demand"
-
-[core_api]
-endpoint = "{}"
-token = "test-token"
-
-[[components]]
-name = "borstest"
-repo = "rust-lang/borstest"
-
-[[environments]]
-id = "dev"
-manifest_path = "dev.toml"
-"#,
-            core.uri()
-        ))
-        .unwrap();
-
-        BorsBuilder::new(pool)
-            .henosis_config(config)
-            .run_test(async |ctx| {
-                let latest = ctx
-                    .api_request(ApiRequest::get(&format!("/graphs/{environment_id}")))
-                    .await?
-                    .assert_ok()
-                    .into_body();
-                assert!(latest.contains("<th>Lifecycle</th><td>retired</td>"));
-                assert!(latest.contains("graph retired; not converged"));
-                assert!(latest.contains("<h2>Diagnostics</h2>none reported"));
-                assert!(latest.contains("last generation 3"));
-                assert!(latest.contains("immutable as-of evidence"));
-
-                let immutable = ctx
-                    .api_request(ApiRequest::get(&format!(
-                        "/graphs/{environment_id}/generations/3"
-                    )))
-                    .await?
-                    .assert_ok()
-                    .into_body();
-                assert!(immutable.contains("<th>Lifecycle</th><td>active</td>"));
-                assert!(immutable.contains("graph retired; not converged"));
-                assert!(!immutable.contains("immutable as-of evidence"));
-
-                let superseded = ctx
-                    .api_request(ApiRequest::get(&format!(
-                        "/graphs/{environment_id}/generations/2"
-                    )))
-                    .await?
-                    .assert_ok()
-                    .into_body();
-                assert!(superseded.contains("Superseded by"));
-                assert!(superseded.contains("generation 3"));
-                assert!(superseded.contains("current audit context"));
-                assert!(!superseded.contains("failed"));
-                Ok(())
-            })
-            .await;
     }
 }
