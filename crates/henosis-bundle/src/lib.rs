@@ -3,14 +3,14 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 
 use minicbor::Encoder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tempfile::{Builder, NamedTempFile};
+use tempfile::{Builder, TempPath};
 use walkdir::{DirEntry, WalkDir};
 
 pub const BUNDLE_FORMAT_VERSION: u32 = 1;
@@ -160,7 +160,7 @@ impl Bundler for EsbuildBundler {
         let mut artifacts = Vec::with_capacity(components.len());
         for component in components {
             artifacts.push(bundle_component(
-                esbuild.path(),
+                esbuild.as_ref(),
                 &repository,
                 &request.output,
                 &component,
@@ -248,34 +248,12 @@ fn bundle_component(
         "import componentDefinition from {};\nimport {{ createBundle }} from \"@henosis/core\";\nconst bundle = createBundle(componentDefinition);\nexport const protocolVersion = bundle.protocolVersion;\nexport const component = bundle.component;\nexport const evaluate = bundle.evaluate;\n",
         serde_json::to_string(&import_path).expect("path string is JSON encodable")
     );
-    let mut generated = Builder::new()
-        .prefix(".henosis-entry-")
-        .suffix(".ts")
-        .tempfile_in(repository)
-        .map_err(|source| BundleError::PrepareEntry {
-            component: component.name.clone(),
-            source,
-        })?;
-    generated
-        .write_all(entry_source.as_bytes())
-        .map_err(|source| BundleError::PrepareEntry {
-            component: component.name.clone(),
-            source,
-        })?;
-    generated
-        .flush()
-        .map_err(|source| BundleError::PrepareEntry {
-            component: component.name.clone(),
-            source,
-        })?;
-
     let build_dir = tempfile::tempdir().map_err(BundleError::PrepareEsbuild)?;
     let module_path = build_dir.path().join("module.js");
-    let output = Command::new(esbuild)
+    let mut child = Command::new(esbuild)
         .current_dir(repository)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .arg(generated.path())
         .arg("--bundle")
         .arg("--format=esm")
         .arg("--platform=browser")
@@ -285,8 +263,24 @@ fn bundle_component(
         .arg("--legal-comments=none")
         .arg("--packages=bundle")
         .arg("--external:henosis:*")
+        .arg("--sourcefile=henosis-component.ts")
         .arg(format!("--outfile={}", module_path.display()))
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(BundleError::PrepareEsbuild)?;
+    child
+        .stdin
+        .take()
+        .expect("piped esbuild stdin is present")
+        .write_all(entry_source.as_bytes())
+        .map_err(|source| BundleError::PrepareEntry {
+            component: component.name.clone(),
+            source,
+        })?;
+    let output = child
+        .wait_with_output()
         .map_err(BundleError::PrepareEsbuild)?;
     if !output.status.success() {
         return Err(BundleError::Esbuild {
@@ -353,7 +347,7 @@ fn reject_external_imports(component: &str, bytes: &[u8]) -> Result<(), BundleEr
     Ok(())
 }
 
-fn packaged_esbuild() -> Result<NamedTempFile, BundleError> {
+fn packaged_esbuild() -> Result<TempPath, BundleError> {
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     compile_error!("the D26 prototype currently packages esbuild only for linux-x86_64");
 
@@ -378,7 +372,7 @@ fn packaged_esbuild() -> Result<NamedTempFile, BundleError> {
         fs::set_permissions(executable.path(), fs::Permissions::from_mode(0o700))
             .map_err(BundleError::PrepareEsbuild)?;
     }
-    Ok(executable)
+    Ok(executable.into_temp_path())
 }
 
 fn dependency_lock_hash(repository: &Path) -> Result<Option<String>, BundleError> {
@@ -533,10 +527,55 @@ mod tests {
     }
 
     #[test]
-    fn emitted_protocol_wrapper_has_required_exports() {
-        let wrapper = "export const protocolVersion = bundle.protocolVersion;\nexport const component = bundle.component;\nexport const evaluate = bundle.evaluate;";
-        assert!(wrapper.contains("export const protocolVersion"));
-        assert!(wrapper.contains("export const component"));
-        assert!(wrapper.contains("export const evaluate"));
+    fn same_source_produces_same_content_addressed_protocol_module() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("src")).unwrap();
+        fs::create_dir_all(repo.path().join("node_modules/@henosis/core")).unwrap();
+        fs::write(
+            repo.path().join("src/web.ts"),
+            "import { defineComponent } from '@henosis/core'; export default defineComponent({ name: 'web', outputs: {}, build() { return {}; } });",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("node_modules/@henosis/core/package.json"),
+            r#"{"name":"@henosis/core","type":"module","exports":"./index.js"}"#,
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("node_modules/@henosis/core/index.js"),
+            "export function defineComponent(spec) { return spec; } export function createBundle(component) { return { protocolVersion: 1, component: { name: component.name, inputs: {}, outputs: {} }, evaluate() { return { protocolVersion: 1, status: 'complete', resources: [], outputs: {}, observedOutputs: {}, reads: [] }; } }; }",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .unwrap();
+        let first_output = repo.path().join("first");
+        let second_output = repo.path().join("second");
+
+        let first = EsbuildBundler
+            .bundle(&BundleRequest {
+                repository: repo.path().to_path_buf(),
+                output: first_output,
+            })
+            .unwrap();
+        let second = EsbuildBundler
+            .bundle(&BundleRequest {
+                repository: repo.path().to_path_buf(),
+                output: second_output,
+            })
+            .unwrap();
+
+        assert_eq!(first.bundles[0].bundle_id, second.bundles[0].bundle_id);
+        assert_eq!(
+            first.bundles[0].executable_sha256,
+            second.bundles[0].executable_sha256
+        );
+        let module = fs::read_to_string(&first.bundles[0].module).unwrap();
+        assert!(module.contains("protocolVersion"));
+        assert!(module.contains("component"));
+        assert!(module.contains("evaluate"));
+        assert!(module.contains("export {"));
     }
 }

@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
 use henosis_bundle::{BundleError, BundleRequest, Bundler};
-use henosis_core_boundary::{
+
+use crate::henosis::core_client::{
     BundlePin, CoreBoundary, CoreBoundaryError, GraphIntent, GraphPhase, GraphStatus,
 };
-
 use crate::henosis::status::{STATUS_END, STATUS_START};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,9 +129,9 @@ mod tests {
     use std::path::Path;
 
     use henosis_bundle::{BundleArtifact, BundleSetManifest};
-    use henosis_core_boundary::{FakeCoreBoundary, GraphIntent};
 
     use super::*;
+    use crate::henosis::core_client::{FakeCoreBoundary, GraphIntent};
 
     struct FakeBundler;
 

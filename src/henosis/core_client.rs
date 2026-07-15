@@ -1,6 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+pub use henosis_core_boundary::{
+    BundlePin, CoreBoundary, CoreBoundaryError, FakeCoreBoundary, GraphIntent, GraphPhase,
+    GraphStatus,
+};
+
 use anyhow::{Context, anyhow};
 use base64::Engine;
 use futures::StreamExt;
