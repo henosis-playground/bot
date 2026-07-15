@@ -10,10 +10,10 @@ use crate::henosis::core_client::{
 use crate::henosis::d26::PreviewWorkflow;
 use crate::henosis::db::{PgEnvironmentStore, PgQueueStore};
 use crate::henosis::environment::{
-    DeployRepoWriter, DeployWriteResult, EnvironmentChange, EnvironmentIdGenerator,
-    EnvironmentManager, EnvironmentStatus, EnvironmentStore, JoinEnvironment, PreviewPullRequest,
-    PullRequestKey, RenderOutcome, RenderStatus, environment_branch, presentation_identity,
-    presentation_name,
+    DeployRepoWriter, DeployWriteResult, DevManifestReader, EnvironmentChange,
+    EnvironmentIdGenerator, EnvironmentManager, EnvironmentStatus, EnvironmentStore,
+    JoinEnvironment, PreviewPullRequest, PullRequestKey, RenderOutcome, RenderStatus,
+    environment_branch, presentation_identity, presentation_name,
 };
 use crate::henosis::gate::{CliGateExecutor, GateExecutor};
 use crate::henosis::github::{
@@ -200,6 +200,74 @@ impl DeployRepoWriter for PreviewWriter<'_> {
         match self {
             Self::D26(writer) => writer.delete_branch(branch).await,
             Self::LegacyTest(writer) => writer.delete_branch(branch).await,
+        }
+    }
+}
+
+struct D26DevManifestReader {
+    core: ConnectCoreBoundary,
+    deploy_repo: Arc<crate::bors::RepositoryState>,
+    branch: String,
+}
+
+impl DevManifestReader for D26DevManifestReader {
+    async fn read_dev_manifest(&self) -> anyhow::Result<crate::henosis::manifest::Manifest> {
+        let repository = crate::henosis::git_sync::GithubGraphFileRepository::new(
+            self.deploy_repo.clone(),
+            &self.branch,
+        );
+        let dev = crate::henosis::git_sync::named_graph(&repository, "dev")
+            .await?
+            .context("The deploy repository has no `dev` graph")?;
+        let status = self.core.status(&dev.graph).await?;
+        let components = status
+            .bundles
+            .into_iter()
+            .map(|bundle| {
+                let SourceProvenance::Vcs {
+                    repository,
+                    revision,
+                    ..
+                } = bundle.source.context(format!(
+                    "Dev component `{}` has no source provenance",
+                    bundle.component
+                ))?
+                else {
+                    anyhow::bail!(
+                        "Dev component `{}` must have VCS source provenance",
+                        bundle.component
+                    );
+                };
+                Ok((
+                    bundle.component,
+                    crate::henosis::manifest::pinned(
+                        repository,
+                        revision,
+                        format!("sha256:{}", bundle.bundle_id),
+                    ),
+                ))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        Ok(crate::henosis::manifest::Manifest {
+            environment: crate::henosis::manifest::EnvironmentSection {
+                id: "dev".to_string(),
+            },
+            components,
+        })
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+enum PreviewDevManifestReader<'a> {
+    D26(D26DevManifestReader),
+    LegacyTest(GithubDevManifestReader<'a>),
+}
+
+impl DevManifestReader for PreviewDevManifestReader<'_> {
+    async fn read_dev_manifest(&self) -> anyhow::Result<crate::henosis::manifest::Manifest> {
+        match self {
+            Self::D26(reader) => reader.read_dev_manifest().await,
+            Self::LegacyTest(reader) => reader.read_dev_manifest().await,
         }
     }
 }
@@ -395,6 +463,25 @@ fn preview_writer<'a>(
     )
 }
 
+fn preview_dev_manifest_reader<'a>(
+    config: &HenosisConfig,
+    deploy_repo: &'a Arc<crate::bors::RepositoryState>,
+) -> PreviewDevManifestReader<'a> {
+    if let Some(core_api) = config.core_api.as_ref() {
+        PreviewDevManifestReader::D26(D26DevManifestReader {
+            core: ConnectCoreBoundary::new(&core_api.endpoint),
+            deploy_repo: deploy_repo.clone(),
+            branch: config.manifest_branch.clone(),
+        })
+    } else {
+        PreviewDevManifestReader::LegacyTest(GithubDevManifestReader::new(
+            &deploy_repo.client,
+            &config.manifest_branch,
+            &config.dev_manifest_path,
+        ))
+    }
+}
+
 pub fn is_henosis_component_repo(ctx: &BorsContext, repo: &GithubRepoName) -> bool {
     ctx.henosis_config
         .as_ref()
@@ -439,11 +526,7 @@ pub async fn create_preview_environment(
     let deploy_repo = deploy_repo(ctx, config)?;
     let packages = GithubComponentPackageReader::new(&ctx.repositories);
     let mut writer = preview_writer(config, &deploy_repo, pr.clone())?;
-    let dev = GithubDevManifestReader::new(
-        &deploy_repo.client,
-        &config.manifest_branch,
-        &config.dev_manifest_path,
-    );
+    let dev = preview_dev_manifest_reader(config, &deploy_repo);
     let digest = GithubImageDigestResolver::new(&ctx.repositories);
 
     let change = manager
@@ -473,11 +556,7 @@ pub async fn reopen_preview_environment(
     let deploy_repo = deploy_repo(ctx, config)?;
     let packages = GithubComponentPackageReader::new(&ctx.repositories);
     let mut writer = preview_writer(config, &deploy_repo, pr.clone())?;
-    let dev = GithubDevManifestReader::new(
-        &deploy_repo.client,
-        &config.manifest_branch,
-        &config.dev_manifest_path,
-    );
+    let dev = preview_dev_manifest_reader(config, &deploy_repo);
     let digest = GithubImageDigestResolver::new(&ctx.repositories);
 
     let change = manager
@@ -518,11 +597,7 @@ pub async fn refresh_preview_environment(
     let deploy_repo = deploy_repo(ctx, config)?;
     let packages = GithubComponentPackageReader::new(&ctx.repositories);
     let mut writer = preview_writer(config, &deploy_repo, pr.clone())?;
-    let dev = GithubDevManifestReader::new(
-        &deploy_repo.client,
-        &config.manifest_branch,
-        &config.dev_manifest_path,
-    );
+    let dev = preview_dev_manifest_reader(config, &deploy_repo);
     let digest = GithubImageDigestResolver::new(&ctx.repositories);
 
     let change = manager
@@ -550,11 +625,7 @@ pub async fn join_environment(
     let deploy_repo = deploy_repo(ctx, config)?;
     let packages = GithubComponentPackageReader::new(&ctx.repositories);
     let mut writer = preview_writer(config, &deploy_repo, pr.clone())?;
-    let dev = GithubDevManifestReader::new(
-        &deploy_repo.client,
-        &config.manifest_branch,
-        &config.dev_manifest_path,
-    );
+    let dev = preview_dev_manifest_reader(config, &deploy_repo);
     let digest = GithubImageDigestResolver::new(&ctx.repositories);
 
     let change = manager
@@ -589,11 +660,7 @@ pub async fn leave_environment(
     let deploy_repo = deploy_repo(ctx, config)?;
     let packages = GithubComponentPackageReader::new(&ctx.repositories);
     let mut writer = preview_writer(config, &deploy_repo, pr.clone())?;
-    let dev = GithubDevManifestReader::new(
-        &deploy_repo.client,
-        &config.manifest_branch,
-        &config.dev_manifest_path,
-    );
+    let dev = preview_dev_manifest_reader(config, &deploy_repo);
     let digest = GithubImageDigestResolver::new(&ctx.repositories);
 
     let change = manager
@@ -611,17 +678,9 @@ pub async fn tick_queue(ctx: &BorsContext) -> anyhow::Result<Option<RecordedGate
     let manager = QueueManager::new(config.registered_components());
     let mut store = PgQueueStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
-    let dev = GithubDevManifestReader::new(
-        &deploy_repo.client,
-        &config.manifest_branch,
-        &config.dev_manifest_path,
-    );
+    let dev = preview_dev_manifest_reader(config, &deploy_repo);
     let reporter = GithubGateCheckReporter::new(&ctx.repositories, &config.gate_check_run_name);
-    let gate_dev = GithubDevManifestReader::new(
-        &deploy_repo.client,
-        &config.manifest_branch,
-        &config.dev_manifest_path,
-    );
+    let gate_dev = preview_dev_manifest_reader(config, &deploy_repo);
     let gate_executor = CliGateExecutor::new(&config.gate_command, gate_dev);
     let merge_executor = GitHubMergeExecutor::new(
         ctx.db.pool().clone(),
@@ -721,11 +780,7 @@ pub async fn run_advisory_gate_on_approval(
     );
     let external_id = advisory_gate_external_id(&advisory_pr);
     let deploy_repo = deploy_repo(ctx, config)?;
-    let dev = GithubDevManifestReader::new(
-        &deploy_repo.client,
-        &config.manifest_branch,
-        &config.dev_manifest_path,
-    );
+    let dev = preview_dev_manifest_reader(config, &deploy_repo);
     let manager = QueueManager::new(config.registered_components());
     let world = manager
         .candidate_world(&dev, vec![advisory_pr.clone()])
@@ -744,11 +799,7 @@ pub async fn run_advisory_gate_on_approval(
     reporter
         .create_in_progress_check(&advisory_pr, &external_id)
         .await?;
-    let gate_dev = GithubDevManifestReader::new(
-        &deploy_repo.client,
-        &config.manifest_branch,
-        &config.dev_manifest_path,
-    );
+    let gate_dev = preview_dev_manifest_reader(config, &deploy_repo);
     let gate_executor = CliGateExecutor::new(&config.gate_command, gate_dev);
     let mut store = PgQueueStore::new(ctx.db.pool().clone());
     let commenter = GithubPrCommenter::new(ctx.repositories.as_ref(), ctx.db.as_ref());
