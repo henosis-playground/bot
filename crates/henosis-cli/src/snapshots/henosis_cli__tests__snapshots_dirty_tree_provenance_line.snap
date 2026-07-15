@@ -1,0 +1,5 @@
+---
+source: crates/henosis-cli/src/lib.rs
+expression: "render_provenance(&SourceProvenance::Local\n{\n    repository:\n    Some(\"https://github.com/henosis-playground/example.git\".to_string()),\n    base_revision: Some(\"0123456789abcdef\".to_string()), dirty: true,\n})"
+---
+local changes (base 0123456789ab; https://github.com/henosis-playground/example.git)

@@ -16,6 +16,28 @@ use tokio::sync::{Mutex, watch};
 pub struct BundlePin {
     pub component: String,
     pub bundle_id: String,
+    pub source: Option<SourceProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceProvenance {
+    Local {
+        repository: Option<String>,
+        base_revision: Option<String>,
+        dirty: bool,
+    },
+    Vcs {
+        repository: String,
+        revision: String,
+        reference: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GraphSourcePolicy {
+    #[default]
+    AcceptLocal,
+    RequireVcs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,9 +45,11 @@ pub enum GraphIntent {
     Create {
         graph: String,
         bundles: Vec<BundlePin>,
+        source_policy: GraphSourcePolicy,
     },
     Update {
         graph: String,
+        expected_generation: u64,
         bundles: Vec<BundlePin>,
     },
     Retire {
@@ -57,6 +81,15 @@ pub enum GraphPhase {
 pub struct BlockedOn {
     pub component: String,
     pub input: String,
+    pub producer: Option<String>,
+    pub output: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceDisposition {
+    pub resource: String,
+    pub state: String,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +101,9 @@ pub struct GraphStatus {
     pub observed_ready: usize,
     pub planned_resources: usize,
     pub diagnostic: Option<String>,
+    pub bundles: Vec<BundlePin>,
+    pub source_policy: GraphSourcePolicy,
+    pub dispositions: Vec<ResourceDisposition>,
 }
 
 impl GraphStatus {
@@ -80,6 +116,9 @@ impl GraphStatus {
             observed_ready: 0,
             planned_resources: 0,
             diagnostic: None,
+            bundles: Vec::new(),
+            source_policy: GraphSourcePolicy::AcceptLocal,
+            dispositions: Vec::new(),
         }
     }
 }
@@ -142,8 +181,40 @@ impl ConnectCoreBoundary {
         Ok(proto::ComponentIntent {
             name: Some(pin.component),
             bundle_digest: Some(digest),
+            source: pin.source.map(source_to_proto).into(),
             ..Default::default()
         })
+    }
+}
+
+fn source_to_proto(source: SourceProvenance) -> proto::SourceProvenance {
+    use proto::__buffa::oneof::source_provenance::Source;
+
+    let source = match source {
+        SourceProvenance::Local {
+            repository,
+            base_revision,
+            dirty,
+        } => Source::Local(Box::new(proto::LocalSource {
+            repository,
+            base_revision,
+            dirty: Some(dirty),
+            ..Default::default()
+        })),
+        SourceProvenance::Vcs {
+            repository,
+            revision,
+            reference,
+        } => Source::Vcs(Box::new(proto::VcsSource {
+            repository: Some(repository),
+            revision: Some(revision),
+            reference,
+            ..Default::default()
+        })),
+    };
+    proto::SourceProvenance {
+        source: Some(source),
+        ..Default::default()
     }
 }
 
@@ -151,7 +222,11 @@ impl CoreBoundary for ConnectCoreBoundary {
     async fn apply(&self, intent: GraphIntent) -> Result<GraphStatus, CoreBoundaryError> {
         let client = self.client()?;
         match intent {
-            GraphIntent::Create { graph, bundles } => {
+            GraphIntent::Create {
+                graph,
+                bundles,
+                source_policy,
+            } => {
                 let response = client
                     .create_graph(proto::CreateGraphRequest {
                         graph_id: Some(graph.clone()),
@@ -160,6 +235,17 @@ impl CoreBoundary for ConnectCoreBoundary {
                             .into_iter()
                             .map(Self::component)
                             .collect::<Result<_, _>>()?,
+                        source_policy: Some(
+                            match source_policy {
+                                GraphSourcePolicy::AcceptLocal => {
+                                    proto::GraphSourcePolicy::AcceptLocal
+                                }
+                                GraphSourcePolicy::RequireVcs => {
+                                    proto::GraphSourcePolicy::RequireVcs
+                                }
+                            }
+                            .into(),
+                        ),
                         ..Default::default()
                     })
                     .await
@@ -167,12 +253,15 @@ impl CoreBoundary for ConnectCoreBoundary {
                     .into_owned();
                 status_from_response(response.status.into_option())
             }
-            GraphIntent::Update { graph, bundles } => {
-                let current = self.status(&graph).await?;
+            GraphIntent::Update {
+                graph,
+                expected_generation,
+                bundles,
+            } => {
                 let response = client
                     .update_graph(proto::UpdateGraphRequest {
                         graph_id: Some(graph),
-                        expected_generation: Some(current.generation),
+                        expected_generation: Some(expected_generation),
                         components: bundles
                             .into_iter()
                             .map(Self::component)
@@ -255,6 +344,23 @@ impl CoreBoundary for ConnectCoreBoundary {
     }
 }
 
+fn source_from_proto(source: Option<proto::SourceProvenance>) -> Option<SourceProvenance> {
+    use proto::__buffa::oneof::source_provenance::Source;
+
+    match source?.source? {
+        Source::Local(local) => Some(SourceProvenance::Local {
+            repository: local.repository.filter(|value| !value.is_empty()),
+            base_revision: local.base_revision.filter(|value| !value.is_empty()),
+            dirty: local.dirty.unwrap_or(false),
+        }),
+        Source::Vcs(vcs) => Some(SourceProvenance::Vcs {
+            repository: vcs.repository.unwrap_or_default(),
+            revision: vcs.revision.unwrap_or_default(),
+            reference: vcs.reference.filter(|value| !value.is_empty()),
+        }),
+    }
+}
+
 fn status_from_response(
     status: Option<proto::GraphStatus>,
 ) -> Result<GraphStatus, CoreBoundaryError> {
@@ -265,28 +371,86 @@ fn status_from_response(
         CoreBoundaryError::Rejected("GraphService status omitted graph_id".into())
     })?;
     let generation = status.generation.unwrap_or_default();
+    let input_sources = status
+        .components
+        .iter()
+        .flat_map(|component| {
+            let consumer = component.name.clone().unwrap_or_default();
+            component.inputs.iter().map(move |input| {
+                (
+                    (consumer.clone(), input.name.clone().unwrap_or_default()),
+                    (
+                        input.source_component.clone().unwrap_or_default(),
+                        input.source_output.clone().unwrap_or_default(),
+                    ),
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
     let plan = status.plan.into_option();
     let blocked_on = plan
         .as_ref()
         .into_iter()
         .flat_map(|plan| &plan.blocked)
         .flat_map(|blocked| {
-            blocked.inputs.iter().map(|input| BlockedOn {
-                component: blocked.component.clone().unwrap_or_default(),
-                input: input.clone(),
+            blocked.inputs.iter().map(|input| {
+                let component = blocked.component.clone().unwrap_or_default();
+                let source = input_sources.get(&(component.clone(), input.clone()));
+                BlockedOn {
+                    component,
+                    input: input.clone(),
+                    producer: source.map(|(producer, _)| producer.clone()),
+                    output: source.map(|(_, output)| output.clone()),
+                }
             })
         })
         .collect::<Vec<_>>();
+    let planned_resources = plan.as_ref().map_or(0, |plan| plan.resources.len());
+    let dispositions = status
+        .dispositions
+        .into_iter()
+        .map(|disposition| ResourceDisposition {
+            resource: disposition.resource_id.unwrap_or_default(),
+            state: disposition.state.unwrap_or_default(),
+            message: disposition.message,
+        })
+        .collect::<Vec<_>>();
+    let failed = dispositions.iter().any(|item| item.state == "failed");
+    let all_ready = dispositions.len() >= planned_resources
+        && dispositions.iter().all(|item| item.state == "ready");
+    let diagnostic = status.diagnostic.or_else(|| {
+        (!status.stall_cycle.is_empty())
+            .then(|| format!("stall: {}", status.stall_cycle.join(" -> ")))
+    });
     let phase = if status.retired.unwrap_or(false) {
         GraphPhase::Retired
-    } else if !status.stall_cycle.is_empty() {
+    } else if failed || diagnostic.is_some() {
         GraphPhase::Failed
     } else if plan.is_none() {
         GraphPhase::Planning
     } else if !blocked_on.is_empty() {
         GraphPhase::Blocked
-    } else {
+    } else if planned_resources == 0 || all_ready {
         GraphPhase::Ready
+    } else {
+        GraphPhase::Reconciling
+    };
+    let bundles = status
+        .components
+        .into_iter()
+        .map(|component| BundlePin {
+            component: component.name.unwrap_or_default(),
+            bundle_id: hex::encode(component.bundle_digest.unwrap_or_default()),
+            source: source_from_proto(component.source.into_option()),
+        })
+        .collect();
+    let source_policy = match status
+        .source_policy
+        .as_ref()
+        .and_then(buffa::EnumValue::as_known)
+    {
+        Some(proto::GraphSourcePolicy::RequireVcs) => GraphSourcePolicy::RequireVcs,
+        _ => GraphSourcePolicy::AcceptLocal,
     };
     Ok(GraphStatus {
         graph,
@@ -294,9 +458,11 @@ fn status_from_response(
         phase,
         blocked_on,
         observed_ready: status.outputs.len(),
-        planned_resources: plan.map_or(0, |plan| plan.resources.len()),
-        diagnostic: (!status.stall_cycle.is_empty())
-            .then(|| format!("stall: {}", status.stall_cycle.join(" -> "))),
+        planned_resources,
+        diagnostic,
+        bundles,
+        source_policy,
+        dispositions,
     })
 }
 
@@ -392,7 +558,9 @@ mod tests {
                 bundles: vec![BundlePin {
                     component: "web".to_string(),
                     bundle_id: "abc".to_string(),
+                    source: None,
                 }],
+                source_policy: GraphSourcePolicy::AcceptLocal,
             })
             .await
             .unwrap();

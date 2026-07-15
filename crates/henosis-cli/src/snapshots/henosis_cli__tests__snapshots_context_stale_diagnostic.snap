@@ -1,0 +1,7 @@
+---
+source: crates/henosis-cli/src/lib.rs
+expression: "CliError::ContextStale\n{\n    graph: \"graph_070w3ge1r70w3ge1r70w3ge1r7\".to_string(), core:\n    \"http://127.0.0.1:4481\".to_string(),\n}.diagnostic()"
+---
+error[HENOSIS_CONTEXT_STALE]: selected graph `graph_070w3ge1r70w3ge1r70w3ge1r7` no longer exists at http://127.0.0.1:4481
+  |
+  = help: Select another existing graph with `henosis deploy --graph <graph-id>`. Add `--create` only when you intend to create a new graph.

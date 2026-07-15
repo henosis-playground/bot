@@ -58,16 +58,19 @@ where
             .map(|bundle| BundlePin {
                 component: bundle.component,
                 bundle_id: bundle.bundle_id,
+                source: None,
             })
             .collect();
         let intent = match self.core.status(&request.environment).await {
-            Ok(_) => GraphIntent::Update {
+            Ok(current) => GraphIntent::Update {
                 graph: request.environment.clone(),
+                expected_generation: current.generation,
                 bundles: pins,
             },
             Err(CoreBoundaryError::GraphNotFound(_)) => GraphIntent::Create {
                 graph: request.environment.clone(),
                 bundles: pins,
+                source_policy: henosis_core_boundary::GraphSourcePolicy::AcceptLocal,
             },
             Err(error) => return Err(error.into()),
         };
@@ -146,6 +149,7 @@ mod tests {
                     module: request.output.join("module.js"),
                     manifest: request.output.join("bundle.json"),
                     executable_sha256: "b".repeat(64),
+                    dependencies: Vec::new(),
                 }],
             })
         }
@@ -175,7 +179,9 @@ mod tests {
                 bundles: vec![BundlePin {
                     component: "web".to_string(),
                     bundle_id: "a".repeat(64),
+                    source: None,
                 }],
+                source_policy: henosis_core_boundary::GraphSourcePolicy::AcceptLocal,
             }]
         );
 

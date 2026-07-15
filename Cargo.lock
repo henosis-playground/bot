@@ -1551,12 +1551,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "url",
 ]
 
 [[package]]
 name = "henosis-core-boundary"
 version = "0.1.0"
 dependencies = [
+ "buffa",
  "connectrpc",
  "henosis-proto 0.0.0",
  "hex",

@@ -11,8 +11,8 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("{}", error.diagnostic());
-            ExitCode::FAILURE
+            eprintln!("{}", error.rendered_diagnostic());
+            ExitCode::from(error.exit_code())
         }
     }
 }

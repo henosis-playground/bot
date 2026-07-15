@@ -1,0 +1,6 @@
+---
+source: crates/henosis-cli/src/lib.rs
+expression: "format!(\"changed components: {}\\nno deployable changes — generation {} remains active\\n\",\nif changed.is_empty() { \"none\" } else { \"unexpected\" }, current.generation,)"
+---
+changed components: none
+no deployable changes — generation 7 remains active
