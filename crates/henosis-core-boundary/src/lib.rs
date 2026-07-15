@@ -565,8 +565,19 @@ impl CoreBoundary for FakeCoreBoundary {
             .map(|sender| sender.borrow().generation + 1)
             .unwrap_or(1);
         let mut status = GraphStatus::planning(graph.clone(), generation);
-        if matches!(intent, GraphIntent::Retire { .. }) {
-            status.phase = GraphPhase::Retired;
+        match &intent {
+            GraphIntent::Create {
+                bundles,
+                source_policy,
+                ..
+            } => {
+                status.bundles = bundles.clone();
+                status.source_policy = *source_policy;
+            }
+            GraphIntent::Update { bundles, .. } => {
+                status.bundles = bundles.clone();
+            }
+            GraphIntent::Retire { .. } => status.phase = GraphPhase::Retired,
         }
         state.intents.push(intent);
         if let Some(sender) = state.statuses.get(&graph) {

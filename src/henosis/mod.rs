@@ -8,6 +8,7 @@ pub mod environment;
 pub mod gate;
 pub mod gate_report;
 pub mod generation;
+pub mod git_sync;
 pub mod github;
 pub mod graph;
 pub mod manifest;
