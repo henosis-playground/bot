@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 
-use base64::Engine as _;
 use minicbor::Encoder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -851,32 +850,13 @@ fn build_assets_artifact(source: &Path) -> Result<Vec<u8>, BundleError> {
             path: entry.path().to_path_buf(),
             source,
         })?;
-        files.insert(
-            format!("/{relative}"),
-            serde_json::json!({
-                "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
-                "contentType": asset_content_type(&relative),
-            }),
-        );
+        files.insert(relative, bytes);
     }
     serde_json::to_vec(&serde_json::json!({
-        "schema": 1,
+        "format": "henosis-static-assets-v1",
         "files": files,
     }))
     .map_err(BundleError::EncodeManifest)
-}
-
-fn asset_content_type(path: &str) -> &'static str {
-    match Path::new(path).extension().and_then(OsStr::to_str) {
-        Some("css") => "text/css; charset=utf-8",
-        Some("html") => "text/html; charset=utf-8",
-        Some("js" | "mjs") => "text/javascript; charset=utf-8",
-        Some("json") => "application/json",
-        Some("svg") => "image/svg+xml",
-        Some("txt") => "text/plain; charset=utf-8",
-        Some("wasm") => "application/wasm",
-        _ => "application/octet-stream",
-    }
 }
 
 fn missing_artifact_source(declaration: &ArtifactBuildDeclaration) -> BundleError {
