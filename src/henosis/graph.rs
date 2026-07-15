@@ -147,6 +147,35 @@ impl ComponentGraph {
         self.nodes.get(name)
     }
 
+    pub fn dependency_closure<I, S>(&self, roots: I) -> BTreeSet<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut closure = BTreeSet::new();
+        let mut queue = VecDeque::new();
+
+        for component in roots {
+            let component = component.as_ref().to_string();
+            if self.nodes.contains_key(&component) && closure.insert(component.clone()) {
+                queue.push_back(component);
+            }
+        }
+
+        while let Some(component) = queue.pop_front() {
+            let Some(node) = self.nodes.get(&component) else {
+                continue;
+            };
+            for dependency in &node.dependencies {
+                if closure.insert(dependency.clone()) {
+                    queue.push_back(dependency.clone());
+                }
+            }
+        }
+
+        closure
+    }
+
     pub fn preview_closure<I, S>(&self, changed_components: I) -> BTreeSet<String>
     where
         I: IntoIterator<Item = S>,
@@ -332,6 +361,18 @@ mod tests {
         assert_eq!(
             graph.preview_closure(["service-b"]),
             BTreeSet::from(["service-b".to_string(), "service-c".to_string()])
+        );
+        assert_eq!(
+            graph.dependency_closure(["service-c"]),
+            BTreeSet::from([
+                "service-a".to_string(),
+                "service-b".to_string(),
+                "service-c".to_string()
+            ])
+        );
+        assert_eq!(
+            graph.dependency_closure(["service-b"]),
+            BTreeSet::from(["service-a".to_string(), "service-b".to_string()])
         );
     }
 

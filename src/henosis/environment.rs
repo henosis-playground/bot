@@ -662,14 +662,11 @@ impl EnvironmentManager {
                 Ok((component.name.clone(), r#ref))
             })
             .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        let graph_refs = ComponentGraph::from_registered_components(&self.components, &refs)?;
+        let graph = ComponentGraph::read(&graph_refs, package_reader).await?;
         let closure = if self.core_previews {
-            self.components
-                .iter()
-                .map(|component| component.name.clone())
-                .collect()
+            graph.dependency_closure(members.iter().map(|member| member.component.as_str()))
         } else {
-            let graph_refs = ComponentGraph::from_registered_components(&self.components, &refs)?;
-            let graph = ComponentGraph::read(&graph_refs, package_reader).await?;
             graph.preview_closure(members.iter().map(|member| member.component.as_str()))
         };
 
@@ -704,16 +701,7 @@ impl EnvironmentManager {
                         dev_pin.digest.clone(),
                     )
                 }
-                None if self.core_previews => {
-                    let dev_pin = dev_pins.get(&component.name).with_context(|| {
-                        format!("No dev pin found for component `{}`", component.name)
-                    })?;
-                    pinned(
-                        dev_pin.repo.clone(),
-                        dev_pin.r#ref.clone(),
-                        dev_pin.digest.clone(),
-                    )
-                }
+                None if self.core_previews => continue,
                 None => follower_dev(),
             };
             components.insert(component.name.clone(), entry);
