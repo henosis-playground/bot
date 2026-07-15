@@ -6,6 +6,7 @@ rust-version = "1.96.0"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+base64 = "0.22"
 hex = "0.4"
 minicbor = { version = "2", features = ["std"] }
 regex = "1"

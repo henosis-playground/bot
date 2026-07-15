@@ -58,6 +58,7 @@ where
             .map(|bundle| BundlePin {
                 component: bundle.component,
                 bundle_id: bundle.bundle_id,
+                input_bindings: std::collections::BTreeMap::new(),
                 source: None,
             })
             .collect();
@@ -179,6 +180,7 @@ mod tests {
                 bundles: vec![BundlePin {
                     component: "web".to_string(),
                     bundle_id: "a".repeat(64),
+                    input_bindings: std::collections::BTreeMap::new(),
                     source: None,
                 }],
                 source_policy: henosis_core_boundary::GraphSourcePolicy::AcceptLocal,

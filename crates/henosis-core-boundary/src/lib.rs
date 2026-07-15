@@ -16,6 +16,8 @@ use tokio::sync::{Mutex, watch};
 pub struct BundlePin {
     pub component: String,
     pub bundle_id: String,
+    #[serde(default)]
+    pub input_bindings: BTreeMap<String, serde_json::Value>,
     pub source: Option<SourceProvenance>,
 }
 
@@ -178,10 +180,24 @@ impl ConnectCoreBoundary {
                 pin.bundle_id
             ))
         })?;
+        let input_bindings = pin
+            .input_bindings
+            .into_iter()
+            .map(|(name, value)| {
+                serde_json::to_vec(&value)
+                    .map(|value_json| proto::InputBinding {
+                        name: Some(name),
+                        value_json: Some(value_json),
+                        ..Default::default()
+                    })
+                    .map_err(|error| CoreBoundaryError::Rejected(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(proto::ComponentIntent {
             name: Some(pin.component),
             bundle_digest: Some(digest),
             source: pin.source.map(source_to_proto).into(),
+            input_bindings,
             ..Default::default()
         })
     }
@@ -441,6 +457,15 @@ fn status_from_response(
         .map(|component| BundlePin {
             component: component.name.unwrap_or_default(),
             bundle_id: hex::encode(component.bundle_digest.unwrap_or_default()),
+            input_bindings: component
+                .input_bindings
+                .into_iter()
+                .filter_map(|binding| {
+                    let name = binding.name?;
+                    let value = serde_json::from_slice(binding.value_json.as_deref()?).ok()?;
+                    Some((name, value))
+                })
+                .collect(),
             source: source_from_proto(component.source.into_option()),
         })
         .collect();
@@ -558,6 +583,7 @@ mod tests {
                 bundles: vec![BundlePin {
                     component: "web".to_string(),
                     bundle_id: "abc".to_string(),
+                    input_bindings: BTreeMap::new(),
                     source: None,
                 }],
                 source_policy: GraphSourcePolicy::AcceptLocal,

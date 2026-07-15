@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 
+use base64::Engine as _;
 use minicbor::Encoder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,24 @@ static COMPONENT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 static ESM_IMPORT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?m)^\s*(?:import|export)\s+(?:[^;]*?\s+from\s+)?["']([^"']+)["']"#)
         .expect("ESM import pattern is valid")
+});
+static FILES_MANIFEST_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?s)\bfiles\s*:\s*\[(.*?)\]"#).expect("files manifest pattern is valid")
+});
+static CONFIG_FILE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"config\.file\s*\(\s*["']([^"']+)["'](?:\s*,\s*["'](sha256:[0-9a-f]{64})["'])?\s*\)"#,
+    )
+    .expect("configuration file pattern is valid")
+});
+static ARTIFACTS_MANIFEST_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?s)\bartifacts\s*:\s*\[(.*?)\]"#).expect("artifacts manifest pattern is valid")
+});
+static ARTIFACT_BUILD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"artifact\.(buildWorker|buildAssets)\s*\(\s*["']([A-Za-z][A-Za-z0-9]{0,62})["']\s*,\s*["']([^"']+)["']\s*\)"#,
+    )
+    .expect("artifact build pattern is valid")
 });
 
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +107,66 @@ pub enum BundleError {
     },
     #[error("cannot encode bundle identity: {0}")]
     EncodeIdentity(minicbor::encode::Error<std::convert::Infallible>),
+    #[error(
+        "error[HENOSIS_BUNDLE_FILE_MANIFEST]: component `{component}` has a non-static files manifest\n  --> {source_path}\n  = help: declare configuration files directly as config.file(\"path\") calls"
+    )]
+    InvalidFileManifest {
+        component: String,
+        source_path: PathBuf,
+    },
+    #[error(
+        "error[HENOSIS_BUNDLE_FILE_MISSING]: component `{component}` declares missing native {kind} `{path}`\n  --> {source_path}:{line}:{column}\n   |\n  = help: create the referenced path or remove it from the component files manifest"
+    )]
+    MissingNativeFile {
+        component: String,
+        kind: String,
+        path: String,
+        source_path: PathBuf,
+        line: usize,
+        column: usize,
+    },
+    #[error(
+        "error[HENOSIS_BUNDLE_FILE_PATH]: component `{component}` declares invalid native path `{path}`\n  --> {source_path}:{line}:{column}\n  = help: use a normalized repository-relative path without dot, parent, empty, or backslash segments"
+    )]
+    InvalidNativePath {
+        component: String,
+        path: String,
+        source_path: PathBuf,
+        line: usize,
+        column: usize,
+    },
+    #[error(
+        "error[HENOSIS_BUNDLE_FILE_DIGEST]: component `{component}` expected {expected} for `{path}`, but the file hashes to {actual}\n  --> {source_path}:{line}:{column}\n  = help: update the optional expected digest or restore the intended file bytes"
+    )]
+    NativeDigestMismatch {
+        component: String,
+        path: String,
+        expected: String,
+        actual: String,
+        source_path: Box<PathBuf>,
+        line: usize,
+        column: usize,
+    },
+    #[error(
+        "error[HENOSIS_ARTIFACT_MANIFEST]: component `{component}` has a non-static artifacts manifest\n  --> {source_path}\n  = help: declare artifacts directly as artifact.buildWorker(input, path) or artifact.buildAssets(input, path) calls"
+    )]
+    InvalidArtifactManifest {
+        component: String,
+        source_path: PathBuf,
+    },
+    #[error(
+        "error[HENOSIS_ARTIFACT_MISSING]: component `{component}` declares missing {kind} source `{path}`\n  --> {source_path}:{line}:{column}"
+    )]
+    MissingArtifactSource {
+        component: String,
+        kind: String,
+        path: String,
+        source_path: PathBuf,
+        line: usize,
+        column: usize,
+    },
+    #[error("cannot build workload artifact for component `{component}`\n{stderr}")]
+    ArtifactBuild { component: String, stderr: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +190,13 @@ pub struct BundlerIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigFileEntry {
+    pub path: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BundleManifestV1 {
     pub format_version: u32,
     pub module_format: String,
@@ -121,6 +207,7 @@ pub struct BundleManifestV1 {
     pub dependency_lock_hash: Option<String>,
     pub sdk_package_hashes: BTreeMap<String, String>,
     pub declared_capabilities: Vec<String>,
+    pub config_files: Vec<ConfigFileEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +226,120 @@ pub struct BundleArtifact {
 pub struct BundleSetManifest {
     pub format_version: u32,
     pub bundles: Vec<BundleArtifact>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkloadArtifactKind {
+    CloudflareWorker,
+    StaticAssets,
+}
+
+impl WorkloadArtifactKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CloudflareWorker => "cloudflare-worker",
+            Self::StaticAssets => "static-assets",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BuiltArtifact {
+    pub component: String,
+    pub input: String,
+    pub kind: WorkloadArtifactKind,
+    pub digest: String,
+    pub source: PathBuf,
+    pub stored: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct ArtifactBuildDeclaration {
+    component: String,
+    input: String,
+    kind: WorkloadArtifactKind,
+    path: String,
+    source_path: PathBuf,
+    line: usize,
+    column: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct DirectoryArtifactStore {
+    root: PathBuf,
+}
+
+impl DirectoryArtifactStore {
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn push(&self, bytes: &[u8]) -> Result<(String, PathBuf), BundleError> {
+        let hexadecimal = sha256(bytes);
+        let digest = format!("sha256:{hexadecimal}");
+        let path = self.root.join("sha256").join(hexadecimal);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| BundleError::WriteOutput {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        fs::write(&path, bytes).map_err(|source| BundleError::WriteOutput {
+            path: path.clone(),
+            source,
+        })?;
+        Ok((digest, path))
+    }
+}
+
+pub fn build_workload_artifacts(
+    repository: &Path,
+    output: &Path,
+) -> Result<Vec<BuiltArtifact>, BundleError> {
+    let repository =
+        repository
+            .canonicalize()
+            .map_err(|source| BundleError::InspectRepository {
+                path: repository.to_path_buf(),
+                source,
+            })?;
+    let declarations = discover_artifact_builds(&repository)?;
+    let store = DirectoryArtifactStore::new(output);
+    let esbuild = packaged_esbuild()?;
+    let mut built = Vec::with_capacity(declarations.len());
+    for declaration in declarations {
+        let source = repository.join(&declaration.path);
+        let bytes = match declaration.kind {
+            WorkloadArtifactKind::CloudflareWorker => {
+                if !source.is_file() {
+                    return Err(missing_artifact_source(&declaration));
+                }
+                build_worker_artifact(esbuild.as_ref(), &repository, &declaration, &source)?
+            }
+            WorkloadArtifactKind::StaticAssets => {
+                if !source.is_dir() {
+                    return Err(missing_artifact_source(&declaration));
+                }
+                build_assets_artifact(&source)?
+            }
+        };
+        let (digest, stored) = store.push(&bytes)?;
+        built.push(BuiltArtifact {
+            component: declaration.component,
+            input: declaration.input,
+            kind: declaration.kind,
+            digest,
+            source,
+            stored,
+        });
+    }
+    built.sort_by(|left, right| {
+        (&left.component, &left.input).cmp(&(&right.component, &right.input))
+    });
+    Ok(built)
 }
 
 pub trait Bundler {
@@ -240,6 +441,20 @@ fn should_visit(entry: &DirEntry) -> bool {
     )
 }
 
+#[derive(Clone, Debug)]
+struct ConfigFileDeclaration {
+    path: String,
+    expected_sha256: Option<String>,
+    line: usize,
+    column: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedConfigFile {
+    entry: ConfigFileEntry,
+    source: PathBuf,
+}
+
 fn bundle_component(
     esbuild: &Path,
     repository: &Path,
@@ -252,9 +467,21 @@ fn bundle_component(
         .strip_prefix(repository)
         .expect("discovery only returns repository children");
     let import_path = format!("./{}", relative_entry.to_string_lossy().replace('\\', "/"));
+    let declarations = read_config_file_declarations(component)?;
+    let config_files = resolve_config_files(repository, component, &declarations)?;
+    let closure_wire = config_files
+        .iter()
+        .map(|file| {
+            serde_json::json!({
+                "path": file.entry.path,
+                "sha256": file.entry.sha256,
+            })
+        })
+        .collect::<Vec<_>>();
     let entry_source = format!(
-        "import componentDefinition from {};\nimport {{ createBundle }} from \"@henosis/core\";\nconst bundle = createBundle(componentDefinition);\nexport const protocolVersion = bundle.protocolVersion;\nexport const component = bundle.component;\nexport const evaluate = bundle.evaluate;\n",
-        serde_json::to_string(&import_path).expect("path string is JSON encodable")
+        "import componentDefinition from {};\nimport {{ createBundle }} from \"@henosis/core\";\nconst bundle = createBundle(componentDefinition, {});\nexport const protocolVersion = bundle.protocolVersion;\nexport const component = bundle.component;\nexport const evaluate = bundle.evaluate;\n",
+        serde_json::to_string(&import_path).expect("path string is JSON encodable"),
+        serde_json::to_string(&closure_wire).expect("closure manifest is JSON encodable")
     );
     let build_dir = tempfile::tempdir().map_err(BundleError::PrepareEsbuild)?;
     let module_path = build_dir.path().join("module.js");
@@ -302,7 +529,10 @@ fn bundle_component(
         path: module_path,
         source,
     })?;
-    let dependencies = read_dependencies(&component.name, repository, &metafile_path)?;
+    let mut dependencies = read_dependencies(&component.name, repository, &metafile_path)?;
+    dependencies.extend(config_files.iter().map(|file| file.source.clone()));
+    dependencies.sort();
+    dependencies.dedup();
     reject_external_imports(&component.name, &bytes)?;
     let executable_sha256 = sha256(&bytes);
     let config_hash = sha256(ESBUILD_CONFIG.as_bytes());
@@ -321,6 +551,7 @@ fn bundle_component(
         dependency_lock_hash,
         sdk_package_hashes: BTreeMap::new(),
         declared_capabilities: Vec::new(),
+        config_files: config_files.iter().map(|file| file.entry.clone()).collect(),
     };
     let bundle_id = bundle_id(&manifest)?;
     let artifact_dir = output_root.join(&bundle_id);
@@ -333,6 +564,19 @@ fn bundle_component(
         path: final_module.clone(),
         source,
     })?;
+    for file in &config_files {
+        let destination = artifact_dir.join("files").join(&file.entry.path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|source| BundleError::WriteOutput {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        fs::copy(&file.source, &destination).map_err(|source| BundleError::WriteOutput {
+            path: destination,
+            source,
+        })?;
+    }
     let final_manifest = artifact_dir.join("manifest.json");
     write_json(&final_manifest, &manifest)?;
     Ok(BundleArtifact {
@@ -343,6 +587,315 @@ fn bundle_component(
         executable_sha256,
         dependencies,
     })
+}
+
+fn read_config_file_declarations(
+    component: &ComponentSource,
+) -> Result<Vec<ConfigFileDeclaration>, BundleError> {
+    let source =
+        fs::read_to_string(&component.entry).map_err(|source| BundleError::ReadSource {
+            path: component.entry.clone(),
+            source,
+        })?;
+    let Some(manifest) = FILES_MANIFEST_PATTERN.captures(&source) else {
+        return Ok(Vec::new());
+    };
+    let contents = manifest.get(1).expect("files capture exists");
+    let mut declarations = Vec::new();
+    let mut consumed = String::with_capacity(contents.as_str().len());
+    let mut cursor = 0;
+    for captures in CONFIG_FILE_PATTERN.captures_iter(contents.as_str()) {
+        let full = captures.get(0).expect("configuration file capture exists");
+        consumed.push_str(&contents.as_str()[cursor..full.start()]);
+        consumed.push_str(&" ".repeat(full.len()));
+        cursor = full.end();
+        let offset = contents.start() + full.start();
+        let (line, column) = line_column(&source, offset);
+        declarations.push(ConfigFileDeclaration {
+            path: captures[1].to_string(),
+            expected_sha256: captures.get(2).map(|value| value.as_str().to_owned()),
+            line,
+            column,
+        });
+    }
+    consumed.push_str(&contents.as_str()[cursor..]);
+    if consumed
+        .chars()
+        .any(|character| !character.is_whitespace() && character != ',')
+    {
+        return Err(BundleError::InvalidFileManifest {
+            component: component.name.clone(),
+            source_path: component.entry.clone(),
+        });
+    }
+    Ok(declarations)
+}
+
+fn resolve_config_files(
+    repository: &Path,
+    component: &ComponentSource,
+    declarations: &[ConfigFileDeclaration],
+) -> Result<Vec<ResolvedConfigFile>, BundleError> {
+    let mut files = BTreeMap::<String, ResolvedConfigFile>::new();
+    for declaration in declarations {
+        validate_config_path(component, declaration)?;
+        let source_path = repository.join(&declaration.path);
+        if !source_path.is_file() {
+            return Err(BundleError::MissingNativeFile {
+                component: component.name.clone(),
+                kind: "configuration file".to_owned(),
+                path: declaration.path.clone(),
+                source_path: component.entry.clone(),
+                line: declaration.line,
+                column: declaration.column,
+            });
+        }
+        let canonical = source_path
+            .canonicalize()
+            .map_err(|source| BundleError::ReadSource {
+                path: source_path.clone(),
+                source,
+            })?;
+        if !canonical.starts_with(repository) {
+            return Err(BundleError::InvalidNativePath {
+                component: component.name.clone(),
+                path: declaration.path.clone(),
+                source_path: component.entry.clone(),
+                line: declaration.line,
+                column: declaration.column,
+            });
+        }
+        let bytes = fs::read(&canonical).map_err(|source| BundleError::ReadSource {
+            path: canonical.clone(),
+            source,
+        })?;
+        let actual = format!("sha256:{}", sha256(&bytes));
+        if declaration
+            .expected_sha256
+            .as_ref()
+            .is_some_and(|expected| expected != &actual)
+        {
+            return Err(BundleError::NativeDigestMismatch {
+                component: component.name.clone(),
+                path: declaration.path.clone(),
+                expected: declaration
+                    .expected_sha256
+                    .clone()
+                    .expect("expected digest exists"),
+                actual,
+                source_path: Box::new(component.entry.clone()),
+                line: declaration.line,
+                column: declaration.column,
+            });
+        }
+        let resolved = ResolvedConfigFile {
+            entry: ConfigFileEntry {
+                path: declaration.path.clone(),
+                sha256: actual,
+                size: bytes.len() as u64,
+            },
+            source: canonical,
+        };
+        files.insert(resolved.entry.path.clone(), resolved);
+    }
+    Ok(files.into_values().collect())
+}
+
+fn validate_config_path(
+    component: &ComponentSource,
+    declaration: &ConfigFileDeclaration,
+) -> Result<(), BundleError> {
+    let valid = !declaration.path.is_empty()
+        && !declaration.path.starts_with('/')
+        && !declaration.path.contains('\\')
+        && declaration
+            .path
+            .split('/')
+            .all(|part| !matches!(part, "" | "." | ".."));
+    if valid {
+        Ok(())
+    } else {
+        Err(BundleError::InvalidNativePath {
+            component: component.name.clone(),
+            path: declaration.path.clone(),
+            source_path: component.entry.clone(),
+            line: declaration.line,
+            column: declaration.column,
+        })
+    }
+}
+
+fn discover_artifact_builds(
+    repository: &Path,
+) -> Result<Vec<ArtifactBuildDeclaration>, BundleError> {
+    let mut declarations = Vec::new();
+    for component in discover_components(repository)? {
+        let source =
+            fs::read_to_string(&component.entry).map_err(|source| BundleError::ReadSource {
+                path: component.entry.clone(),
+                source,
+            })?;
+        let Some(manifest) = ARTIFACTS_MANIFEST_PATTERN.captures(&source) else {
+            continue;
+        };
+        let contents = manifest.get(1).expect("artifacts capture exists");
+        let mut consumed = String::with_capacity(contents.as_str().len());
+        let mut cursor = 0;
+        for captures in ARTIFACT_BUILD_PATTERN.captures_iter(contents.as_str()) {
+            let full = captures.get(0).expect("artifact build capture exists");
+            consumed.push_str(&contents.as_str()[cursor..full.start()]);
+            consumed.push_str(&" ".repeat(full.len()));
+            cursor = full.end();
+            let offset = contents.start() + full.start();
+            let (line, column) = line_column(&source, offset);
+            let path = captures[3].to_owned();
+            if !valid_repository_path(&path) {
+                return Err(BundleError::InvalidNativePath {
+                    component: component.name.clone(),
+                    path,
+                    source_path: component.entry.clone(),
+                    line,
+                    column,
+                });
+            }
+            declarations.push(ArtifactBuildDeclaration {
+                component: component.name.clone(),
+                input: captures[2].to_owned(),
+                kind: match &captures[1] {
+                    "buildWorker" => WorkloadArtifactKind::CloudflareWorker,
+                    "buildAssets" => WorkloadArtifactKind::StaticAssets,
+                    _ => unreachable!("regex limits artifact build kind"),
+                },
+                path,
+                source_path: component.entry.clone(),
+                line,
+                column,
+            });
+        }
+        consumed.push_str(&contents.as_str()[cursor..]);
+        if consumed
+            .chars()
+            .any(|character| !character.is_whitespace() && character != ',')
+        {
+            return Err(BundleError::InvalidArtifactManifest {
+                component: component.name,
+                source_path: component.entry,
+            });
+        }
+    }
+    Ok(declarations)
+}
+
+fn build_worker_artifact(
+    esbuild: &Path,
+    repository: &Path,
+    declaration: &ArtifactBuildDeclaration,
+    source: &Path,
+) -> Result<Vec<u8>, BundleError> {
+    let output = tempfile::NamedTempFile::new().map_err(BundleError::PrepareEsbuild)?;
+    let result = Command::new(esbuild)
+        .current_dir(repository)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .arg(source)
+        .arg("--bundle")
+        .arg("--format=esm")
+        .arg("--platform=browser")
+        .arg("--target=esnext")
+        .arg("--charset=utf8")
+        .arg("--tree-shaking=true")
+        .arg("--legal-comments=none")
+        .arg("--minify")
+        .arg(format!("--outfile={}", output.path().display()))
+        .output()
+        .map_err(BundleError::PrepareEsbuild)?;
+    if !result.status.success() {
+        return Err(BundleError::ArtifactBuild {
+            component: declaration.component.clone(),
+            stderr: String::from_utf8_lossy(&result.stderr).trim().to_owned(),
+        });
+    }
+    fs::read(output.path()).map_err(|source| BundleError::ReadSource {
+        path: output.path().to_path_buf(),
+        source,
+    })
+}
+
+fn build_assets_artifact(source: &Path) -> Result<Vec<u8>, BundleError> {
+    let mut files = BTreeMap::new();
+    for entry in WalkDir::new(source).follow_links(false) {
+        let entry = entry.map_err(|error| BundleError::InspectRepository {
+            path: source.to_path_buf(),
+            source: error
+                .into_io_error()
+                .unwrap_or_else(|| std::io::Error::other("static assets traversal failed")),
+        })?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(source)
+            .expect("assets traversal stays below root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let bytes = fs::read(entry.path()).map_err(|source| BundleError::ReadSource {
+            path: entry.path().to_path_buf(),
+            source,
+        })?;
+        files.insert(
+            format!("/{relative}"),
+            serde_json::json!({
+                "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+                "contentType": asset_content_type(&relative),
+            }),
+        );
+    }
+    serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "files": files,
+    }))
+    .map_err(BundleError::EncodeManifest)
+}
+
+fn asset_content_type(path: &str) -> &'static str {
+    match Path::new(path).extension().and_then(OsStr::to_str) {
+        Some("css") => "text/css; charset=utf-8",
+        Some("html") => "text/html; charset=utf-8",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        Some("json") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("wasm") => "application/wasm",
+        _ => "application/octet-stream",
+    }
+}
+
+fn missing_artifact_source(declaration: &ArtifactBuildDeclaration) -> BundleError {
+    BundleError::MissingArtifactSource {
+        component: declaration.component.clone(),
+        kind: declaration.kind.as_str().to_owned(),
+        path: declaration.path.clone(),
+        source_path: declaration.source_path.clone(),
+        line: declaration.line,
+        column: declaration.column,
+    }
+}
+
+fn valid_repository_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
+}
+
+fn line_column(source: &str, offset: usize) -> (usize, usize) {
+    let prefix = &source[..offset];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix.len() + 1, |(_, tail)| tail.len() + 1);
+    (line, column)
 }
 
 #[derive(Deserialize)]
@@ -444,7 +997,7 @@ fn dependency_lock_hash(repository: &Path) -> Result<Option<String>, BundleError
 fn bundle_id(manifest: &BundleManifestV1) -> Result<String, BundleError> {
     let mut bytes = Vec::new();
     let mut encoder = Encoder::new(&mut bytes);
-    encoder.map(9).map_err(BundleError::EncodeIdentity)?;
+    encoder.map(10).map_err(BundleError::EncodeIdentity)?;
     encoder.u8(0).map_err(BundleError::EncodeIdentity)?;
     encoder
         .u32(manifest.format_version)
@@ -503,6 +1056,22 @@ fn bundle_id(manifest: &BundleManifestV1) -> Result<String, BundleError> {
     for capability in &manifest.declared_capabilities {
         encoder
             .str(capability)
+            .map_err(BundleError::EncodeIdentity)?;
+    }
+    encoder.u8(9).map_err(BundleError::EncodeIdentity)?;
+    encoder
+        .array(manifest.config_files.len() as u64)
+        .map_err(BundleError::EncodeIdentity)?;
+    for file in &manifest.config_files {
+        encoder.array(3).map_err(BundleError::EncodeIdentity)?;
+        encoder
+            .str(&file.path)
+            .map_err(BundleError::EncodeIdentity)?;
+        encoder
+            .str(&file.sha256)
+            .map_err(BundleError::EncodeIdentity)?;
+        encoder
+            .u64(file.size)
             .map_err(BundleError::EncodeIdentity)?;
     }
     Ok(sha256(&bytes))
@@ -567,6 +1136,7 @@ mod tests {
             dependency_lock_hash: Some("c".repeat(64)),
             sdk_package_hashes: BTreeMap::new(),
             declared_capabilities: Vec::new(),
+            config_files: Vec::new(),
         };
         assert_eq!(bundle_id(&manifest).unwrap(), bundle_id(&manifest).unwrap());
     }
@@ -622,5 +1192,116 @@ mod tests {
         assert!(module.contains("component"));
         assert!(module.contains("evaluate"));
         assert!(module.contains("export {"));
+    }
+
+    #[test]
+    fn configuration_file_bytes_round_trip_and_change_bundle_identity() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("src")).unwrap();
+        fs::create_dir_all(repo.path().join("migrations")).unwrap();
+        fs::create_dir_all(repo.path().join("node_modules/@henosis/core")).unwrap();
+        fs::write(
+            repo.path().join("src/database.ts"),
+            "import { config, defineComponent } from '@henosis/core'; export default defineComponent({ name: 'database', files: [config.file('migrations/001.sql')], outputs: {}, build() { return {}; } });",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("node_modules/@henosis/core/package.json"),
+            r#"{"name":"@henosis/core","type":"module","exports":"./index.js"}"#,
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("node_modules/@henosis/core/index.js"),
+            "export const config = { file(path) { return { path }; } }; export function defineComponent(spec) { return spec; } export function createBundle(component, files) { return { protocolVersion: 1, component: { name: component.name, inputs: {}, outputs: {}, files }, evaluate() { return { protocolVersion: 1, status: 'complete', resources: [], outputs: {}, observedOutputs: {}, reads: [] }; } }; }",
+        )
+        .unwrap();
+        fs::write(repo.path().join("migrations/001.sql"), "select 1;\n").unwrap();
+
+        let first = EsbuildBundler
+            .bundle(&BundleRequest {
+                repository: repo.path().to_path_buf(),
+                output: repo.path().join("bundles-one"),
+            })
+            .unwrap();
+        let manifest: BundleManifestV1 =
+            serde_json::from_slice(&fs::read(&first.bundles[0].manifest).unwrap()).unwrap();
+        assert_eq!(manifest.config_files.len(), 1);
+        assert_eq!(
+            fs::read(
+                first.bundles[0]
+                    .manifest
+                    .parent()
+                    .unwrap()
+                    .join("files/migrations/001.sql")
+            )
+            .unwrap(),
+            b"select 1;\n"
+        );
+
+        fs::write(repo.path().join("migrations/001.sql"), "select 2;\n").unwrap();
+        let second = EsbuildBundler
+            .bundle(&BundleRequest {
+                repository: repo.path().to_path_buf(),
+                output: repo.path().join("bundles-two"),
+            })
+            .unwrap();
+        assert_ne!(first.bundles[0].bundle_id, second.bundles[0].bundle_id);
+    }
+
+    #[test]
+    fn worker_rebuild_changes_binding_without_changing_config_bundle_identity() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("src")).unwrap();
+        fs::create_dir_all(repo.path().join("workers")).unwrap();
+        fs::create_dir_all(repo.path().join("node_modules/@henosis/core")).unwrap();
+        fs::write(
+            repo.path().join("src/web.ts"),
+            "import { artifact, defineComponent } from '@henosis/core'; export default defineComponent({ name: 'web', artifacts: [artifact.buildWorker('workerArtifact', 'workers/web.ts')], inputs: {}, outputs: {}, build() { return {}; } });",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("node_modules/@henosis/core/package.json"),
+            r#"{"name":"@henosis/core","type":"module","exports":"./index.js"}"#,
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("node_modules/@henosis/core/index.js"),
+            "export const artifact = { buildWorker(input, path) { return { input, path }; } }; export function defineComponent(spec) { return spec; } export function createBundle(component) { return { protocolVersion: 1, component: { name: component.name, inputs: {}, outputs: {} }, evaluate() { return { protocolVersion: 1, status: 'complete', resources: [], outputs: {}, observedOutputs: {}, reads: [] }; } }; }",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("workers/web.ts"),
+            "export default { fetch() { return new Response('one'); } };\n",
+        )
+        .unwrap();
+
+        let first_bundle = EsbuildBundler
+            .bundle(&BundleRequest {
+                repository: repo.path().to_path_buf(),
+                output: repo.path().join("bundles-one"),
+            })
+            .unwrap();
+        let first_artifact =
+            build_workload_artifacts(repo.path(), &repo.path().join("artifacts")).unwrap();
+        fs::write(
+            repo.path().join("workers/web.ts"),
+            "export default { fetch() { return new Response('two'); } };\n",
+        )
+        .unwrap();
+        let second_bundle = EsbuildBundler
+            .bundle(&BundleRequest {
+                repository: repo.path().to_path_buf(),
+                output: repo.path().join("bundles-two"),
+            })
+            .unwrap();
+        let second_artifact =
+            build_workload_artifacts(repo.path(), &repo.path().join("artifacts")).unwrap();
+
+        assert_eq!(
+            first_bundle.bundles[0].bundle_id,
+            second_bundle.bundles[0].bundle_id
+        );
+        assert_ne!(first_artifact[0].digest, second_artifact[0].digest);
+        assert_eq!(first_artifact[0].input, "workerArtifact");
     }
 }

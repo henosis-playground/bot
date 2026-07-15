@@ -9,8 +9,8 @@ Henosis keeps the selected graph and core target in .henosis/context. Graph crea
 Usage: henosis <COMMAND>
 
 Commands:
-  dev     Continuously typecheck, bundle, deploy, and follow graph status
-  deploy  Typecheck, bundle, deploy once, and wait for a terminal graph status
+  dev     Continuously typecheck, build artifacts, bundle configuration, deploy, and follow status
+  deploy  Typecheck, build artifacts, bundle configuration, deploy once, and wait for status
   status  Print the selected graph's current status
   retire  Retire the selected graph
   debug   Low-level packaging and troubleshooting commands

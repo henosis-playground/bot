@@ -6,7 +6,10 @@ use std::process::Command as ProcessCommand;
 use std::time::{Duration, SystemTime};
 
 use clap::{Args, CommandFactory as _, Parser, Subcommand};
-use henosis_bundle::{BundleError, BundleRequest, BundleSetManifest, Bundler, EsbuildBundler};
+use henosis_bundle::{
+    BuiltArtifact, BundleError, BundleRequest, BundleSetManifest, Bundler, EsbuildBundler,
+    build_workload_artifacts,
+};
 use henosis_core_boundary::{
     BundlePin, ConnectCoreBoundary, CoreBoundary, CoreBoundaryError, GraphIntent, GraphPhase,
     GraphSourcePolicy, GraphStatus, SourceProvenance,
@@ -16,6 +19,7 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_CORE: &str = "http://127.0.0.1:4481";
 const CONTEXT_PATH: &str = ".henosis/context";
 const BUNDLE_PATH: &str = ".henosis/bundles";
+const ARTIFACT_PATH: &str = ".henosis/artifacts";
 const TRANSIENT_RETRIES: usize = 3;
 
 #[derive(Debug, Parser)]
@@ -31,9 +35,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Continuously typecheck, bundle, deploy, and follow graph status.
+    /// Continuously typecheck, build artifacts, bundle configuration, deploy, and follow status.
     Dev(PipelineArgs),
-    /// Typecheck, bundle, deploy once, and wait for a terminal graph status.
+    /// Typecheck, build artifacts, bundle configuration, deploy once, and wait for status.
     Deploy(PipelineArgs),
     /// Print the selected graph's current status.
     Status(TargetArgs),
@@ -387,7 +391,9 @@ async fn run_cycle(
         repository: repository.clone(),
         output: bundle_output,
     })?;
-    let pins = bundle_pins(&repository, &bundles);
+    let artifacts = build_workload_artifacts(&repository, &repository.join(ARTIFACT_PATH))?;
+    emit_stdout(&render_artifact_result(&artifacts));
+    let pins = bundle_pins(&repository, &bundles, &artifacts);
     let changed = changed_components(target.current.as_ref(), &pins);
     emit_stdout(&format!(
         "changed components: {}\n",
@@ -398,7 +404,7 @@ async fn run_cycle(
         }
     ));
 
-    let dependencies = observed_dependencies(&repository, &bundles);
+    let dependencies = observed_dependencies(&repository, &bundles, &artifacts);
     if changed.is_empty() {
         let generation = target
             .current
@@ -564,23 +570,42 @@ async fn run_typecheck(repository: &Path) -> Result<(), CliError> {
     }))
 }
 
-fn bundle_pins(repository: &Path, bundles: &BundleSetManifest) -> Vec<BundlePin> {
+fn bundle_pins(
+    repository: &Path,
+    bundles: &BundleSetManifest,
+    artifacts: &[BuiltArtifact],
+) -> Vec<BundlePin> {
     bundles
         .bundles
         .iter()
         .map(|bundle| BundlePin {
             component: bundle.component.clone(),
             bundle_id: bundle.bundle_id.clone(),
+            input_bindings: artifacts
+                .iter()
+                .filter(|artifact| artifact.component == bundle.component)
+                .map(|artifact| {
+                    (
+                        artifact.input.clone(),
+                        serde_json::Value::String(artifact.digest.clone()),
+                    )
+                })
+                .collect(),
             source: Some(repository_provenance(repository, &bundle.dependencies)),
         })
         .collect()
 }
 
-fn observed_dependencies(repository: &Path, bundles: &BundleSetManifest) -> Vec<PathBuf> {
+fn observed_dependencies(
+    repository: &Path,
+    bundles: &BundleSetManifest,
+    artifacts: &[BuiltArtifact],
+) -> Vec<PathBuf> {
     let mut dependencies = bundles
         .bundles
         .iter()
         .flat_map(|bundle| bundle.dependencies.iter().cloned())
+        .chain(artifacts.iter().map(|artifact| artifact.source.clone()))
         .collect::<Vec<_>>();
     for name in [
         "package.json",
@@ -727,12 +752,22 @@ where
 fn changed_components(current: Option<&GraphStatus>, pins: &[BundlePin]) -> Vec<String> {
     let desired = pins
         .iter()
-        .map(|pin| (pin.component.as_str(), pin.bundle_id.as_str()))
+        .map(|pin| {
+            (
+                pin.component.as_str(),
+                (pin.bundle_id.as_str(), &pin.input_bindings),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     let existing = current
         .into_iter()
         .flat_map(|status| status.bundles.iter())
-        .map(|pin| (pin.component.as_str(), pin.bundle_id.as_str()))
+        .map(|pin| {
+            (
+                pin.component.as_str(),
+                (pin.bundle_id.as_str(), &pin.input_bindings),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     desired
         .keys()
@@ -845,6 +880,23 @@ fn render_bundle_result(bundles: &BundleSetManifest) -> String {
             bundle.component,
             bundle.bundle_id,
             bundle.module.display()
+        ));
+    }
+    rendered
+}
+
+fn render_artifact_result(artifacts: &[BuiltArtifact]) -> String {
+    if artifacts.is_empty() {
+        return "built 0 workload artifacts\n".to_owned();
+    }
+    let mut rendered = format!("built {} workload artifact(s)\n", artifacts.len());
+    for artifact in artifacts {
+        rendered.push_str(&format!(
+            "  {}.{}  {}  {}\n",
+            artifact.component,
+            artifact.input,
+            artifact.kind.as_str(),
+            artifact.digest
         ));
     }
     rendered
@@ -1026,6 +1078,7 @@ mod tests {
             bundles: vec![BundlePin {
                 component: "web".to_string(),
                 bundle_id: "a".repeat(64),
+                input_bindings: BTreeMap::new(),
                 source: None,
             }],
             source_policy: GraphSourcePolicy::AcceptLocal,
@@ -1070,6 +1123,7 @@ mod tests {
             bundles: vec![BundlePin {
                 component: "web".to_string(),
                 bundle_id: "a".repeat(64),
+                input_bindings: BTreeMap::new(),
                 source: None,
             }],
             source_policy: GraphSourcePolicy::AcceptLocal,
@@ -1078,6 +1132,7 @@ mod tests {
         let desired = vec![BundlePin {
             component: "web".to_string(),
             bundle_id: "a".repeat(64),
+            input_bindings: BTreeMap::new(),
             source: Some(SourceProvenance::Local {
                 repository: None,
                 base_revision: None,
@@ -1085,6 +1140,30 @@ mod tests {
             }),
         }];
         assert!(changed_components(Some(&status), &desired).is_empty());
+    }
+
+    #[test]
+    fn artifact_binding_change_is_deployable_without_bundle_change() {
+        let mut current = GraphStatus::planning("graph_demo", 1);
+        current.bundles = vec![BundlePin {
+            component: "web".to_owned(),
+            bundle_id: "a".repeat(64),
+            input_bindings: BTreeMap::from([(
+                "workerArtifact".to_owned(),
+                serde_json::json!(format!("sha256:{}", "11".repeat(32))),
+            )]),
+            source: None,
+        }];
+        let desired = vec![BundlePin {
+            component: "web".to_owned(),
+            bundle_id: "a".repeat(64),
+            input_bindings: BTreeMap::from([(
+                "workerArtifact".to_owned(),
+                serde_json::json!(format!("sha256:{}", "22".repeat(32))),
+            )]),
+            source: None,
+        }];
+        assert_eq!(changed_components(Some(&current), &desired), ["web"]);
     }
 
     #[allow(dead_code)]
