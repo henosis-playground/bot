@@ -12,6 +12,8 @@ pub struct PreviewRequest {
     pub repository: String,
     pub pull_request: u64,
     pub checkout: PathBuf,
+    pub revision: String,
+    pub reference: Option<String>,
     pub environment: String,
 }
 
@@ -26,6 +28,7 @@ pub enum PreviewError {
 pub struct PreviewWorkflow<C, B> {
     core: C,
     bundler: B,
+    bundle_root: PathBuf,
     artifact_root: PathBuf,
 }
 
@@ -34,27 +37,28 @@ where
     C: CoreBoundary,
     B: Bundler,
 {
-    pub fn new(core: C, bundler: B, artifact_root: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        core: C,
+        bundler: B,
+        bundle_root: impl Into<PathBuf>,
+        artifact_root: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             core,
             bundler,
+            bundle_root: bundle_root.into(),
             artifact_root: artifact_root.into(),
         }
     }
 
     pub async fn p_plus(&self, request: &PreviewRequest) -> Result<GraphStatus, PreviewError> {
-        let output = self.artifact_root.join(&request.environment).join(format!(
-            "{}-{}",
-            repository_slug(&request.repository),
-            request.pull_request
-        ));
         let bundles = self.bundler.bundle(&BundleRequest {
             repository: request.checkout.clone(),
-            output: output.join("bundles"),
+            output: self.bundle_root.clone(),
         })?;
         let artifacts = self
             .bundler
-            .build_artifacts(&request.checkout, &output.join("artifacts"))?;
+            .build_artifacts(&request.checkout, &self.artifact_root)?;
         let pins = bundles
             .bundles
             .into_iter()
@@ -71,7 +75,11 @@ where
                         )
                     })
                     .collect(),
-                source: None,
+                source: Some(crate::henosis::core_client::SourceProvenance::Vcs {
+                    repository: request.repository.clone(),
+                    revision: request.revision.clone(),
+                    reference: request.reference.clone(),
+                }),
             })
             .collect();
         let intent = match self.core.status(&request.environment).await {
@@ -135,10 +143,6 @@ pub fn render_core_status(status: &GraphStatus) -> String {
     )
 }
 
-fn repository_slug(repository: &str) -> &str {
-    repository.rsplit('/').next().unwrap_or(repository)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -179,15 +183,19 @@ mod tests {
     #[tokio::test]
     async fn pr_opened_then_p_plus_records_intent_and_renders_status() {
         let core = FakeCoreBoundary::default();
+        let root = tempfile::tempdir().unwrap();
         let workflow = PreviewWorkflow::new(
             core.clone(),
             FakeBundler,
-            tempfile::tempdir().unwrap().path(),
+            root.path().join("bundles"),
+            root.path().join("artifacts"),
         );
         let request = PreviewRequest {
             repository: "henosis-playground/web".to_string(),
             pull_request: 42,
             checkout: Path::new("/checkout/web").to_path_buf(),
+            revision: "deadbeef".to_string(),
+            reference: Some("refs/pull/42/head".to_string()),
             environment: "preview_01k00000000000000000000000".to_string(),
         };
 
@@ -201,7 +209,11 @@ mod tests {
                     component: "web".to_string(),
                     bundle_id: "a".repeat(64),
                     input_bindings: std::collections::BTreeMap::new(),
-                    source: None,
+                    source: Some(crate::henosis::core_client::SourceProvenance::Vcs {
+                        repository: request.repository.clone(),
+                        revision: request.revision.clone(),
+                        reference: request.reference.clone(),
+                    }),
                 }],
                 source_policy: henosis_core_boundary::GraphSourcePolicy::AcceptLocal,
             }]

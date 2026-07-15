@@ -4,9 +4,10 @@ use crate::bors::event::{PushToBranch, WorkflowRunCompleted};
 use crate::github::{GithubRepoName, PullRequest, PullRequestNumber};
 use crate::henosis::config::{HenosisConfig, PreviewMode};
 use crate::henosis::core_client::{
-    CoreClient, CoreEnvironmentIdGenerator, CoreFailurePresentation, CoreGraphWriter,
-    borrowed_components_from_generation, ui_links_from_generation,
+    ConnectCoreBoundary, CoreBoundary, CoreEnvironmentIdGenerator, CoreFailurePresentation,
+    GraphPhase, GraphStatus, UiLink,
 };
+use crate::henosis::d26::{PreviewRequest, PreviewWorkflow};
 use crate::henosis::db::{PgEnvironmentStore, PgQueueStore};
 use crate::henosis::environment::{
     DeployRepoWriter, DeployWriteResult, EnvironmentChange, EnvironmentManager, EnvironmentStatus,
@@ -14,9 +15,8 @@ use crate::henosis::environment::{
     RenderStatus, environment_branch,
 };
 use crate::henosis::gate::{CliGateExecutor, GateExecutor};
-#[cfg(test)]
-use crate::henosis::github::GithubDeployRepoWriter;
 use crate::henosis::github::{
+    GithubDeployRepoWriter,
     GitHubMergeExecutor, GithubComponentPackageReader, GithubDevManifestReader,
     GithubGateCheckReporter, GithubImageDigestResolver, GithubPrCommenter,
     GithubRepoValidationChecker, deploy_manifest_url,
@@ -31,7 +31,11 @@ use crate::henosis::status::{
     StatusSnapshot, remove_status_section, render_status_section, upsert_status_section,
 };
 use anyhow::Context;
+use base64::Engine as _;
+use henosis_bundle::EsbuildBundler;
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use tokio::sync::Notify;
@@ -42,9 +46,77 @@ pub async fn wait_for_core_status_wake() {
     CORE_STATUS_WAKE.notified().await;
 }
 
+struct D26PreviewWriter {
+    core: ConnectCoreBoundary,
+    request: PreviewPullRequest,
+    checkout_subdir: Option<PathBuf>,
+    bundle_root: PathBuf,
+    artifact_root: PathBuf,
+}
+
+impl DeployRepoWriter for D26PreviewWriter {
+    async fn write_manifest(
+        &mut self,
+        path: &str,
+        _contents: &str,
+    ) -> anyhow::Result<DeployWriteResult> {
+        let environment = environment_id_from_manifest_path(path)?;
+        let checkout = checkout_pull_request(&self.request).await?;
+        install_checkout_dependencies(checkout.path()).await?;
+        let component_root = self
+            .checkout_subdir
+            .as_ref()
+            .map_or_else(|| checkout.path().to_path_buf(), |subdir| checkout.path().join(subdir));
+        anyhow::ensure!(
+            component_root.is_dir(),
+            "D26 preview component root {} does not exist",
+            component_root.display()
+        );
+        let workflow = PreviewWorkflow::new(
+            self.core.clone(),
+            EsbuildBundler,
+            &self.bundle_root,
+            &self.artifact_root,
+        );
+        let status = workflow
+            .p_plus(&PreviewRequest {
+                repository: self.request.key.repo.clone(),
+                pull_request: self.request.key.number,
+                checkout: component_root,
+                revision: self.request.head_sha.clone(),
+                reference: Some(format!("refs/heads/{}", self.request.head_branch)),
+                environment: environment.to_string(),
+            })
+            .await?;
+        Ok(DeployWriteResult {
+            commit_sha: format!("generation:{}", status.generation),
+        })
+    }
+
+    async fn delete_manifest(&mut self, path: &str) -> anyhow::Result<()> {
+        let environment = environment_id_from_manifest_path(path)?;
+        PreviewWorkflow::new(
+            self.core.clone(),
+            EsbuildBundler,
+            &self.bundle_root,
+            &self.artifact_root,
+        )
+        .p_minus(environment)
+        .await?;
+        Ok(())
+    }
+
+    async fn create_branch(&mut self, _branch: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn delete_branch(&mut self, _branch: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 enum PreviewWriter<'a> {
-    Core(CoreGraphWriter<'a, GithubComponentPackageReader<'a>>),
-    #[cfg(test)]
+    D26(D26PreviewWriter),
     LegacyTest(GithubDeployRepoWriter<'a>),
 }
 
@@ -55,35 +127,119 @@ impl DeployRepoWriter for PreviewWriter<'_> {
         contents: &str,
     ) -> anyhow::Result<DeployWriteResult> {
         match self {
-            Self::Core(writer) => writer.write_manifest(path, contents).await,
-            #[cfg(test)]
+            Self::D26(writer) => writer.write_manifest(path, contents).await,
             Self::LegacyTest(writer) => writer.write_manifest(path, contents).await,
         }
     }
 
     async fn delete_manifest(&mut self, path: &str) -> anyhow::Result<()> {
         match self {
-            Self::Core(writer) => writer.delete_manifest(path).await,
-            #[cfg(test)]
+            Self::D26(writer) => writer.delete_manifest(path).await,
             Self::LegacyTest(writer) => writer.delete_manifest(path).await,
         }
     }
 
     async fn create_branch(&mut self, branch: &str) -> anyhow::Result<()> {
         match self {
-            Self::Core(writer) => writer.create_branch(branch).await,
-            #[cfg(test)]
+            Self::D26(writer) => writer.create_branch(branch).await,
             Self::LegacyTest(writer) => writer.create_branch(branch).await,
         }
     }
 
     async fn delete_branch(&mut self, branch: &str) -> anyhow::Result<()> {
         match self {
-            Self::Core(writer) => writer.delete_branch(branch).await,
-            #[cfg(test)]
+            Self::D26(writer) => writer.delete_branch(branch).await,
             Self::LegacyTest(writer) => writer.delete_branch(branch).await,
         }
     }
+}
+
+fn d26_store_root(variable: &str, leaf: &str) -> PathBuf {
+    std::env::var_os(variable)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/henosis-d26").join(leaf))
+}
+
+fn environment_id_from_manifest_path(path: &str) -> anyhow::Result<&str> {
+    path.strip_suffix(".toml")
+        .with_context(|| format!("Invalid preview environment path `{path}`"))
+}
+
+async fn checkout_pull_request(request: &PreviewPullRequest) -> anyhow::Result<tempfile::TempDir> {
+    let checkout = tempfile::tempdir().context("Cannot create D26 pull request checkout")?;
+    let url = format!("https://github.com/{}.git", request.key.repo);
+    run_git_authenticated(None, ["init", "--quiet", checkout.path().to_str().context("Checkout path is not UTF-8")?]).await?;
+    run_git_authenticated(
+        Some(checkout.path()),
+        ["remote", "add", "origin", &url],
+    )
+    .await?;
+    run_git_authenticated(
+        Some(checkout.path()),
+        ["fetch", "--quiet", "--depth=1", "origin", &request.head_sha],
+    )
+    .await?;
+    run_git_authenticated(
+        Some(checkout.path()),
+        ["checkout", "--quiet", "--detach", "FETCH_HEAD"],
+    )
+    .await?;
+    Ok(checkout)
+}
+
+async fn run_git_authenticated<'a>(
+    current_dir: Option<&Path>,
+    args: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<()> {
+    let token_path = std::env::var("HENOSIS_GITHUB_TOKEN_FILE")
+        .context("HENOSIS_GITHUB_TOKEN_FILE is required for D26 GitHub checkouts")?;
+    let token = tokio::fs::read_to_string(&token_path)
+        .await
+        .with_context(|| format!("Cannot read GitHub token from {token_path}"))?;
+    let credentials = base64::engine::general_purpose::STANDARD
+        .encode(format!("x-access-token:{}", token.trim()));
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args(args)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+        .env(
+            "GIT_CONFIG_VALUE_0",
+            format!("Authorization: Basic {credentials}"),
+        )
+        .stdin(Stdio::null());
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
+    let output = command.output().await.context("Cannot run git")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git checkout command failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
+async fn install_checkout_dependencies(checkout: &Path) -> anyhow::Result<()> {
+    let output = tokio::process::Command::new("corepack")
+        .args([
+            "pnpm",
+            "install",
+            "--frozen-lockfile",
+            "--ignore-scripts",
+        ])
+        .env("CI", "1")
+        .current_dir(checkout)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("Cannot install D26 checkout dependencies with pnpm")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "pnpm install failed for D26 checkout: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
 }
 
 fn environment_manager(config: &HenosisConfig) -> EnvironmentManager {
@@ -97,20 +253,22 @@ fn environment_manager(config: &HenosisConfig) -> EnvironmentManager {
 
 fn preview_writer<'a>(
     config: &HenosisConfig,
-    _deploy_repo: &'a crate::bors::RepositoryState,
-    packages: &'a GithubComponentPackageReader<'a>,
+    deploy_repo: &'a crate::bors::RepositoryState,
+    request: PreviewPullRequest,
 ) -> anyhow::Result<PreviewWriter<'a>> {
     if let Some(core_api) = config.core_api.as_ref() {
-        return Ok(PreviewWriter::Core(CoreGraphWriter::new(
-            core_api,
-            config.registered_components(),
-            packages,
-        )?));
+        return Ok(PreviewWriter::D26(D26PreviewWriter {
+            core: ConnectCoreBoundary::new(&core_api.endpoint),
+            request,
+            checkout_subdir: core_api.preview_checkout_subdir.as_deref().map(PathBuf::from),
+            bundle_root: d26_store_root("HENOSIS_BUNDLE_ROOT", "bundles"),
+            artifact_root: d26_store_root("HENOSIS_ARTIFACT_ROOT", "artifacts"),
+        }));
     }
     #[cfg(test)]
     {
         Ok(PreviewWriter::LegacyTest(GithubDeployRepoWriter::new(
-            &_deploy_repo.client,
+            &deploy_repo.client,
             &config.manifest_branch,
         )))
     }
@@ -163,7 +321,7 @@ pub async fn create_preview_environment(
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
     let packages = GithubComponentPackageReader::new(&ctx.repositories);
-    let mut writer = preview_writer(config, &deploy_repo, &packages)?;
+    let mut writer = preview_writer(config, &deploy_repo, pr.clone())?;
     let dev = GithubDevManifestReader::new(
         &deploy_repo.client,
         &config.manifest_branch,
@@ -197,7 +355,7 @@ pub async fn reopen_preview_environment(
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
     let packages = GithubComponentPackageReader::new(&ctx.repositories);
-    let mut writer = preview_writer(config, &deploy_repo, &packages)?;
+    let mut writer = preview_writer(config, &deploy_repo, pr.clone())?;
     let dev = GithubDevManifestReader::new(
         &deploy_repo.client,
         &config.manifest_branch,
@@ -242,7 +400,7 @@ pub async fn refresh_preview_environment(
     }
     let deploy_repo = deploy_repo(ctx, config)?;
     let packages = GithubComponentPackageReader::new(&ctx.repositories);
-    let mut writer = preview_writer(config, &deploy_repo, &packages)?;
+    let mut writer = preview_writer(config, &deploy_repo, pr.clone())?;
     let dev = GithubDevManifestReader::new(
         &deploy_repo.client,
         &config.manifest_branch,
@@ -274,7 +432,7 @@ pub async fn join_environment(
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
     let packages = GithubComponentPackageReader::new(&ctx.repositories);
-    let mut writer = preview_writer(config, &deploy_repo, &packages)?;
+    let mut writer = preview_writer(config, &deploy_repo, pr.clone())?;
     let dev = GithubDevManifestReader::new(
         &deploy_repo.client,
         &config.manifest_branch,
@@ -313,7 +471,7 @@ pub async fn leave_environment(
     let mut store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let deploy_repo = deploy_repo(ctx, config)?;
     let packages = GithubComponentPackageReader::new(&ctx.repositories);
-    let mut writer = preview_writer(config, &deploy_repo, &packages)?;
+    let mut writer = preview_writer(config, &deploy_repo, pr.clone())?;
     let dev = GithubDevManifestReader::new(
         &deploy_repo.client,
         &config.manifest_branch,
@@ -707,61 +865,32 @@ async fn reconcile_environment_status(
         return Ok(());
     };
     let members = environment_store.active_members(environment_id).await?;
-    let render = if let Some(core_api) = config.core_api.as_ref() {
-        let client = CoreClient::new(core_api)?;
-        match client.get_graph(environment_id).await? {
-            Some(state) => {
-                let status = client.graph_status(&state)?;
-                let failure_presentations = status.failure_presentations.clone();
-                let outcome = RenderOutcome {
-                    environment_id: environment_id.to_string(),
-                    commit_sha: format!("generation:{}", status.generation),
-                    status: status.status,
-                    run_url: client.generation_url(environment_id, status.generation),
-                    excerpt: status.diagnostic,
-                    generation: Some(status.generation),
-                    publication: status.publication,
-                };
-                let outcome = outcome_for_desired_state(&environment, outcome, &client);
-                record_core_render_outcome(
-                    ctx,
-                    &environment_store,
-                    &outcome,
-                    &failure_presentations,
-                )
-                .await?;
-                Some(outcome)
-            }
-            None => None,
+    let core_status = if let Some(core_api) = config.core_api.as_ref() {
+        let core = ConnectCoreBoundary::new(&core_api.endpoint);
+        match core.status(environment_id).await {
+            Ok(status) => Some(status),
+            Err(crate::henosis::core_client::CoreBoundaryError::GraphNotFound(_)) => None,
+            Err(error) => return Err(error.into()),
         }
     } else {
-        environment_store
-            .latest_render_outcome(environment_id)
-            .await?
+        None
+    };
+    let render = if let (Some(core_api), Some(status)) = (config.core_api.as_ref(), core_status.as_ref()) {
+        let outcome = outcome_from_core_status(core_api, status);
+        let outcome = outcome_for_desired_state(&environment, outcome, core_api);
+        record_core_render_outcome(ctx, &environment_store, &outcome, &[]).await?;
+        Some(outcome)
+    } else {
+        environment_store.latest_render_outcome(environment_id).await?
     };
     let last_publication = environment_store
         .latest_published_outcome(environment_id)
         .await?;
-    let materialized_components = members
-        .iter()
-        .map(|member| member.component.clone())
-        .collect::<BTreeSet<_>>();
-    let (ui_links, borrowed_components) = match (
-        config.core_api.as_ref(),
-        render.as_ref().and_then(|render| render.generation),
-    ) {
-        (Some(core_api), Some(generation)) => CoreClient::new(core_api)?
-            .get_graph_generation(environment_id, generation)
-            .await?
-            .map(|record| {
-                (
-                    ui_links_from_generation(&record, &materialized_components),
-                    borrowed_components_from_generation(&record),
-                )
-            })
-            .unwrap_or_default(),
-        _ => (Vec::new(), Vec::new()),
-    };
+    let ui_links = core_status
+        .as_ref()
+        .map(ui_links_from_status)
+        .unwrap_or_default();
+    let borrowed_components = Vec::new();
     let queue_store = PgQueueStore::new(ctx.db.pool().clone());
 
     for member in &members {
@@ -791,9 +920,7 @@ async fn reconcile_environment_status(
             graph_url: config
                 .core_api
                 .as_ref()
-                .map(CoreClient::new)
-                .transpose()?
-                .map(|client| client.graph_url(&environment.id)),
+                .map(|core_api| graph_url(core_api, &environment.id)),
             advisory_gate,
             gate,
             render: render.clone(),
@@ -820,46 +947,105 @@ pub async fn reconcile_core_graphs(ctx: &BorsContext) -> anyhow::Result<usize> {
     let Some(core_api) = config.core_api.as_ref() else {
         return Ok(0);
     };
-    let client = CoreClient::new(core_api)?;
+    let core = ConnectCoreBoundary::new(&core_api.endpoint);
     let store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let environments = store.active_preview_environments().await?;
     for environment in &environments {
-        let state = match client.watch_graph(&environment.id).await {
-            Ok(state) => state,
-            Err(_) => match client.get_graph(&environment.id).await? {
-                Some(state) => state,
-                None if environment
+        let status = match core.status(&environment.id).await {
+            Ok(status) => status,
+            Err(crate::henosis::core_client::CoreBoundaryError::GraphNotFound(_))
+                if environment
                     .desired_render_key
                     .as_deref()
                     .is_some_and(|key| key == "creating" || key.starts_with("pending:")) =>
-                {
-                    continue;
-                }
-                None => anyhow::bail!("Core graph `{}` disappeared", environment.id),
-            },
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
         };
-        let status = client.graph_status(&state)?;
-        let failure_presentations = status.failure_presentations.clone();
-        let outcome = RenderOutcome {
-            environment_id: environment.id.clone(),
-            commit_sha: format!("generation:{}", status.generation),
-            status: status.status,
-            run_url: client.generation_url(&environment.id, status.generation),
-            excerpt: status.diagnostic,
-            generation: Some(status.generation),
-            publication: status.publication,
-        };
-        let outcome = outcome_for_desired_state(environment, outcome, &client);
-        record_core_render_outcome(ctx, &store, &outcome, &failure_presentations).await?;
+        let outcome = outcome_from_core_status(core_api, &status);
+        let outcome = outcome_for_desired_state(environment, outcome, core_api);
+        record_core_render_outcome(ctx, &store, &outcome, &[]).await?;
         reconcile_environment_status(ctx, &environment.id).await?;
     }
     Ok(environments.len())
 }
 
+fn outcome_from_core_status(
+    core_api: &crate::henosis::config::CoreApiConfig,
+    status: &GraphStatus,
+) -> RenderOutcome {
+    let render_status = match status.phase {
+        GraphPhase::Ready | GraphPhase::Retired => RenderStatus::Success,
+        GraphPhase::Failed => RenderStatus::Failure,
+        GraphPhase::Planning | GraphPhase::Blocked | GraphPhase::Reconciling => RenderStatus::Pending,
+    };
+    let excerpt = status.diagnostic.clone().or_else(|| {
+        (!status.blocked_on.is_empty()).then(|| {
+            format!(
+                "blocked on {}",
+                status
+                    .blocked_on
+                    .iter()
+                    .map(|blocked| format!("{}.{}", blocked.component, blocked.input))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+    });
+    RenderOutcome {
+        environment_id: status.graph.clone(),
+        commit_sha: format!("generation:{}", status.generation),
+        status: render_status,
+        run_url: generation_url(core_api, &status.graph, status.generation),
+        excerpt,
+        generation: Some(status.generation),
+        publication: None,
+    }
+}
+
+fn ui_links_from_status(status: &GraphStatus) -> Vec<UiLink> {
+    let mut links = status
+        .outputs
+        .iter()
+        .filter_map(|output| {
+            let url = output.value.as_str()?;
+            url::Url::parse(url)
+                .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+                .then(|| UiLink {
+                    label: output.reference.clone(),
+                    url: url.to_string(),
+                })
+        })
+        .collect::<Vec<_>>();
+    links.sort_by(|left, right| left.label.cmp(&right.label));
+    links
+}
+
+fn presentation_endpoint(core_api: &crate::henosis::config::CoreApiConfig) -> &str {
+    core_api
+        .presentation_endpoint
+        .as_deref()
+        .unwrap_or(&core_api.endpoint)
+        .trim_end_matches('/')
+}
+
+fn graph_url(core_api: &crate::henosis::config::CoreApiConfig, graph: &str) -> String {
+    format!("{}/graphs/{graph}", presentation_endpoint(core_api))
+}
+
+fn generation_url(
+    core_api: &crate::henosis::config::CoreApiConfig,
+    graph: &str,
+    generation: u64,
+) -> String {
+    format!("{}/graphs/{graph}/generations/{generation}", presentation_endpoint(core_api))
+}
+
 fn outcome_for_desired_state(
     environment: &crate::henosis::environment::EnvironmentState,
     observed: RenderOutcome,
-    client: &CoreClient,
+    core_api: &crate::henosis::config::CoreApiConfig,
 ) -> RenderOutcome {
     let Some(desired) = environment.desired_render_key.as_deref() else {
         return observed;
@@ -875,8 +1061,8 @@ fn outcome_for_desired_state(
         commit_sha: desired.to_string(),
         status: RenderStatus::Pending,
         run_url: generation
-            .map(|generation| client.generation_url(&environment.id, generation))
-            .unwrap_or_else(|| client.graph_url(&environment.id)),
+            .map(|generation| generation_url(core_api, &environment.id, generation))
+            .unwrap_or_else(|| graph_url(core_api, &environment.id)),
         excerpt: None,
         generation,
         publication: None,
@@ -1043,16 +1229,15 @@ mod desired_state_tests {
     use crate::henosis::config::CoreApiConfig;
     use crate::henosis::environment::EnvironmentState;
 
-    fn client() -> CoreClient {
-        let config: CoreApiConfig = toml::from_str(
+    fn core_api() -> CoreApiConfig {
+        toml::from_str(
             r#"
 endpoint = "http://core:8080"
 presentation_endpoint = "https://henosis.example"
 token = "test-token"
 "#,
         )
-        .unwrap();
-        CoreClient::new(&config).unwrap()
+        .unwrap()
     }
 
     #[test]
@@ -1076,7 +1261,7 @@ token = "test-token"
                     generation: Some(4),
                     publication: None,
                 },
-                &client(),
+                &core_api(),
             );
             assert_eq!(outcome.status, RenderStatus::Pending, "{change}");
             assert_eq!(outcome.generation, Some(5), "{change}");

@@ -34,7 +34,7 @@ ENV GIT_VERSION=${GIT_VERSION}
 
 RUN cargo build --release --locked
 
-FROM debian:trixie-slim AS runtime
+FROM node:22-bookworm-slim AS runtime
 
 WORKDIR /
 
@@ -43,6 +43,7 @@ RUN apt-get update \
         ca-certificates \
         curl \
         git \
+        jq \
         openssl \
     && rm -rf /var/lib/apt/lists/*
 

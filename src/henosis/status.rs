@@ -212,10 +212,16 @@ fn gate_word(gate: &GateStatus) -> &'static str {
 
 fn render_row(render: Option<&RenderOutcome>, explain_observation_lag: bool) -> String {
     match render {
-        Some(render) if render.status == RenderStatus::Pending && explain_observation_lag => {
+        Some(render) if render.status == RenderStatus::Pending => {
+            let detail = render.excerpt.as_deref().unwrap_or(if explain_observation_lag {
+                "waiting for the current generation to converge"
+            } else {
+                "reconciling"
+            });
             format!(
-                "{} ([current generation]({})); the latest terminal result can take about a minute to appear here",
+                "{} — {} ([current generation]({}))",
                 icon_word("running"),
+                detail,
                 render.run_url,
             )
         }

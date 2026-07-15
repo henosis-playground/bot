@@ -145,13 +145,19 @@ impl ComponentPackageReader for GithubComponentPackageReader<'_> {
             .repositories
             .get(&repo_name)
             .with_context(|| format!("Repository `{repo_name}` is not loaded"))?;
-        let file = repo
+        let (path, file) = match repo
             .client
             .read_file_at_ref("henosis/package.json", sha)
-            .await?;
-        serde_json::from_str(&file.content).with_context(|| {
-            format!("Cannot parse henosis/package.json for `{repo_name}` at `{sha}`")
-        })
+            .await
+        {
+            Ok(file) => ("henosis/package.json", file),
+            Err(_) => (
+                "package.json",
+                repo.client.read_file_at_ref("package.json", sha).await?,
+            ),
+        };
+        serde_json::from_str(&file.content)
+            .with_context(|| format!("Cannot parse {path} for `{repo_name}` at `{sha}`"))
     }
 }
 

@@ -46,6 +46,8 @@ pub struct CoreApiConfig {
     pub presentation_endpoint: Option<String>,
     #[serde(default, alias = "output_schema_command")]
     pub component_spec_command: Option<String>,
+    #[serde(default)]
+    pub preview_checkout_subdir: Option<String>,
     pub token: CoreApiToken,
 }
 
