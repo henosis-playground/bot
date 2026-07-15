@@ -95,11 +95,19 @@ pub struct ResourceDisposition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphOutput {
+    pub reference: String,
+    pub value: serde_json::Value,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphStatus {
     pub graph: String,
     pub generation: u64,
     pub phase: GraphPhase,
     pub blocked_on: Vec<BlockedOn>,
+    pub outputs: Vec<GraphOutput>,
     pub observed_ready: usize,
     pub planned_resources: usize,
     pub diagnostic: Option<String>,
@@ -115,6 +123,7 @@ impl GraphStatus {
             generation,
             phase: GraphPhase::Planning,
             blocked_on: Vec::new(),
+            outputs: Vec::new(),
             observed_ready: 0,
             planned_resources: 0,
             diagnostic: None,
@@ -434,6 +443,25 @@ fn status_from_response(
     let failed = dispositions.iter().any(|item| item.state == "failed");
     let all_ready = dispositions.len() >= planned_resources
         && dispositions.iter().all(|item| item.state == "ready");
+    let outputs = status
+        .outputs
+        .into_iter()
+        .map(|output| {
+            let reference = output.reference.unwrap_or_default();
+            let value =
+                serde_json::from_slice(output.canonical_value_json.as_deref().unwrap_or_default())
+                    .map_err(|error| {
+                        CoreBoundaryError::Rejected(format!(
+                            "GraphService output {reference:?} contains invalid JSON: {error}"
+                        ))
+                    })?;
+            Ok(GraphOutput {
+                reference,
+                value,
+                source: output.source.unwrap_or_default(),
+            })
+        })
+        .collect::<Result<Vec<_>, CoreBoundaryError>>()?;
     let diagnostic = status.diagnostic.or_else(|| {
         (!status.stall_cycle.is_empty())
             .then(|| format!("stall: {}", status.stall_cycle.join(" -> ")))
@@ -482,7 +510,8 @@ fn status_from_response(
         generation,
         phase,
         blocked_on,
-        observed_ready: status.outputs.len(),
+        observed_ready: outputs.len(),
+        outputs,
         planned_resources,
         diagnostic,
         bundles,

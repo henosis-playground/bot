@@ -934,16 +934,54 @@ fn render_status_event(status: &GraphStatus, demo_targets: bool) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            if detail.is_empty() {
-                format!("reconciling {} resource(s)\n", status.planned_resources)
+            let progress = if status.observed_ready == 0 {
+                String::new()
             } else {
-                format!("reconciling: {detail}\n")
+                format!(
+                    "observed {} output(s); re-evaluated; ",
+                    status.observed_ready
+                )
+            };
+            if detail.is_empty() {
+                format!(
+                    "{progress}reconciling {} resource(s)\n",
+                    status.planned_resources
+                )
+            } else {
+                format!("{progress}reconciling: {detail}\n")
             }
         }
         GraphPhase::Ready => format!("ready: generation {}\n", status.generation),
-        GraphPhase::Failed => format!("failed: generation {}\n", status.generation),
+        GraphPhase::Failed => {
+            let failures = status
+                .dispositions
+                .iter()
+                .filter(|item| item.state == "failed")
+                .map(|item| {
+                    item.message
+                        .as_ref()
+                        .map(|message| format!("{}: {message}", item.resource))
+                        .unwrap_or_else(|| item.resource.clone())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if failures.is_empty() {
+                format!("failed: generation {}\n", status.generation)
+            } else {
+                format!("failed: {failures}\n")
+            }
+        }
         GraphPhase::Retired => format!("retired: generation {}\n", status.generation),
     };
+    if status.phase == GraphPhase::Ready {
+        for output in &status.outputs {
+            let value = output
+                .value
+                .as_str()
+                .map_or_else(|| output.value.to_string(), str::to_owned);
+            rendered.push_str(&format!("  output {} = {value}\n", output.reference));
+        }
+    }
     if let Some(diagnostic) = &status.diagnostic {
         if color_enabled() {
             eprintln!("\u{1b}[1;31mdiagnostic\u{1b}[0m: {diagnostic}");
@@ -1072,6 +1110,7 @@ mod tests {
             generation: 7,
             phase: GraphPhase::Ready,
             blocked_on: Vec::new(),
+            outputs: Vec::new(),
             observed_ready: 0,
             planned_resources: 0,
             diagnostic: None,
@@ -1117,6 +1156,7 @@ mod tests {
             generation: 1,
             phase: GraphPhase::Ready,
             blocked_on: Vec::new(),
+            outputs: Vec::new(),
             observed_ready: 0,
             planned_resources: 0,
             diagnostic: None,
