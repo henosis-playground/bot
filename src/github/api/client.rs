@@ -253,12 +253,15 @@ impl GithubRepositoryClient {
             }
             Err(error) => return Err(error.into()),
         };
-        Ok(response
-            .take_items()
-            .into_iter()
-            .filter_map(|item| item.decoded_content().map(|content| (item.path, content)))
-            .map(|(path, content)| RepositoryDirectoryFile { path, content })
-            .collect())
+        let mut files = Vec::new();
+        for item in response.take_items() {
+            let file = self.read_file_at_ref(&item.path, r#ref).await?;
+            files.push(RepositoryDirectoryFile {
+                path: item.path,
+                content: file.content,
+            });
+        }
+        Ok(files)
     }
 
     pub async fn paths_ever_changed_under(
