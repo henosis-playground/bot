@@ -50,15 +50,27 @@ where
         ));
         let bundles = self.bundler.bundle(&BundleRequest {
             repository: request.checkout.clone(),
-            output,
+            output: output.join("bundles"),
         })?;
+        let artifacts = self
+            .bundler
+            .build_artifacts(&request.checkout, &output.join("artifacts"))?;
         let pins = bundles
             .bundles
             .into_iter()
             .map(|bundle| BundlePin {
-                component: bundle.component,
+                component: bundle.component.clone(),
                 bundle_id: bundle.bundle_id,
-                input_bindings: std::collections::BTreeMap::new(),
+                input_bindings: artifacts
+                    .iter()
+                    .filter(|artifact| artifact.component == bundle.component)
+                    .map(|artifact| {
+                        (
+                            artifact.input.clone(),
+                            serde_json::Value::String(artifact.digest.clone()),
+                        )
+                    })
+                    .collect(),
                 source: None,
             })
             .collect();
@@ -153,6 +165,14 @@ mod tests {
                     dependencies: Vec::new(),
                 }],
             })
+        }
+
+        fn build_artifacts(
+            &self,
+            _repository: &Path,
+            _output: &Path,
+        ) -> Result<Vec<henosis_bundle::BuiltArtifact>, BundleError> {
+            Ok(Vec::new())
         }
     }
 

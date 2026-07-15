@@ -344,6 +344,14 @@ pub fn build_workload_artifacts(
 
 pub trait Bundler {
     fn bundle(&self, request: &BundleRequest) -> Result<BundleSetManifest, BundleError>;
+
+    fn build_artifacts(
+        &self,
+        repository: &Path,
+        output: &Path,
+    ) -> Result<Vec<BuiltArtifact>, BundleError> {
+        build_workload_artifacts(repository, output)
+    }
 }
 
 #[derive(Debug, Default)]
