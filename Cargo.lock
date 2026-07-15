@@ -1561,7 +1561,7 @@ version = "0.1.0"
 dependencies = [
  "buffa",
  "connectrpc",
- "henosis-proto 0.0.0",
+ "henosis-proto 0.0.0 (git+https://github.com/henosis-playground/core.git?branch=d26-core)",
  "hex",
  "serde",
  "serde_json",
@@ -1572,11 +1572,12 @@ dependencies = [
 [[package]]
 name = "henosis-proto"
 version = "0.0.0"
+source = "git+https://github.com/henosis-playground/core.git?branch=d26-core#16e728030d0a9fc03a6efa4ddd6e99bf02e4bf24"
 dependencies = [
  "buffa",
  "connectrpc",
  "serde",
- "workspace-hack 0.0.0",
+ "workspace-hack 0.0.0 (git+https://github.com/henosis-playground/core.git?branch=d26-core)",
 ]
 
 [[package]]
@@ -4737,6 +4738,7 @@ dependencies = [
 [[package]]
 name = "workspace-hack"
 version = "0.0.0"
+source = "git+https://github.com/henosis-playground/core.git?branch=d26-core#16e728030d0a9fc03a6efa4ddd6e99bf02e4bf24"
 dependencies = [
  "allocator-api2",
  "bitflags",
