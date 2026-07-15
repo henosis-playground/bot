@@ -81,6 +81,11 @@ pub enum BundleError {
     },
     #[error("cannot encode bundle manifest: {0}")]
     EncodeManifest(serde_json::Error),
+    #[error("cannot decode esbuild dependency metadata for component `{component}`: {source}")]
+    DecodeMetafile {
+        component: String,
+        source: serde_json::Error,
+    },
     #[error("cannot encode bundle identity: {0}")]
     EncodeIdentity(minicbor::encode::Error<std::convert::Infallible>),
 }
@@ -125,6 +130,9 @@ pub struct BundleArtifact {
     pub module: PathBuf,
     pub manifest: PathBuf,
     pub executable_sha256: String,
+    /// Canonical source and package files observed while producing this component bundle.
+    #[serde(default)]
+    pub dependencies: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +258,7 @@ fn bundle_component(
     );
     let build_dir = tempfile::tempdir().map_err(BundleError::PrepareEsbuild)?;
     let module_path = build_dir.path().join("module.js");
+    let metafile_path = build_dir.path().join("metafile.json");
     let mut child = Command::new(esbuild)
         .current_dir(repository)
         .env_clear()
@@ -264,6 +273,7 @@ fn bundle_component(
         .arg("--packages=bundle")
         .arg("--external:henosis:*")
         .arg("--sourcefile=henosis-component.ts")
+        .arg(format!("--metafile={}", metafile_path.display()))
         .arg(format!("--outfile={}", module_path.display()))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -292,6 +302,7 @@ fn bundle_component(
         path: module_path,
         source,
     })?;
+    let dependencies = read_dependencies(&component.name, repository, &metafile_path)?;
     reject_external_imports(&component.name, &bytes)?;
     let executable_sha256 = sha256(&bytes);
     let config_hash = sha256(ESBUILD_CONFIG.as_bytes());
@@ -330,7 +341,41 @@ fn bundle_component(
         module: final_module,
         manifest: final_manifest,
         executable_sha256,
+        dependencies,
     })
+}
+
+#[derive(Deserialize)]
+struct EsbuildMetafile {
+    inputs: BTreeMap<String, serde_json::Value>,
+}
+
+fn read_dependencies(
+    component: &str,
+    repository: &Path,
+    metafile_path: &Path,
+) -> Result<Vec<PathBuf>, BundleError> {
+    let bytes = fs::read(metafile_path).map_err(|source| BundleError::ReadSource {
+        path: metafile_path.to_path_buf(),
+        source,
+    })?;
+    let metafile: EsbuildMetafile =
+        serde_json::from_slice(&bytes).map_err(|source| BundleError::DecodeMetafile {
+            component: component.to_string(),
+            source,
+        })?;
+    let mut dependencies = metafile
+        .inputs
+        .into_keys()
+        .filter(|path| path != "henosis-component.ts")
+        .filter_map(|path| {
+            let path = repository.join(path);
+            path.is_file().then(|| path.canonicalize().unwrap_or(path))
+        })
+        .collect::<Vec<_>>();
+    dependencies.sort();
+    dependencies.dedup();
+    Ok(dependencies)
 }
 
 fn reject_external_imports(component: &str, bytes: &[u8]) -> Result<(), BundleError> {
