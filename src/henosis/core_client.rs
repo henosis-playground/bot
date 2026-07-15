@@ -17,8 +17,8 @@ use henosis_proto::proto::henosis::v1::{
 };
 use newtype_uuid::{GenericUuid, TypedUuid, TypedUuidKind, TypedUuidTag};
 use reqwest::{Client, StatusCode};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::henosis::config::CoreApiConfig;
 use crate::henosis::environment::{EnvironmentIdGenerator, PublicationLink, RenderStatus};

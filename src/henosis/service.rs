@@ -16,9 +16,8 @@ use crate::henosis::environment::{
 };
 use crate::henosis::gate::{CliGateExecutor, GateExecutor};
 use crate::henosis::github::{
-    GithubDeployRepoWriter,
-    GitHubMergeExecutor, GithubComponentPackageReader, GithubDevManifestReader,
-    GithubGateCheckReporter, GithubImageDigestResolver, GithubPrCommenter,
+    GitHubMergeExecutor, GithubComponentPackageReader, GithubDeployRepoWriter,
+    GithubDevManifestReader, GithubGateCheckReporter, GithubImageDigestResolver, GithubPrCommenter,
     GithubRepoValidationChecker, deploy_manifest_url,
 };
 use crate::henosis::queue::{
@@ -63,10 +62,10 @@ impl DeployRepoWriter for D26PreviewWriter {
         let environment = environment_id_from_manifest_path(path)?;
         let checkout = checkout_pull_request(&self.request).await?;
         install_checkout_dependencies(checkout.path()).await?;
-        let component_root = self
-            .checkout_subdir
-            .as_ref()
-            .map_or_else(|| checkout.path().to_path_buf(), |subdir| checkout.path().join(subdir));
+        let component_root = self.checkout_subdir.as_ref().map_or_else(
+            || checkout.path().to_path_buf(),
+            |subdir| checkout.path().join(subdir),
+        );
         anyhow::ensure!(
             component_root.is_dir(),
             "D26 preview component root {} does not exist",
@@ -169,12 +168,19 @@ fn environment_id_from_manifest_path(path: &str) -> anyhow::Result<&str> {
 async fn checkout_pull_request(request: &PreviewPullRequest) -> anyhow::Result<tempfile::TempDir> {
     let checkout = tempfile::tempdir().context("Cannot create D26 pull request checkout")?;
     let url = format!("https://github.com/{}.git", request.key.repo);
-    run_git_authenticated(None, ["init", "--quiet", checkout.path().to_str().context("Checkout path is not UTF-8")?]).await?;
     run_git_authenticated(
-        Some(checkout.path()),
-        ["remote", "add", "origin", &url],
+        None,
+        [
+            "init",
+            "--quiet",
+            checkout
+                .path()
+                .to_str()
+                .context("Checkout path is not UTF-8")?,
+        ],
     )
     .await?;
+    run_git_authenticated(Some(checkout.path()), ["remote", "add", "origin", &url]).await?;
     run_git_authenticated(
         Some(checkout.path()),
         ["fetch", "--quiet", "--depth=1", "origin", &request.head_sha],
@@ -223,12 +229,7 @@ async fn run_git_authenticated<'a>(
 
 async fn install_checkout_dependencies(checkout: &Path) -> anyhow::Result<()> {
     let output = tokio::process::Command::new("corepack")
-        .args([
-            "pnpm",
-            "install",
-            "--frozen-lockfile",
-            "--ignore-scripts",
-        ])
+        .args(["pnpm", "install", "--frozen-lockfile", "--ignore-scripts"])
         .env("CI", "1")
         .current_dir(checkout)
         .stdin(Stdio::null())
@@ -261,7 +262,10 @@ fn preview_writer<'a>(
         return Ok(PreviewWriter::D26(D26PreviewWriter {
             core: ConnectCoreBoundary::new(&core_api.endpoint),
             request,
-            checkout_subdir: core_api.preview_checkout_subdir.as_deref().map(PathBuf::from),
+            checkout_subdir: core_api
+                .preview_checkout_subdir
+                .as_deref()
+                .map(PathBuf::from),
             bundle_root: d26_store_root("HENOSIS_BUNDLE_ROOT", "bundles"),
             artifact_root: d26_store_root("HENOSIS_ARTIFACT_ROOT", "artifacts"),
         }));
@@ -876,14 +880,17 @@ async fn reconcile_environment_status(
     } else {
         None
     };
-    let render = if let (Some(core_api), Some(status)) = (config.core_api.as_ref(), core_status.as_ref()) {
-        let outcome = outcome_from_core_status(core_api, status);
-        let outcome = outcome_for_desired_state(&environment, outcome, core_api);
-        record_core_render_outcome(ctx, &environment_store, &outcome, &[]).await?;
-        Some(outcome)
-    } else {
-        environment_store.latest_render_outcome(environment_id).await?
-    };
+    let render =
+        if let (Some(core_api), Some(status)) = (config.core_api.as_ref(), core_status.as_ref()) {
+            let outcome = outcome_from_core_status(core_api, status);
+            let outcome = outcome_for_desired_state(&environment, outcome, core_api);
+            record_core_render_outcome(ctx, &environment_store, &outcome, &[]).await?;
+            Some(outcome)
+        } else {
+            environment_store
+                .latest_render_outcome(environment_id)
+                .await?
+        };
     let last_publication = environment_store
         .latest_published_outcome(environment_id)
         .await?;
@@ -979,7 +986,9 @@ fn outcome_from_core_status(
     let render_status = match status.phase {
         GraphPhase::Ready | GraphPhase::Retired => RenderStatus::Success,
         GraphPhase::Failed => RenderStatus::Failure,
-        GraphPhase::Planning | GraphPhase::Blocked | GraphPhase::Reconciling => RenderStatus::Pending,
+        GraphPhase::Planning | GraphPhase::Blocked | GraphPhase::Reconciling => {
+            RenderStatus::Pending
+        }
     };
     let excerpt = status.diagnostic.clone().or_else(|| {
         (!status.blocked_on.is_empty()).then(|| {
@@ -1040,7 +1049,10 @@ fn generation_url(
     graph: &str,
     generation: u64,
 ) -> String {
-    format!("{}/graphs/{graph}/generations/{generation}", presentation_endpoint(core_api))
+    format!(
+        "{}/graphs/{graph}/generations/{generation}",
+        presentation_endpoint(core_api)
+    )
 }
 
 fn outcome_for_desired_state(
