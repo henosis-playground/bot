@@ -115,6 +115,7 @@ impl DeployRepoWriter for D26PreviewWriter {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 enum PreviewWriter<'a> {
     D26(D26PreviewWriter),
     LegacyTest(GithubDeployRepoWriter<'a>),
@@ -253,7 +254,7 @@ fn environment_manager(config: &HenosisConfig) -> EnvironmentManager {
 
 fn preview_writer<'a>(
     config: &HenosisConfig,
-    deploy_repo: &'a crate::bors::RepositoryState,
+    _deploy_repo: &'a crate::bors::RepositoryState,
     request: PreviewPullRequest,
 ) -> anyhow::Result<PreviewWriter<'a>> {
     if let Some(core_api) = config.core_api.as_ref() {
@@ -268,7 +269,7 @@ fn preview_writer<'a>(
     #[cfg(test)]
     {
         Ok(PreviewWriter::LegacyTest(GithubDeployRepoWriter::new(
-            &deploy_repo.client,
+            &_deploy_repo.client,
             &config.manifest_branch,
         )))
     }

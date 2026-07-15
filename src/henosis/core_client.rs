@@ -6,35 +6,26 @@ pub use henosis_core_boundary::{
     GraphPhase, GraphStatus, SourceProvenance,
 };
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use base64::Engine;
 use futures::StreamExt;
 use henosis_proto::proto::henosis::v1::__buffa::oneof::watch_graph_response::Item as WatchItem;
 use henosis_proto::proto::henosis::v1::{
-    AddComponentsRequest, AddComponentsResponse, ComponentReplacement, ComponentSpec,
-    ContractFailureKind, CreateGraphRequest, CreateGraphResponse, Diagnostic,
-    GetGraphGenerationRequest, GetGraphGenerationResponse, GetGraphRequest, GetGraphResponse,
-    Graph, GraphLifecycle, GraphState, RegisterComponentSpecRequest, RegisterComponentSpecResponse,
-    RemoveComponentsRequest, RemoveComponentsResponse, RetireGraphRequest, RetireGraphResponse,
-    SliceReport, UpdateComponentsRequest, UpdateComponentsResponse, WatchGraphRequest,
-    WatchGraphResponse,
+    ContractFailureKind, Diagnostic, GetGraphGenerationRequest, GetGraphGenerationResponse,
+    GetGraphRequest, GetGraphResponse, Graph, GraphLifecycle, GraphState, RetireGraphRequest,
+    RetireGraphResponse, SliceReport, WatchGraphRequest, WatchGraphResponse,
 };
 use newtype_uuid::{GenericUuid, TypedUuid, TypedUuidKind, TypedUuidTag};
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-use crate::henosis::config::{CoreApiConfig, RegisteredComponent};
-use crate::henosis::environment::{
-    DeployRepoWriter, DeployWriteResult, EnvironmentIdGenerator, PublicationLink, RenderStatus,
-};
+use crate::henosis::config::CoreApiConfig;
+use crate::henosis::environment::{EnvironmentIdGenerator, PublicationLink, RenderStatus};
 use crate::henosis::gate_report::{GateFailure, GateReport};
 use crate::henosis::generation::{GenerationState, derive_generation};
-use crate::henosis::graph::ComponentPackageReader;
-use crate::henosis::manifest::{self, ComponentEntry, Manifest, PinnedEntry};
 use crate::henosis::render_diagnostics::DiagnosticPresentation;
 
-const COMPONENT_SPEC_INSPECTION_API_VERSION: &str = "henosis.dev/component-spec-inspection/v1";
 const WATCH_INITIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum PreviewEnvironmentKind {}
@@ -274,42 +265,6 @@ fn json_u64(value: Option<&serde_json::Value>) -> Option<u64> {
     value.and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PlannedComponentSpec {
-    name: String,
-    connector: String,
-    dependencies: Vec<String>,
-    outputs_schema: Vec<u8>,
-    connector_context: Vec<u8>,
-    dependency_spec_hash_slots: Vec<DependencySpecHashSlot>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ComponentSpecInspection {
-    api_version: String,
-    components: BTreeMap<String, InspectedComponentSpec>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct InspectedComponentSpec {
-    connector: String,
-    #[serde(default)]
-    dependencies: Vec<String>,
-    outputs_schema: String,
-    connector_context: String,
-    #[serde(default)]
-    dependency_spec_hash_slots: Vec<DependencySpecHashSlot>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DependencySpecHashSlot {
-    component: String,
-    pointer: String,
-}
-
 #[derive(Clone)]
 pub struct CoreClient {
     endpoint: String,
@@ -361,32 +316,6 @@ impl CoreClient {
             "{}/graphs/{environment_id}/generations/{generation}",
             self.presentation_endpoint
         )
-    }
-
-    async fn apply_graph(
-        &self,
-        environment_id: &str,
-        specs: Vec<PlannedComponentSpec>,
-    ) -> anyhow::Result<u64> {
-        let graph_id = graph_id_bytes(environment_id)?;
-        let component_spec_hashes = self.register_component_specs(specs).await?;
-        let Some(state) = self.get_graph_by_id(&graph_id).await? else {
-            let request = CreateGraphRequest {
-                graph_id: Some(graph_id),
-                component_spec_hashes,
-                request_id: Some(new_request_id()),
-                ..Default::default()
-            };
-            let response: CreateGraphResponse = self
-                .unary("CreateGraph", &request)
-                .await
-                .context("Cannot create Henosis core graph")?;
-            return graph_generation(&response.graph)
-                .context("CreateGraph response omitted the accepted graph generation");
-        };
-
-        self.edit_graph(graph_id, state, component_spec_hashes)
-            .await
     }
 
     pub async fn retire_graph(&self, environment_id: &str) -> anyhow::Result<()> {
@@ -545,164 +474,6 @@ impl CoreClient {
         graph_status(state)
     }
 
-    async fn edit_graph(
-        &self,
-        graph_id: Vec<u8>,
-        state: GraphState,
-        desired: Vec<Vec<u8>>,
-    ) -> anyhow::Result<u64> {
-        let graph = current_graph(&state)?;
-        let mut generation = graph
-            .generation
-            .context("GetGraph response omitted graph generation")?;
-        let existing = graph
-            .component_spec_hashes
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let desired = desired.into_iter().collect::<BTreeSet<_>>();
-        let additions = desired.difference(&existing).cloned().collect::<Vec<_>>();
-        let removals = existing.difference(&desired).cloned().collect::<Vec<_>>();
-
-        if additions.len() == removals.len() && !additions.is_empty() {
-            let replacements = removals
-                .into_iter()
-                .zip(additions)
-                .map(
-                    |(current_spec_hash, replacement_spec_hash)| ComponentReplacement {
-                        current_spec_hash: Some(current_spec_hash),
-                        replacement_spec_hash: Some(replacement_spec_hash),
-                        ..Default::default()
-                    },
-                )
-                .collect();
-            let request = UpdateComponentsRequest {
-                graph_id: Some(graph_id),
-                expected_generation: Some(generation),
-                replacements,
-                request_id: Some(new_request_id()),
-                ..Default::default()
-            };
-            let _: UpdateComponentsResponse = self
-                .unary("UpdateComponents", &request)
-                .await
-                .context("Cannot replace Henosis core graph component specs")?;
-            return Ok(generation + 1);
-        }
-
-        if !additions.is_empty() {
-            let request = AddComponentsRequest {
-                graph_id: Some(graph_id.clone()),
-                expected_generation: Some(generation),
-                component_spec_hashes: additions,
-                request_id: Some(new_request_id()),
-                ..Default::default()
-            };
-            let _: AddComponentsResponse = self
-                .unary("AddComponents", &request)
-                .await
-                .context("Cannot add Henosis core graph components")?;
-            generation += 1;
-        }
-        if !removals.is_empty() {
-            let request = RemoveComponentsRequest {
-                graph_id: Some(graph_id),
-                expected_generation: Some(generation),
-                component_spec_hashes: removals,
-                request_id: Some(new_request_id()),
-                ..Default::default()
-            };
-            let _: RemoveComponentsResponse = self
-                .unary("RemoveComponents", &request)
-                .await
-                .context("Cannot remove Henosis core graph components")?;
-            generation += 1;
-        }
-
-        Ok(generation)
-    }
-
-    async fn register_component_specs(
-        &self,
-        mut pending: Vec<PlannedComponentSpec>,
-    ) -> anyhow::Result<Vec<Vec<u8>>> {
-        let mut hashes = BTreeMap::new();
-        while !pending.is_empty() {
-            let index = pending
-                .iter()
-                .position(|spec| {
-                    spec.dependencies
-                        .iter()
-                        .all(|dependency| hashes.contains_key(dependency))
-                })
-                .context("Component specs could not be ordered by their dependencies")?;
-            let planned = pending.remove(index);
-            let mut depends_on = planned
-                .dependencies
-                .iter()
-                .map(|dependency| {
-                    hashes.get(dependency).cloned().with_context(|| {
-                        format!("Component spec dependency `{dependency}` was not registered")
-                    })
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            depends_on.sort_unstable();
-            let connector_context = materialize_connector_context(
-                &planned.name,
-                planned.connector_context,
-                &planned.dependency_spec_hash_slots,
-                &planned.dependencies,
-                &hashes,
-            )?;
-            let spec = ComponentSpec {
-                name: Some(planned.name.clone()),
-                connector: Some(planned.connector.clone()),
-                outputs_schema: Some(planned.outputs_schema),
-                depends_on,
-                connector_context: Some(connector_context),
-                ..Default::default()
-            };
-            let request = RegisterComponentSpecRequest {
-                spec: spec.clone().into(),
-                ..Default::default()
-            };
-            let response: RegisterComponentSpecResponse = self
-                .unary("RegisterComponentSpec", &request)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Cannot register Henosis core component spec `{}`",
-                        planned.name
-                    )
-                })?;
-            let registered = response
-                .component
-                .into_option()
-                .context("RegisterComponentSpec response omitted registered component")?;
-            let returned_spec = registered
-                .spec
-                .into_option()
-                .context("RegisterComponentSpec response omitted immutable spec body")?;
-            anyhow::ensure!(
-                returned_spec == spec,
-                "RegisterComponentSpec returned a different immutable spec body"
-            );
-            let hash = registered
-                .hash
-                .context("RegisterComponentSpec response omitted content hash")?;
-            anyhow::ensure!(
-                hash.len() == 32,
-                "RegisterComponentSpec returned a non-BLAKE3 content hash"
-            );
-            anyhow::ensure!(
-                hashes.insert(planned.name.clone(), hash).is_none(),
-                "Component spec name `{}` was planned more than once",
-                planned.name
-            );
-        }
-        Ok(hashes.into_values().collect())
-    }
-
     async fn get_graph_by_id(&self, graph_id: &[u8]) -> anyhow::Result<Option<GraphState>> {
         let request = GetGraphRequest {
             graph_id: Some(graph_id.to_vec()),
@@ -763,47 +534,6 @@ impl CoreClient {
     }
 }
 
-fn materialize_connector_context(
-    component: &str,
-    context: Vec<u8>,
-    slots: &[DependencySpecHashSlot],
-    dependencies: &[String],
-    hashes: &BTreeMap<String, Vec<u8>>,
-) -> anyhow::Result<Vec<u8>> {
-    if slots.is_empty() {
-        return Ok(context);
-    }
-    let mut context: serde_json::Value = serde_json::from_slice(&context).with_context(|| {
-        format!("Connector context for `{component}` has dependency slots but is not JSON")
-    })?;
-    for slot in slots {
-        anyhow::ensure!(
-            dependencies.contains(&slot.component),
-            "Connector context for `{component}` references undeclared dependency `{}`",
-            slot.component
-        );
-        let hash = hashes.get(&slot.component).with_context(|| {
-            format!(
-                "Connector context for `{component}` references unregistered dependency `{}`",
-                slot.component
-            )
-        })?;
-        let target = context.pointer_mut(&slot.pointer).with_context(|| {
-            format!(
-                "Connector context for `{component}` has no dependency hash slot at `{}`",
-                slot.pointer
-            )
-        })?;
-        *target = serde_json::Value::Array(
-            hash.iter()
-                .map(|byte| serde_json::Value::from(*byte))
-                .collect(),
-        );
-    }
-    serde_json::to_vec(&context)
-        .with_context(|| format!("Cannot encode materialized connector context for `{component}`"))
-}
-
 fn graph_id_bytes(environment_id: &str) -> anyhow::Result<Vec<u8>> {
     let id: TypedUuid<PreviewEnvironmentKind> = environment_id
         .parse()
@@ -829,10 +559,6 @@ fn current_graph(state: &GraphState) -> anyhow::Result<&Graph> {
     );
     anyhow::ensure!(state.durable.graph.is_set(), "Graph state omitted graph");
     Ok(&state.durable.graph)
-}
-
-fn graph_generation(graph: &impl std::ops::Deref<Target = Graph>) -> Option<u64> {
-    graph.generation
 }
 
 fn graph_status(state: &GraphState) -> anyhow::Result<CoreGraphStatus> {
@@ -1048,278 +774,7 @@ async fn core_http_error(response: reqwest::Response) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::henosis::config::ComponentMode;
-    use crate::henosis::graph::{PackageHenosis, PackageJson};
-    use crate::henosis::manifest::{EnvironmentSection, pinned};
-    use indexmap::IndexMap;
     use serde_json::{Value, json};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-
-    struct PackageReader {
-        packages: BTreeMap<(String, String), PackageJson>,
-    }
-
-    impl ComponentPackageReader for PackageReader {
-        async fn fetch_package_json(&self, repo: &str, sha: &str) -> anyhow::Result<PackageJson> {
-            self.packages
-                .get(&(repo.to_string(), sha.to_string()))
-                .cloned()
-                .with_context(|| format!("missing package {repo}@{sha}"))
-        }
-    }
-
-    fn package(name: &str, component: &str, dependencies: &[&str]) -> PackageJson {
-        PackageJson {
-            name: name.to_string(),
-            dependencies: dependencies
-                .iter()
-                .map(|dependency| (dependency.to_string(), "workspace:*".to_string()))
-                .collect(),
-            henosis: PackageHenosis {
-                component: Some(component.to_string()),
-            },
-        }
-    }
-
-    fn inspected_spec(
-        connector: &str,
-        dependencies: &[&str],
-        outputs_schema: &[u8],
-        connector_context: &[u8],
-    ) -> InspectedComponentSpec {
-        InspectedComponentSpec {
-            connector: connector.to_string(),
-            dependencies: dependencies
-                .iter()
-                .map(|dependency| dependency.to_string())
-                .collect(),
-            outputs_schema: base64::engine::general_purpose::STANDARD.encode(outputs_schema),
-            connector_context: base64::engine::general_purpose::STANDARD.encode(connector_context),
-            dependency_spec_hash_slots: Vec::new(),
-        }
-    }
-
-    #[tokio::test]
-    async fn boundary_uses_inspector_context_and_dependency_edges() {
-        let environment_id = TypedUuid::<PreviewEnvironmentKind>::from_untyped_uuid(
-            uuid::Uuid::from_u128(0x018f_1234_5678_7abc_8def_0123_4567_89ab),
-        )
-        .to_string();
-        let a_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let b_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let manifest = Manifest {
-            environment: EnvironmentSection {
-                id: environment_id.clone(),
-            },
-            components: IndexMap::from([
-                (
-                    "service-a".to_string(),
-                    pinned(
-                        "henosis-playground/service-a",
-                        a_sha,
-                        format!("sha256:{}", "a".repeat(64)),
-                    ),
-                ),
-                (
-                    "service-b".to_string(),
-                    pinned(
-                        "henosis-playground/service-b",
-                        b_sha,
-                        format!("sha256:{}", "b".repeat(64)),
-                    ),
-                ),
-            ]),
-        };
-        let registered = vec![
-            RegisteredComponent {
-                name: "service-a".to_string(),
-                repo: "henosis-playground/service-a".to_string(),
-                main_branch: "main".to_string(),
-                mode: ComponentMode::GateOnly,
-            },
-            RegisteredComponent {
-                name: "service-b".to_string(),
-                repo: "henosis-playground/service-b".to_string(),
-                main_branch: "main".to_string(),
-                mode: ComponentMode::GateOnly,
-            },
-        ];
-        let reader = PackageReader {
-            packages: BTreeMap::from([
-                (
-                    (
-                        "henosis-playground/service-a".to_string(),
-                        a_sha.to_string(),
-                    ),
-                    package("@henosis/service-a", "service-a", &[]),
-                ),
-                (
-                    (
-                        "henosis-playground/service-b".to_string(),
-                        b_sha.to_string(),
-                    ),
-                    package("@henosis/service-b", "service-b", &["@henosis/service-a"]),
-                ),
-            ]),
-        };
-
-        let context = format!(
-            r#"{{"apiVersion":"henosis.dev/k8s-component-context/v1","environment":{{"id":"{environment_id}"}},"source":{{"repository":"henosis-playground/service-b","revision":"{b_sha}"}},"image":{{"digest":"sha256:{}"}}}}"#,
-            "b".repeat(64)
-        )
-        .into_bytes();
-        let inspected = BTreeMap::from([
-            (
-                "service-a".to_string(),
-                inspected_spec("k8s", &[], br#"{"kind":"object"}"#, b"service-a"),
-            ),
-            (
-                "service-b".to_string(),
-                inspected_spec("k8s", &["service-a"], br#"{"kind":"object"}"#, &context),
-            ),
-        ]);
-
-        let specs = graph_component_specs(&manifest, &registered, &reader, inspected)
-            .await
-            .unwrap();
-        assert_eq!(specs[1].connector, "k8s");
-        assert_eq!(specs[1].dependencies, vec!["service-a"]);
-        assert_eq!(specs[1].connector_context, context);
-    }
-
-    #[tokio::test]
-    async fn registers_dependency_ordered_specs_before_graph_creation() {
-        let server = MockServer::start().await;
-        let first_hash =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1_u8; 32]);
-        let second_hash =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [2_u8; 32]);
-        let registration_first_hash = first_hash.clone();
-        let registration_second_hash = second_hash.clone();
-        Mock::given(method("POST"))
-            .and(path("/henosis.v1.GraphService/RegisterComponentSpec"))
-            .respond_with(move |request: &Request| {
-                let body: Value = request.body_json().unwrap();
-                let spec = body["spec"].clone();
-                assert_eq!(
-                    base64::Engine::decode(
-                        &base64::engine::general_purpose::STANDARD,
-                        spec["outputsSchema"].as_str().unwrap()
-                    )
-                    .unwrap(),
-                    br#"{"kind":"object"}"#
-                );
-                let hash = match spec["name"].as_str().unwrap() {
-                    "service-a" => {
-                        assert_eq!(spec["connector"], "k8s");
-                        assert!(spec.get("dependsOn").is_none());
-                        &registration_first_hash
-                    }
-                    "service-b" => {
-                        assert_eq!(spec["connector"], "supabase");
-                        assert_eq!(spec["dependsOn"], json!([registration_first_hash.clone()]));
-                        let context = base64::engine::general_purpose::STANDARD
-                            .decode(spec["connectorContext"].as_str().unwrap())
-                            .unwrap();
-                        let context: Value = serde_json::from_slice(&context).unwrap();
-                        assert_eq!(context["producerSpecHash"], json!(vec![1_u8; 32]));
-                        &registration_second_hash
-                    }
-                    name => panic!("unexpected component spec `{name}`"),
-                };
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "component": {
-                        "hash": hash,
-                        "spec": spec
-                    }
-                }))
-            })
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/henosis.v1.GraphService/GetGraph"))
-            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
-                "code": "not_found",
-                "message": "graph does not exist"
-            })))
-            .mount(&server)
-            .await;
-        let create_first_hash = first_hash.clone();
-        let create_second_hash = second_hash.clone();
-        Mock::given(method("POST"))
-            .and(path("/henosis.v1.GraphService/CreateGraph"))
-            .respond_with(move |request: &Request| {
-                let body: Value = request.body_json().unwrap();
-                assert_eq!(
-                    body["componentSpecHashes"],
-                    json!([create_first_hash.clone(), create_second_hash.clone()])
-                );
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "graph": {
-                        "id": body["graphId"],
-                        "generation": "1",
-                        "componentSpecHashes": body["componentSpecHashes"]
-                    }
-                }))
-            })
-            .mount(&server)
-            .await;
-        let config: CoreApiConfig = toml::from_str(&format!(
-            "endpoint = {:?}\ntoken = \"test-token\"",
-            server.uri()
-        ))
-        .unwrap();
-        let environment_id = TypedUuid::<PreviewEnvironmentKind>::from_untyped_uuid(
-            uuid::Uuid::from_u128(0x018f_1234_5678_7abc_8def_0123_4567_89ac),
-        )
-        .to_string();
-        let client = CoreClient::new(&config).unwrap();
-
-        let generation = client
-            .apply_graph(
-                &environment_id,
-                vec![
-                    PlannedComponentSpec {
-                        name: "service-b".to_string(),
-                        connector: "supabase".to_string(),
-                        dependencies: vec!["service-a".to_string()],
-                        outputs_schema: br#"{"kind":"object"}"#.to_vec(),
-                        connector_context: br#"{"producerSpecHash":null}"#.to_vec(),
-                        dependency_spec_hash_slots: vec![DependencySpecHashSlot {
-                            component: "service-a".to_string(),
-                            pointer: "/producerSpecHash".to_string(),
-                        }],
-                    },
-                    PlannedComponentSpec {
-                        name: "service-a".to_string(),
-                        connector: "k8s".to_string(),
-                        dependencies: Vec::new(),
-                        outputs_schema: br#"{"kind":"object"}"#.to_vec(),
-                        connector_context: b"service-a".to_vec(),
-                        dependency_spec_hash_slots: Vec::new(),
-                    },
-                ],
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(generation, 1);
-        let requests = server.received_requests().await.unwrap();
-        let methods = requests
-            .iter()
-            .map(|request| request.url.path().rsplit('/').next().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            methods,
-            vec![
-                "RegisterComponentSpec",
-                "RegisterComponentSpec",
-                "GetGraph",
-                "CreateGraph"
-            ]
-        );
-    }
 
     #[test]
     fn core_preview_ids_are_canonical_uuid_v7_typeids() {
