@@ -286,10 +286,13 @@ where
                             .await?
                     }
                     Err(CoreBoundaryError::GraphNotFound(_)) => {
-                        return Err(GitSyncError::Decode(format!(
-                            "graph {} has generation {} but does not exist in core",
-                            intent.graph, intent.generation
-                        )));
+                        self.core
+                            .apply(GraphIntent::Create {
+                                graph: intent.graph.clone(),
+                                bundles,
+                                source_policy: GraphSourcePolicy::AcceptLocal,
+                            })
+                            .await?
                     }
                     Err(error) => return Err(error.into()),
                 }
