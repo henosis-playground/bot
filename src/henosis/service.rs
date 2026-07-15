@@ -7,7 +7,7 @@ use crate::henosis::core_client::{
     BundlePin, ConnectCoreBoundary, CoreBoundary, CoreEnvironmentIdGenerator,
     CoreFailurePresentation, GraphIntent, GraphPhase, GraphStatus, SourceProvenance, UiLink,
 };
-use crate::henosis::d26::{PreviewRequest, PreviewWorkflow};
+use crate::henosis::d26::PreviewWorkflow;
 use crate::henosis::db::{PgEnvironmentStore, PgQueueStore};
 use crate::henosis::environment::{
     DeployRepoWriter, DeployWriteResult, EnvironmentChange, EnvironmentIdGenerator,
@@ -59,36 +59,84 @@ impl DeployRepoWriter for D26PreviewWriter {
     async fn write_manifest(
         &mut self,
         path: &str,
-        _contents: &str,
+        contents: &str,
     ) -> anyhow::Result<DeployWriteResult> {
         let environment = environment_id_from_manifest_path(path)?;
-        let checkout = checkout_pull_request(&self.request).await?;
-        install_checkout_dependencies(checkout.path()).await?;
-        let component_root = self.checkout_subdir.as_ref().map_or_else(
-            || checkout.path().to_path_buf(),
-            |subdir| checkout.path().join(subdir),
-        );
+        let manifest = crate::henosis::manifest::parse_toml(contents)
+            .context("Cannot parse D26 preview graph pins")?;
         anyhow::ensure!(
-            component_root.is_dir(),
-            "D26 preview component root {} does not exist",
-            component_root.display()
+            manifest.environment.id == environment,
+            "D26 preview graph `{}` does not match path `{environment}`",
+            manifest.environment.id
         );
-        let workflow = PreviewWorkflow::new(
-            self.core.clone(),
-            EsbuildBundler,
-            &self.bundle_root,
-            &self.artifact_root,
-        );
-        let status = workflow
-            .p_plus(&PreviewRequest {
-                repository: self.request.key.repo.clone(),
-                pull_request: self.request.key.number,
-                checkout: component_root,
-                revision: self.request.head_sha.clone(),
-                reference: Some(format!("refs/heads/{}", self.request.head_branch)),
-                environment: environment.to_string(),
-            })
-            .await?;
+
+        let bundler = EsbuildBundler;
+        let mut pins = Vec::with_capacity(manifest.components.len());
+        for (component, entry) in manifest.components {
+            let crate::henosis::manifest::ComponentEntry::Pinned(entry) = entry else {
+                anyhow::bail!("D26 preview component `{component}` must be pinned");
+            };
+            let checkout = checkout_repository(&entry.repo, &entry.r#ref).await?;
+            install_checkout_dependencies(checkout.path()).await?;
+            let component_root = self.checkout_subdir.as_ref().map_or_else(
+                || checkout.path().to_path_buf(),
+                |subdir| checkout.path().join(subdir),
+            );
+            anyhow::ensure!(
+                component_root.is_dir(),
+                "D26 preview component root {} does not exist",
+                component_root.display()
+            );
+            let bundles = bundler.bundle(&BundleRequest {
+                repository: component_root.clone(),
+                output: self.bundle_root.clone(),
+            })?;
+            let artifacts = bundler.build_artifacts(&component_root, &self.artifact_root)?;
+            let bundle = bundles
+                .bundles
+                .into_iter()
+                .find(|bundle| bundle.component == component)
+                .with_context(|| {
+                    format!(
+                        "Repository `{}` did not bundle preview component `{component}`",
+                        entry.repo
+                    )
+                })?;
+            pins.push(BundlePin {
+                component,
+                bundle_id: bundle.bundle_id,
+                input_bindings: artifacts
+                    .into_iter()
+                    .filter(|artifact| artifact.component == bundle.component)
+                    .map(|artifact| (artifact.input, serde_json::Value::String(artifact.digest)))
+                    .collect(),
+                source: Some(SourceProvenance::Vcs {
+                    repository: entry.repo.clone(),
+                    revision: entry.r#ref.clone(),
+                    reference: (entry.repo == self.request.key.repo
+                        && entry.r#ref == self.request.head_sha)
+                        .then(|| format!("refs/heads/{}", self.request.head_branch)),
+                }),
+            });
+        }
+        pins.sort_by(|left, right| left.component.cmp(&right.component));
+
+        let intent = match self.core.status(environment).await {
+            Ok(current) => GraphIntent::Update {
+                graph: environment.to_string(),
+                expected_generation: current.generation,
+                bundles: pins,
+            },
+            Err(crate::henosis::core_client::CoreBoundaryError::GraphNotFound(_)) => {
+                GraphIntent::Create {
+                    graph: environment.to_string(),
+                    bundles: pins,
+                    source_policy: GraphSourcePolicy::AcceptLocal,
+                }
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let status = self.core.apply(intent).await?;
         Ok(DeployWriteResult {
             commit_sha: format!("generation:{}", status.generation),
         })
@@ -176,10 +224,6 @@ impl RepositoryCheckout {
     fn path(&self) -> &Path {
         &self.repository
     }
-}
-
-async fn checkout_pull_request(request: &PreviewPullRequest) -> anyhow::Result<RepositoryCheckout> {
-    checkout_repository(&request.key.repo, &request.head_sha).await
 }
 
 async fn checkout_repository(repo: &str, revision: &str) -> anyhow::Result<RepositoryCheckout> {
