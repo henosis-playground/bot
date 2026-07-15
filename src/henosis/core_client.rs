@@ -32,7 +32,7 @@ pub enum PreviewEnvironmentKind {}
 
 impl TypedUuidKind for PreviewEnvironmentKind {
     fn tag() -> TypedUuidTag {
-        const TAG: TypedUuidTag = TypedUuidTag::new("preview");
+        const TAG: TypedUuidTag = TypedUuidTag::new("graph");
         TAG
     }
 }
@@ -777,7 +777,7 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
-    fn core_preview_ids_are_canonical_uuid_v7_typeids() {
+    fn core_preview_graph_ids_are_canonical_uuid_v7_typeids() {
         let id = CoreEnvironmentIdGenerator.new_preview_environment_id();
         let parsed: TypedUuid<PreviewEnvironmentKind> = id.parse().unwrap();
         assert_eq!(parsed.get_version_num(), 7);
