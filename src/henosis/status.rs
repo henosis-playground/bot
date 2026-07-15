@@ -1,6 +1,7 @@
 use crate::henosis::core_client::UiLink;
 use crate::henosis::environment::{
     EnvironmentStatus, PreviewPullRequest, PullRequestKey, RenderOutcome, RenderStatus,
+    presentation_name,
 };
 use crate::henosis::queue::GateStatus;
 
@@ -69,7 +70,7 @@ fn environment_cell(snapshot: &StatusSnapshot) -> String {
     let environment = &snapshot.environment.environment;
     let identity = format!(
         "**{}** (`{}`)",
-        environment.display_label.as_deref().unwrap_or("unnamed"),
+        presentation_name(environment),
         environment.id
     );
     let mut links = vec![environment_link(snapshot)];

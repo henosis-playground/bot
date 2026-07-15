@@ -821,6 +821,20 @@ pub fn is_preview_environment_id(id: &str) -> bool {
     true
 }
 
+pub fn presentation_name(environment: &EnvironmentState) -> &str {
+    environment.display_label.as_deref().unwrap_or_else(|| {
+        if environment.is_preview {
+            environment
+                .id
+                .strip_prefix("preview-")
+                .filter(|_| !is_preview_environment_id(&environment.id))
+                .unwrap_or("preview")
+        } else {
+            "unnamed"
+        }
+    })
+}
+
 pub fn presentation_identity(name: Option<&str>, graph: &str) -> String {
     let name = name.unwrap_or("unnamed");
     format!("{name} ({graph})")

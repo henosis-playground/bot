@@ -13,6 +13,7 @@ use crate::henosis::environment::{
     DeployRepoWriter, DeployWriteResult, EnvironmentChange, EnvironmentIdGenerator,
     EnvironmentManager, EnvironmentStatus, EnvironmentStore, JoinEnvironment, PreviewPullRequest,
     PullRequestKey, RenderOutcome, RenderStatus, environment_branch, presentation_identity,
+    presentation_name,
 };
 use crate::henosis::gate::{CliGateExecutor, GateExecutor};
 use crate::henosis::github::{
@@ -1266,7 +1267,7 @@ async fn environment_identity(
     let environment = store.active_environment(graph).await?;
     let mut name = environment
         .as_ref()
-        .and_then(|environment| environment.display_label.clone());
+        .map(|environment| presentation_name(environment).to_string());
     if let Some(config) = ctx.henosis_config.as_ref() {
         let repository = crate::henosis::git_sync::GithubGraphFileRepository::new(
             deploy_repo(ctx, config)?,

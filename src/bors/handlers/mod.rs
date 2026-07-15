@@ -2097,7 +2097,7 @@ digest = "sha256:service-b"
 
                 assert!(body.contains("<!-- henosis:status -->"));
                 assert!(body.contains("<!-- /henosis:status -->"));
-                assert!(body.contains("| Environment | `preview-"));
+                assert!(body.contains("| Environment | **preview** (`preview-"));
                 assert!(body.contains(
                     "[manifest](https://github.com/rust-lang/borstest/blob/main/preview-"
                 ));
@@ -2130,7 +2130,7 @@ digest = "sha256:service-b"
 
                 let body = ctx.pr(pr_id.clone()).await.get_gh_pr().description;
                 assert!(body.contains("<!-- henosis:status -->"));
-                assert!(body.contains("| Environment | `preview-"));
+                assert!(body.contains("| Environment | **preview** (`preview-"));
                 assert!(body.contains("| Render | :grey_question: none |"));
                 let environment_id = environment_id_from_body(&body);
                 assert_preview_active(ctx, &environment_id).await?;
@@ -2543,8 +2543,12 @@ digest = "sha256:service-b"
 
                 let service_a_body = ctx.pr(service_a_id).await.get_gh_pr().description;
                 let service_b_body = ctx.pr(service_b_id).await.get_gh_pr().description;
-                assert!(service_a_body.contains(&format!("| Environment | `{environment_id}`")));
-                assert!(service_b_body.contains(&format!("| Environment | `{environment_id}`")));
+                assert!(service_a_body.contains(&format!(
+                            "| Environment | **shared-demo** (`{environment_id}`)"
+                        )));
+                assert!(service_b_body.contains(&format!(
+                            "| Environment | **shared-demo** (`{environment_id}`)"
+                        )));
                 assert!(
                     service_a_body
                         .contains("[rust-lang/borstest#2](https://github.com/rust-lang/borstest/pull/2) (this PR), [rust-lang/service-b#1](https://github.com/rust-lang/service-b/pull/1)")
@@ -2593,7 +2597,9 @@ digest = "sha256:service-b"
                 assert_preview_active(ctx, environment_id).await?;
                 assert_eq!(active_member_count(ctx, environment_id).await?, 1);
                 let service_b_body = ctx.pr(service_b_id).await.get_gh_pr().description;
-                assert!(service_b_body.contains(&format!("| Environment | `{environment_id}`")));
+                assert!(service_b_body.contains(&format!(
+                            "| Environment | **shared-demo** (`{environment_id}`)"
+                        )));
                 assert!(service_b_body.contains(
                     "[rust-lang/service-b#1](https://github.com/rust-lang/service-b/pull/1) (this PR)"
                 ));
