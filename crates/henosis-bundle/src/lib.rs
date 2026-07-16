@@ -43,7 +43,7 @@ static CONFIG_FILE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     .expect("configuration file pattern is valid")
 });
 static DEFAULT_IMPORT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)^\s*import\s+([A-Za-z][A-Za-z0-9]*)\s+from\s+["']([^"']+)["']\s*;?"#)
+    Regex::new(r#"(?m)(?:^|;)\s*import\s+([A-Za-z][A-Za-z0-9]*)\s+from\s+["']([^"']+)["']\s*;?"#)
         .expect("default import pattern is valid")
 });
 static OUTPUT_REFERENCE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
@@ -576,7 +576,7 @@ fn bundle_component(
     let import_path = format!("./{}", relative_entry.to_string_lossy().replace('\\', "/"));
     let declarations = read_config_file_declarations(component)?;
     let config_files = resolve_config_files(repository, component, &declarations)?;
-    let derived_inputs = discover_derived_inputs(component)?;
+    let initial_inputs = discover_derived_inputs(component)?;
     let component_revision =
         sha256(
             &fs::read(&component.entry).map_err(|source| BundleError::ReadSource {
@@ -599,7 +599,7 @@ fn bundle_component(
     let discovery_entry = generated_entry_source(
         &import_path,
         &closure_wire,
-        &derived_inputs,
+        &initial_inputs,
         &[],
         &component_revision,
     );
@@ -611,6 +611,17 @@ fn bundle_component(
         &module_path,
         &metafile_path,
     )?;
+    let mut derived_inputs =
+        discover_output_inputs_from_metafile(repository, component, &metafile_path)?
+            .into_iter()
+            .map(DerivedInputDeclaration::Output)
+            .chain(
+                initial_inputs
+                    .into_iter()
+                    .filter(|input| matches!(input, DerivedInputDeclaration::Artifact(_))),
+            )
+            .collect::<Vec<_>>();
+    derived_inputs.sort_by(|left, right| derived_input_name(left).cmp(derived_input_name(right)));
     let compiled_dependencies =
         resolve_compiled_dependencies(repository, component, &derived_inputs, &metafile_path)?;
     let entry_source = generated_entry_source(
@@ -1148,6 +1159,69 @@ struct EsbuildImport {
     original: Option<String>,
 }
 
+fn discover_output_inputs_from_metafile(
+    repository: &Path,
+    component: &ComponentSource,
+    metafile_path: &Path,
+) -> Result<Vec<OutputInputDeclaration>, BundleError> {
+    let bytes = fs::read(metafile_path).map_err(|source| BundleError::ReadSource {
+        path: metafile_path.to_path_buf(),
+        source,
+    })?;
+    let metafile: EsbuildMetafile =
+        serde_json::from_slice(&bytes).map_err(|source| BundleError::DecodeMetafile {
+            component: component.name.clone(),
+            source,
+        })?;
+    let mut used_names = BTreeMap::<String, usize>::new();
+    let mut outputs = BTreeMap::<(String, String), OutputInputDeclaration>::new();
+    for path in metafile.inputs.keys() {
+        let Some(path) = resolved_input_path(repository, path) else {
+            continue;
+        };
+        if !is_repository_source(repository, &path)
+            || !matches!(path.extension().and_then(OsStr::to_str), Some("ts" | "tsx"))
+        {
+            continue;
+        }
+        let source = fs::read_to_string(&path).map_err(|source| BundleError::ReadSource {
+            path: path.clone(),
+            source,
+        })?;
+        let imports = DEFAULT_IMPORT_PATTERN
+            .captures_iter(&source)
+            .map(|captures| (captures[1].to_owned(), captures[2].to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        for captures in OUTPUT_REFERENCE_PATTERN.captures_iter(&source) {
+            let alias = captures[1].to_owned();
+            let output = captures[2].to_owned();
+            let Some(specifier) = imports.get(&alias) else {
+                continue;
+            };
+            let key = (specifier.clone(), output.clone());
+            outputs
+                .entry(key)
+                .or_insert_with(|| OutputInputDeclaration {
+                    input: unique_input_name(
+                        &format!("{alias}{}", capitalize(&output)),
+                        &mut used_names,
+                    ),
+                    specifier: specifier.clone(),
+                    output,
+                });
+        }
+    }
+    Ok(outputs.into_values().collect())
+}
+
+fn is_repository_source(repository: &Path, path: &Path) -> bool {
+    path.strip_prefix(repository).is_ok_and(|relative| {
+        !relative
+            .components()
+            .any(|component| component.as_os_str() == "node_modules")
+    })
+}
+
 fn resolve_compiled_dependencies(
     repository: &Path,
     component: &ComponentSource,
@@ -1163,23 +1237,16 @@ fn resolve_compiled_dependencies(
             component: component.name.clone(),
             source,
         })?;
-    let component_path =
-        component
-            .entry
-            .canonicalize()
-            .map_err(|source| BundleError::ReadSource {
-                path: component.entry.clone(),
-                source,
-            })?;
-    let component_input = metafile
+    let repository_inputs = metafile
         .inputs
         .iter()
-        .find(|(path, _)| resolved_input_path(repository, path).as_deref() == Some(&component_path))
+        .filter(|(path, _)| {
+            resolved_input_path(repository, path)
+                .as_deref()
+                .is_some_and(|path| is_repository_source(repository, path))
+        })
         .map(|(_, input)| input)
-        .ok_or_else(|| BundleError::MissingResolvedProducer {
-            component: component.name.clone(),
-            specifier: component.entry.display().to_string(),
-        })?;
+        .collect::<Vec<_>>();
     let consumed = derived_inputs
         .iter()
         .filter_map(|input| match input {
@@ -1197,9 +1264,9 @@ fn resolve_compiled_dependencies(
         );
     let mut resolved = Vec::with_capacity(consumed.len());
     for (specifier, outputs) in consumed {
-        let import = component_input
-            .imports
+        let import = repository_inputs
             .iter()
+            .flat_map(|input| &input.imports)
             .find(|import| import.original.as_deref() == Some(specifier.as_str()))
             .ok_or_else(|| BundleError::MissingResolvedProducer {
                 component: component.name.clone(),
@@ -1670,7 +1737,12 @@ mod tests {
         fs::create_dir_all(repo.path().join("node_modules/@henosis/service-a")).unwrap();
         fs::write(
             repo.path().join("src/web.ts"),
-            "import { defineComponent } from '@henosis/core';\nimport producer from '@henosis/service-a';\nexport default defineComponent({ name: 'web', outputs: {}, build() { producer.outputs.api.value; return {}; } });",
+            "import { defineComponent } from '@henosis/core';\nimport { readApi } from './helper';\nexport default defineComponent({ name: 'web', outputs: {}, build() { readApi(); return {}; } });",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("src/helper.ts"),
+            "import producer from '@henosis/service-a'; export function readApi() { return producer.outputs.api.value; }",
         )
         .unwrap();
         fs::write(
