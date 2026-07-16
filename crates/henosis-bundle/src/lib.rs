@@ -1310,7 +1310,7 @@ fn inspect_compiled_dependencies(
     let module_url = format!("file://{}", module_path.display());
     let output = Command::new("node")
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .args([
             "--input-type=module",
             "--eval",
