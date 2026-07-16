@@ -577,6 +577,13 @@ fn bundle_component(
     let declarations = read_config_file_declarations(component)?;
     let config_files = resolve_config_files(repository, component, &declarations)?;
     let derived_inputs = discover_derived_inputs(component)?;
+    let component_revision =
+        sha256(
+            &fs::read(&component.entry).map_err(|source| BundleError::ReadSource {
+                path: component.entry.clone(),
+                source,
+            })?,
+        );
     let closure_wire = config_files
         .iter()
         .map(|file| {
@@ -589,7 +596,13 @@ fn bundle_component(
     let build_dir = tempfile::tempdir().map_err(BundleError::PrepareEsbuild)?;
     let module_path = build_dir.path().join("module.js");
     let metafile_path = build_dir.path().join("metafile.json");
-    let discovery_entry = generated_entry_source(&import_path, &closure_wire, &derived_inputs, &[]);
+    let discovery_entry = generated_entry_source(
+        &import_path,
+        &closure_wire,
+        &derived_inputs,
+        &[],
+        &component_revision,
+    );
     run_esbuild(
         esbuild,
         repository,
@@ -605,6 +618,7 @@ fn bundle_component(
         &closure_wire,
         &derived_inputs,
         &compiled_dependencies,
+        &component_revision,
     );
     run_esbuild(
         esbuild,
@@ -929,6 +943,7 @@ fn generated_entry_source(
     closure_wire: &[serde_json::Value],
     derived_inputs: &[DerivedInputDeclaration],
     compiled_dependencies: &[ResolvedCompiledDependency],
+    component_revision: &str,
 ) -> String {
     let mut imports = String::new();
     let producer_specifiers = derived_inputs
@@ -989,11 +1004,12 @@ fn generated_entry_source(
         })
         .collect::<Vec<_>>();
     format!(
-        "import componentDefinition from {};\n{imports}import {{ createBundle }} from \"@henosis/core\";\nconst bundle = createBundle(componentDefinition, {}, {{ {} }}, [{}]);\nexport const protocolVersion = bundle.protocolVersion;\nexport const component = bundle.component;\nexport const evaluate = bundle.evaluate;\n",
+        "import componentDefinition from {};\n{imports}import {{ createBundle }} from \"@henosis/core\";\nconst bundle = createBundle(componentDefinition, {}, {{ {} }}, [{}], {});\nexport const protocolVersion = bundle.protocolVersion;\nexport const component = bundle.component;\nexport const evaluate = bundle.evaluate;\n",
         serde_json::to_string(import_path).expect("path string is JSON encodable"),
         serde_json::to_string(closure_wire).expect("closure manifest is JSON encodable"),
         entries.join(", "),
         contracts.join(", "),
+        serde_json::to_string(component_revision).expect("revision is JSON encodable"),
     )
 }
 
@@ -1636,7 +1652,7 @@ mod tests {
             inputs.iter().map(derived_input_name).collect::<Vec<_>>(),
             vec!["aApi", "workerAssets", "workerEntry"]
         );
-        let entry_source = generated_entry_source("./src/web.ts", &[], &inputs, &[]);
+        let entry_source = generated_entry_source("./src/web.ts", &[], &inputs, &[], "revision");
         assert!(entry_source.contains("\"aApi\": __henosis_producer_0.outputs.api"));
         assert!(entry_source.contains(
             "\"workerEntry\": { source: \"artifact\", kind: \"cloudflare-worker\", path: \"workers/web.ts\" }"
