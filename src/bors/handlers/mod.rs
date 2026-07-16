@@ -60,13 +60,8 @@ mod trybuild;
 mod workflow;
 
 fn command_failure_comment(error: &anyhow::Error) -> String {
-    let root_cause = error.root_cause().to_string();
-    let diagnostic = root_cause
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or(root_cause.as_str());
-    format!(":x: **Command failed.**\n\n```text\nerror: {diagnostic}\n```")
+    let diagnostic = error.root_cause().to_string();
+    format!(":x: **Command failed.**\n\n```text\n{diagnostic}\n```")
 }
 
 /// This function executes a single bors repository event
@@ -1303,7 +1298,7 @@ mod tests {
 
         assert_eq!(
             super::command_failure_comment(&error),
-            ":x: **Command failed.**\n\n```text\nerror: Component-spec inspector returned unknown dependency 'service-e' for 'service-f'\n```"
+            ":x: **Command failed.**\n\n```text\nComponent-spec inspector failed: setup noise\nComponent-spec inspector returned unknown dependency 'service-e' for 'service-f'\n```"
         );
     }
 
