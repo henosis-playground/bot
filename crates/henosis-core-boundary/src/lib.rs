@@ -686,6 +686,15 @@ impl CoreBoundary for FakeCoreBoundary {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rejection_diagnostic_is_rendered_verbatim() {
+        let diagnostic = "error[HENOSIS_CONTRACT_SKEW]: consumer -> producer.api";
+        assert_eq!(
+            CoreBoundaryError::Rejected(diagnostic.to_owned()).to_string(),
+            diagnostic
+        );
+    }
+
     #[tokio::test]
     async fn fake_records_intent_and_publishes_status() {
         let core = FakeCoreBoundary::default();
