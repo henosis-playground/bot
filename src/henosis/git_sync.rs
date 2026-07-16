@@ -598,6 +598,8 @@ mod tests {
 
     use super::*;
     use crate::henosis::core_client::{FakeCoreBoundary, GraphPhase};
+    use proptest::prelude::*;
+    use proptest::test_runner::Config;
 
     struct BareRepository {
         remote: tempfile::TempDir,
@@ -793,6 +795,128 @@ mod tests {
             frontend.repository.read(graph).components[0].bundle_digest,
             vec![9]
         );
+    }
+
+    #[derive(Clone, Debug)]
+    enum GitFrontendTransition {
+        EditPin(u8),
+        CoreStatus(u8),
+        Delete,
+        Restart,
+    }
+
+    fn git_frontend_transition() -> impl Strategy<Value = GitFrontendTransition> {
+        prop_oneof![
+            4 => any::<u8>().prop_map(GitFrontendTransition::EditPin),
+            3 => any::<u8>().prop_map(GitFrontendTransition::CoreStatus),
+            2 => Just(GitFrontendTransition::Delete),
+            1 => Just(GitFrontendTransition::Restart),
+        ]
+    }
+
+    fn git_property_cases() -> u32 {
+        std::env::var("HENOSIS_FRONTEND_PROPTEST_CASES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8)
+    }
+
+    proptest! {
+        #![proptest_config(Config {
+            cases: git_property_cases(),
+            max_shrink_iters: 512,
+            .. Config::default()
+        })]
+
+        #[test]
+        fn git_sync_state_machine_matches_naive_pin_map_across_restarts_and_deletion(
+            transitions in proptest::collection::vec(git_frontend_transition(), 1..16),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("git frontend state-machine runtime builds");
+            runtime.block_on(async move {
+                let repository = BareRepository::new();
+                let graph = "graph_01k00000000000000000000009";
+                let core = FakeCoreBoundary::default();
+                let mut frontend = GitSyncFrontend::new(repository, core.clone());
+                let mut expected_pin = None::<u8>;
+                let mut retired = false;
+
+                for transition in transitions {
+                    match transition {
+                        GitFrontendTransition::EditPin(digest) if !retired => {
+                            let generation = frontend
+                                .repository
+                                .read_graph_files()
+                                .await
+                                .unwrap()
+                                .get(&graph_path(graph))
+                                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                                .and_then(|text| toml::from_str::<GraphIntentFile>(text).ok())
+                                .map_or(0, |intent| intent.generation);
+                            frontend.repository.edit(graph, Some(&intent(graph, generation, digest)));
+                            frontend.sync_from_main().await.unwrap();
+                            expected_pin = Some(digest);
+                        }
+                        GitFrontendTransition::CoreStatus(digest) if expected_pin.is_some() && !retired => {
+                            let status = core.status(graph).await.unwrap();
+                            let status = core
+                                .apply(GraphIntent::Update {
+                                    graph: graph.to_string(),
+                                    expected_generation: status.generation,
+                                    bundles: vec![pin(digest)],
+                                })
+                                .await
+                                .unwrap();
+                            frontend.publish_graph("dev", &status).await.unwrap();
+                            expected_pin = Some(digest);
+                        }
+                        GitFrontendTransition::Delete if expected_pin.is_some() && !retired => {
+                            frontend.repository.edit(graph, None);
+                            frontend.sync_from_main().await.unwrap();
+                            expected_pin = None;
+                            retired = true;
+                        }
+                        GitFrontendTransition::Restart => {
+                            let repository = frontend.repository;
+                            frontend = GitSyncFrontend::new(repository, core.clone());
+                            frontend.sync_from_main().await.unwrap();
+                        }
+                        GitFrontendTransition::EditPin(_)
+                        | GitFrontendTransition::CoreStatus(_)
+                        | GitFrontendTransition::Delete => {}
+                    }
+
+                    let live = core
+                        .list(false)
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .map(|summary| summary.graph)
+                        .collect::<BTreeSet<_>>();
+                    prop_assert_eq!(live.contains(graph), expected_pin.is_some());
+                    match expected_pin {
+                        Some(digest) => {
+                            let file = frontend.repository.read(graph);
+                            prop_assert_eq!(file.components[0].bundle_digest.clone(), vec![digest]);
+                            let status = core.status(graph).await.unwrap();
+                            prop_assert_eq!(status.bundles[0].bundle_id.clone(), format!("{digest:02x}"));
+                        }
+                        None => {
+                            prop_assert!(!frontend
+                                .repository
+                                .read_graph_files()
+                                .await
+                                .unwrap()
+                                .contains_key(&graph_path(graph)));
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
     }
 
     fn intent(graph: &str, generation: u64, digest: u8) -> GraphIntentFile {

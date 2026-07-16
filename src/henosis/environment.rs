@@ -891,6 +891,8 @@ mod tests {
     use super::*;
     use crate::henosis::config::ComponentMode;
     use crate::henosis::graph::{PackageHenosis, PackageJson};
+    use proptest::prelude::*;
+    use proptest::test_runner::Config;
 
     #[derive(Clone)]
     struct StaticDevManifest(Manifest);
@@ -915,6 +917,7 @@ mod tests {
         deleted_manifests: Vec<String>,
         created_branches: Vec<String>,
         deleted_branches: Vec<String>,
+        branches: BTreeSet<String>,
         commit_counter: u64,
     }
 
@@ -939,11 +942,13 @@ mod tests {
 
         async fn create_branch(&mut self, branch: &str) -> anyhow::Result<()> {
             self.created_branches.push(branch.to_string());
+            self.branches.insert(branch.to_string());
             Ok(())
         }
 
         async fn delete_branch(&mut self, branch: &str) -> anyhow::Result<()> {
             self.deleted_branches.push(branch.to_string());
+            self.branches.remove(branch);
             Ok(())
         }
     }
@@ -1166,6 +1171,13 @@ mod tests {
                     (
                         "henosis-playground/service-b".to_string(),
                         "b-pr".to_string(),
+                    ),
+                    service_b.clone(),
+                ),
+                (
+                    (
+                        "henosis-playground/service-b".to_string(),
+                        "b-pr-2".to_string(),
                     ),
                     service_b,
                 ),
@@ -1665,6 +1677,187 @@ mod tests {
             shared.components.get("service-b"),
             Some(ComponentEntry::Pinned(PinnedEntry { r#ref, .. })) if r#ref == "pr/7"
         ));
+    }
+
+    #[derive(Clone, Debug)]
+    enum FrontendTransition {
+        Join { pr: u8, environment: u8 },
+        Leave { pr: u8 },
+        AdvanceHead { pr: u8 },
+        Restart,
+    }
+
+    fn frontend_transition() -> impl Strategy<Value = FrontendTransition> {
+        prop_oneof![
+            4 => (0_u8..2, 0_u8..2).prop_map(|(pr, environment)| FrontendTransition::Join { pr, environment }),
+            3 => (0_u8..2).prop_map(|pr| FrontendTransition::Leave { pr }),
+            4 => (0_u8..2).prop_map(|pr| FrontendTransition::AdvanceHead { pr }),
+            1 => Just(FrontendTransition::Restart),
+        ]
+    }
+
+    fn frontend_property_cases() -> u32 {
+        std::env::var("HENOSIS_FRONTEND_PROPTEST_CASES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(24)
+    }
+
+    fn state_machine_pr(index: u8, revision: u8) -> PreviewPullRequest {
+        match index {
+            0 => PreviewPullRequest::new(
+                "henosis-playground/service-a",
+                3,
+                "service-a",
+                "pr/3",
+                if revision.is_multiple_of(2) { "a-pr" } else { "a-pr-2" },
+            ),
+            _ => PreviewPullRequest::new(
+                "henosis-playground/service-b",
+                7,
+                "service-b",
+                "pr/7",
+                if revision.is_multiple_of(2) { "b-pr" } else { "b-pr-2" },
+            ),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(Config {
+            cases: frontend_property_cases(),
+            max_shrink_iters: 2_048,
+            .. Config::default()
+        })]
+
+        #[test]
+        fn preview_membership_state_machine_matches_naive_maps(
+            transitions in proptest::collection::vec(frontend_transition(), 1..32),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("frontend state-machine runtime builds");
+            runtime.block_on(async move {
+                let mut manager = manager_with_ids(&[]);
+                let mut store = MemoryStore::default();
+                let mut writer = MemoryWriter::default();
+                let packages = package_reader();
+                let dev = StaticDevManifest(dev_manifest());
+                let digest = NoDigestResolver;
+                let mut memberships = BTreeMap::<u8, u8>::new();
+                let mut heads = BTreeMap::from([(0_u8, 0_u8), (1_u8, 0_u8)]);
+
+                for transition in transitions {
+                    match transition {
+                        FrontendTransition::Join { pr, environment } => {
+                            let member = state_machine_pr(pr, heads[&pr]);
+                            manager
+                                .join(
+                                    &mut store,
+                                    &mut writer,
+                                    &packages,
+                                    &dev,
+                                    &digest,
+                                    JoinEnvironment {
+                                        pr: member,
+                                        name: if environment == 0 { "alpha" } else { "beta" },
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                            memberships.insert(pr, environment);
+                        }
+                        FrontendTransition::Leave { pr } => {
+                            manager
+                                .leave(
+                                    &mut store,
+                                    &mut writer,
+                                    &packages,
+                                    &dev,
+                                    &digest,
+                                    state_machine_pr(pr, heads[&pr]),
+                                )
+                                .await
+                                .unwrap();
+                            memberships.remove(&pr);
+                        }
+                        FrontendTransition::AdvanceHead { pr } => {
+                            let revision = heads.get_mut(&pr).unwrap();
+                            *revision = revision.wrapping_add(1);
+                            if memberships.contains_key(&pr) {
+                                manager
+                                    .refresh_pr(
+                                        &mut store,
+                                        &mut writer,
+                                        &packages,
+                                        &dev,
+                                        &digest,
+                                        state_machine_pr(pr, *revision),
+                                    )
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                        FrontendTransition::Restart => {
+                            manager = manager_with_ids(&[]);
+                        }
+                    }
+
+                    let actual_memberships = store
+                        .members
+                        .iter()
+                        .map(|(key, (environment, member))| {
+                            let pr = if key.repo.ends_with("service-a") { 0 } else { 1 };
+                            let named = if environment == "preview-alpha" { 0 } else { 1 };
+                            (pr, (named, member.head_sha.clone()))
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    let expected_memberships = memberships
+                        .iter()
+                        .map(|(pr, environment)| {
+                            (*pr, (*environment, state_machine_pr(*pr, heads[pr]).head_sha))
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    prop_assert_eq!(actual_memberships, expected_memberships);
+
+                    let expected_manifests = memberships
+                        .values()
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .map(|environment| {
+                            format!("preview-{}.toml", if environment == 0 { "alpha" } else { "beta" })
+                        })
+                        .collect::<BTreeSet<_>>();
+                    prop_assert_eq!(writer.writes.keys().cloned().collect::<BTreeSet<_>>(), expected_manifests.clone());
+                    prop_assert_eq!(
+                        writer.branches.clone(),
+                        expected_manifests
+                            .iter()
+                            .map(|path| format!("env/{}", path.trim_end_matches(".toml")))
+                            .collect::<BTreeSet<_>>()
+                    );
+
+                    for (pr, environment) in &memberships {
+                        let path = format!(
+                            "preview-{}.toml",
+                            if *environment == 0 { "alpha" } else { "beta" }
+                        );
+                        let manifest = read_written(&writer, &path);
+                        let component = if *pr == 0 { "service-a" } else { "service-b" };
+                        let expected_head = state_machine_pr(*pr, heads[pr]).head_sha;
+                        let pin_matches = matches!(
+                            manifest.components.get(component),
+                            Some(ComponentEntry::Pinned(PinnedEntry { r#ref, digest, .. }))
+                                if r#ref == if *pr == 0 { "pr/3" } else { "pr/7" }
+                                    && digest == &synthetic_digest_for_ref(&expected_head)
+                        );
+                        prop_assert!(pin_matches, "preview pin differs from naive model");
+                    }
+                }
+                Ok(())
+            })?;
+        }
     }
 
     #[test]
