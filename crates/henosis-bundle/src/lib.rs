@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write as _;
@@ -113,6 +114,18 @@ pub enum BundleError {
     },
     #[error("cannot encode bundle identity: {0}")]
     EncodeIdentity(minicbor::encode::Error<std::convert::Infallible>),
+    #[error("esbuild did not resolve imported producer `{specifier}` for component `{component}`")]
+    MissingResolvedProducer {
+        component: String,
+        specifier: String,
+    },
+    #[error("cannot inspect compiled dependency contracts for component `{component}`\n{stderr}")]
+    InspectContracts { component: String, stderr: String },
+    #[error("compiled dependency contracts for component `{component}` are invalid: {source}")]
+    DecodeContracts {
+        component: String,
+        source: serde_json::Error,
+    },
     #[error(
         "error[HENOSIS_BUNDLE_FILE_MANIFEST]: component `{component}` has a non-static files manifest\n  --> {source_path}\n  = help: declare configuration files directly as config.file(\"path\") calls"
     )]
@@ -203,6 +216,15 @@ pub struct ConfigFileEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompiledDependencyManifest {
+    pub component: String,
+    pub revision: String,
+    pub outputs: BTreeMap<String, serde_json::Value>,
+    pub consumed_outputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BundleManifestV1 {
     pub format_version: u32,
     pub module_format: String,
@@ -213,6 +235,7 @@ pub struct BundleManifestV1 {
     pub dependency_lock_hash: Option<String>,
     pub sdk_package_hashes: BTreeMap<String, String>,
     pub declared_capabilities: Vec<String>,
+    pub compiled_dependencies: Vec<CompiledDependencyManifest>,
     pub config_files: Vec<ConfigFileEntry>,
 }
 
@@ -277,6 +300,13 @@ struct OutputInputDeclaration {
     input: String,
     specifier: String,
     output: String,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedCompiledDependency {
+    specifier: String,
+    revision: String,
+    consumed_outputs: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -468,48 +498,14 @@ fn should_visit(entry: &DirEntry) -> bool {
     )
 }
 
-#[derive(Clone, Debug)]
-struct ConfigFileDeclaration {
-    path: String,
-    expected_sha256: Option<String>,
-    line: usize,
-    column: usize,
-}
-
-#[derive(Clone, Debug)]
-struct ResolvedConfigFile {
-    entry: ConfigFileEntry,
-    source: PathBuf,
-}
-
-fn bundle_component(
+fn run_esbuild(
     esbuild: &Path,
     repository: &Path,
-    output_root: &Path,
     component: &ComponentSource,
-    dependency_lock_hash: Option<String>,
-) -> Result<BundleArtifact, BundleError> {
-    let relative_entry = component
-        .entry
-        .strip_prefix(repository)
-        .expect("discovery only returns repository children");
-    let import_path = format!("./{}", relative_entry.to_string_lossy().replace('\\', "/"));
-    let declarations = read_config_file_declarations(component)?;
-    let config_files = resolve_config_files(repository, component, &declarations)?;
-    let derived_inputs = discover_derived_inputs(component)?;
-    let closure_wire = config_files
-        .iter()
-        .map(|file| {
-            serde_json::json!({
-                "path": file.entry.path,
-                "sha256": file.entry.sha256,
-            })
-        })
-        .collect::<Vec<_>>();
-    let entry_source = generated_entry_source(&import_path, &closure_wire, &derived_inputs);
-    let build_dir = tempfile::tempdir().map_err(BundleError::PrepareEsbuild)?;
-    let module_path = build_dir.path().join("module.js");
-    let metafile_path = build_dir.path().join("metafile.json");
+    entry_source: &str,
+    module_path: &Path,
+    metafile_path: &Path,
+) -> Result<(), BundleError> {
     let mut child = Command::new(esbuild)
         .current_dir(repository)
         .env_clear()
@@ -549,8 +545,77 @@ fn bundle_component(
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
     }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct ConfigFileDeclaration {
+    path: String,
+    expected_sha256: Option<String>,
+    line: usize,
+    column: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedConfigFile {
+    entry: ConfigFileEntry,
+    source: PathBuf,
+}
+
+fn bundle_component(
+    esbuild: &Path,
+    repository: &Path,
+    output_root: &Path,
+    component: &ComponentSource,
+    dependency_lock_hash: Option<String>,
+) -> Result<BundleArtifact, BundleError> {
+    let relative_entry = component
+        .entry
+        .strip_prefix(repository)
+        .expect("discovery only returns repository children");
+    let import_path = format!("./{}", relative_entry.to_string_lossy().replace('\\', "/"));
+    let declarations = read_config_file_declarations(component)?;
+    let config_files = resolve_config_files(repository, component, &declarations)?;
+    let derived_inputs = discover_derived_inputs(component)?;
+    let closure_wire = config_files
+        .iter()
+        .map(|file| {
+            serde_json::json!({
+                "path": file.entry.path,
+                "sha256": file.entry.sha256,
+            })
+        })
+        .collect::<Vec<_>>();
+    let build_dir = tempfile::tempdir().map_err(BundleError::PrepareEsbuild)?;
+    let module_path = build_dir.path().join("module.js");
+    let metafile_path = build_dir.path().join("metafile.json");
+    let discovery_entry = generated_entry_source(&import_path, &closure_wire, &derived_inputs, &[]);
+    run_esbuild(
+        esbuild,
+        repository,
+        component,
+        &discovery_entry,
+        &module_path,
+        &metafile_path,
+    )?;
+    let compiled_dependencies =
+        resolve_compiled_dependencies(repository, component, &derived_inputs, &metafile_path)?;
+    let entry_source = generated_entry_source(
+        &import_path,
+        &closure_wire,
+        &derived_inputs,
+        &compiled_dependencies,
+    );
+    run_esbuild(
+        esbuild,
+        repository,
+        component,
+        &entry_source,
+        &module_path,
+        &metafile_path,
+    )?;
     let bytes = fs::read(&module_path).map_err(|source| BundleError::ReadSource {
-        path: module_path,
+        path: module_path.clone(),
         source,
     })?;
     let mut dependencies = read_dependencies(&component.name, repository, &metafile_path)?;
@@ -559,6 +624,7 @@ fn bundle_component(
     dependencies.dedup();
     reject_external_imports(&component.name, &bytes)?;
     let executable_sha256 = sha256(&bytes);
+    let compiled_dependencies = inspect_compiled_dependencies(component, &module_path)?;
     let config_hash = sha256(ESBUILD_CONFIG.as_bytes());
     let manifest = BundleManifestV1 {
         format_version: BUNDLE_FORMAT_VERSION,
@@ -575,6 +641,7 @@ fn bundle_component(
         dependency_lock_hash,
         sdk_package_hashes: BTreeMap::new(),
         declared_capabilities: Vec::new(),
+        compiled_dependencies,
         config_files: config_files.iter().map(|file| file.entry.clone()).collect(),
     };
     let bundle_id = bundle_id(&manifest)?;
@@ -861,18 +928,35 @@ fn generated_entry_source(
     import_path: &str,
     closure_wire: &[serde_json::Value],
     derived_inputs: &[DerivedInputDeclaration],
+    compiled_dependencies: &[ResolvedCompiledDependency],
 ) -> String {
     let mut imports = String::new();
+    let producer_specifiers = derived_inputs
+        .iter()
+        .filter_map(|input| match input {
+            DerivedInputDeclaration::Output(output) => Some(output.specifier.as_str()),
+            DerivedInputDeclaration::Artifact(_) => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let producer_imports = producer_specifiers
+        .into_iter()
+        .enumerate()
+        .map(|(index, specifier)| {
+            let generated = format!("__henosis_producer_{index}");
+            imports.push_str(&format!(
+                "import {generated} from {};\n",
+                serde_json::to_string(specifier).expect("module specifier is JSON encodable")
+            ));
+            (specifier, generated)
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut entries = Vec::with_capacity(derived_inputs.len());
-    for (index, input) in derived_inputs.iter().enumerate() {
+    for input in derived_inputs {
         match input {
             DerivedInputDeclaration::Output(output) => {
-                let generated = format!("__henosis_input_{index}");
-                imports.push_str(&format!(
-                    "import {generated} from {};\n",
-                    serde_json::to_string(&output.specifier)
-                        .expect("module specifier is JSON encodable")
-                ));
+                let generated = producer_imports
+                    .get(output.specifier.as_str())
+                    .expect("every output producer has one generated import");
                 entries.push(format!(
                     "{}: {generated}.outputs.{}",
                     serde_json::to_string(&output.input).expect("input name is JSON encodable"),
@@ -890,11 +974,26 @@ fn generated_entry_source(
             }
         }
     }
+    let contracts = compiled_dependencies
+        .iter()
+        .map(|dependency| {
+            let generated = producer_imports
+                .get(dependency.specifier.as_str())
+                .expect("resolved producer has one generated import");
+            format!(
+                "{{ component: {generated}, revision: {}, consumedOutputs: {} }}",
+                serde_json::to_string(&dependency.revision).expect("revision is JSON encodable"),
+                serde_json::to_string(&dependency.consumed_outputs)
+                    .expect("consumed outputs are JSON encodable"),
+            )
+        })
+        .collect::<Vec<_>>();
     format!(
-        "import componentDefinition from {};\n{imports}import {{ createBundle }} from \"@henosis/core\";\nconst bundle = createBundle(componentDefinition, {}, {{ {} }});\nexport const protocolVersion = bundle.protocolVersion;\nexport const component = bundle.component;\nexport const evaluate = bundle.evaluate;\n",
+        "import componentDefinition from {};\n{imports}import {{ createBundle }} from \"@henosis/core\";\nconst bundle = createBundle(componentDefinition, {}, {{ {} }}, [{}]);\nexport const protocolVersion = bundle.protocolVersion;\nexport const component = bundle.component;\nexport const evaluate = bundle.evaluate;\n",
         serde_json::to_string(import_path).expect("path string is JSON encodable"),
         serde_json::to_string(closure_wire).expect("closure manifest is JSON encodable"),
         entries.join(", "),
+        contracts.join(", "),
     )
 }
 
@@ -1018,7 +1117,135 @@ fn line_column(source: &str, offset: usize) -> (usize, usize) {
 
 #[derive(Deserialize)]
 struct EsbuildMetafile {
-    inputs: BTreeMap<String, serde_json::Value>,
+    inputs: BTreeMap<String, EsbuildInput>,
+}
+
+#[derive(Deserialize)]
+struct EsbuildInput {
+    #[serde(default)]
+    imports: Vec<EsbuildImport>,
+}
+
+#[derive(Deserialize)]
+struct EsbuildImport {
+    path: String,
+    original: Option<String>,
+}
+
+fn resolve_compiled_dependencies(
+    repository: &Path,
+    component: &ComponentSource,
+    derived_inputs: &[DerivedInputDeclaration],
+    metafile_path: &Path,
+) -> Result<Vec<ResolvedCompiledDependency>, BundleError> {
+    let bytes = fs::read(metafile_path).map_err(|source| BundleError::ReadSource {
+        path: metafile_path.to_path_buf(),
+        source,
+    })?;
+    let metafile: EsbuildMetafile =
+        serde_json::from_slice(&bytes).map_err(|source| BundleError::DecodeMetafile {
+            component: component.name.clone(),
+            source,
+        })?;
+    let component_path =
+        component
+            .entry
+            .canonicalize()
+            .map_err(|source| BundleError::ReadSource {
+                path: component.entry.clone(),
+                source,
+            })?;
+    let component_input = metafile
+        .inputs
+        .iter()
+        .find(|(path, _)| resolved_input_path(repository, path).as_deref() == Some(&component_path))
+        .map(|(_, input)| input)
+        .ok_or_else(|| BundleError::MissingResolvedProducer {
+            component: component.name.clone(),
+            specifier: component.entry.display().to_string(),
+        })?;
+    let consumed = derived_inputs
+        .iter()
+        .filter_map(|input| match input {
+            DerivedInputDeclaration::Output(output) => {
+                Some((output.specifier.clone(), output.output.clone()))
+            }
+            DerivedInputDeclaration::Artifact(_) => None,
+        })
+        .fold(
+            BTreeMap::<String, BTreeSet<String>>::new(),
+            |mut grouped, (specifier, output)| {
+                grouped.entry(specifier).or_default().insert(output);
+                grouped
+            },
+        );
+    let mut resolved = Vec::with_capacity(consumed.len());
+    for (specifier, outputs) in consumed {
+        let import = component_input
+            .imports
+            .iter()
+            .find(|import| import.original.as_deref() == Some(specifier.as_str()))
+            .ok_or_else(|| BundleError::MissingResolvedProducer {
+                component: component.name.clone(),
+                specifier: specifier.clone(),
+            })?;
+        let source_path = resolved_input_path(repository, &import.path).ok_or_else(|| {
+            BundleError::MissingResolvedProducer {
+                component: component.name.clone(),
+                specifier: specifier.clone(),
+            }
+        })?;
+        let source = fs::read(&source_path).map_err(|source| BundleError::ReadSource {
+            path: source_path,
+            source,
+        })?;
+        resolved.push(ResolvedCompiledDependency {
+            specifier,
+            revision: sha256(&source),
+            consumed_outputs: outputs.into_iter().collect(),
+        });
+    }
+    Ok(resolved)
+}
+
+fn resolved_input_path(repository: &Path, path: &str) -> Option<PathBuf> {
+    let path = Path::new(path);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repository.join(path)
+    };
+    candidate
+        .is_file()
+        .then(|| candidate.canonicalize().unwrap_or(candidate))
+}
+
+fn inspect_compiled_dependencies(
+    component: &ComponentSource,
+    module_path: &Path,
+) -> Result<Vec<CompiledDependencyManifest>, BundleError> {
+    let module_url = format!("file://{}", module_path.display());
+    let output = Command::new("node")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .args([
+            "--input-type=module",
+            "--eval",
+            "const module = await import(process.argv[1]); process.stdout.write(JSON.stringify(module.component.compiledDependencies ?? []));",
+            &module_url,
+        ])
+        .output()
+        .map_err(BundleError::PrepareEsbuild)?;
+    if !output.status.success() {
+        return Err(BundleError::InspectContracts {
+            component: component.name.clone(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    serde_json::from_slice(&output.stdout).map_err(|source| BundleError::DecodeContracts {
+        component: component.name.clone(),
+        source,
+    })
 }
 
 fn read_dependencies(
@@ -1115,7 +1342,7 @@ fn dependency_lock_hash(repository: &Path) -> Result<Option<String>, BundleError
 fn bundle_id(manifest: &BundleManifestV1) -> Result<String, BundleError> {
     let mut bytes = Vec::new();
     let mut encoder = Encoder::new(&mut bytes);
-    encoder.map(10).map_err(BundleError::EncodeIdentity)?;
+    encoder.map(11).map_err(BundleError::EncodeIdentity)?;
     encoder.u8(0).map_err(BundleError::EncodeIdentity)?;
     encoder
         .u32(manifest.format_version)
@@ -1177,6 +1404,28 @@ fn bundle_id(manifest: &BundleManifestV1) -> Result<String, BundleError> {
             .map_err(BundleError::EncodeIdentity)?;
     }
     encoder.u8(9).map_err(BundleError::EncodeIdentity)?;
+    encoder
+        .array(manifest.compiled_dependencies.len() as u64)
+        .map_err(BundleError::EncodeIdentity)?;
+    for dependency in &manifest.compiled_dependencies {
+        encoder.array(4).map_err(BundleError::EncodeIdentity)?;
+        encoder
+            .str(&dependency.component)
+            .map_err(BundleError::EncodeIdentity)?;
+        encoder
+            .str(&dependency.revision)
+            .map_err(BundleError::EncodeIdentity)?;
+        let outputs =
+            serde_json::to_string(&dependency.outputs).map_err(BundleError::EncodeManifest)?;
+        encoder.str(&outputs).map_err(BundleError::EncodeIdentity)?;
+        encoder
+            .array(dependency.consumed_outputs.len() as u64)
+            .map_err(BundleError::EncodeIdentity)?;
+        for output in &dependency.consumed_outputs {
+            encoder.str(output).map_err(BundleError::EncodeIdentity)?;
+        }
+    }
+    encoder.u8(10).map_err(BundleError::EncodeIdentity)?;
     encoder
         .array(manifest.config_files.len() as u64)
         .map_err(BundleError::EncodeIdentity)?;
@@ -1254,6 +1503,7 @@ mod tests {
             dependency_lock_hash: Some("c".repeat(64)),
             sdk_package_hashes: BTreeMap::new(),
             declared_capabilities: Vec::new(),
+            compiled_dependencies: Vec::new(),
             config_files: Vec::new(),
         };
         assert_eq!(bundle_id(&manifest).unwrap(), bundle_id(&manifest).unwrap());
@@ -1386,14 +1636,74 @@ mod tests {
             inputs.iter().map(derived_input_name).collect::<Vec<_>>(),
             vec!["aApi", "workerAssets", "workerEntry"]
         );
-        let entry_source = generated_entry_source("./src/web.ts", &[], &inputs);
-        assert!(entry_source.contains("\"aApi\": __henosis_input_0.outputs.api"));
+        let entry_source = generated_entry_source("./src/web.ts", &[], &inputs, &[]);
+        assert!(entry_source.contains("\"aApi\": __henosis_producer_0.outputs.api"));
         assert!(entry_source.contains(
             "\"workerEntry\": { source: \"artifact\", kind: \"cloudflare-worker\", path: \"workers/web.ts\" }"
         ));
         assert!(entry_source.contains(
             "\"workerAssets\": { source: \"artifact\", kind: \"static-assets\", path: \"public\" }"
         ));
+    }
+
+    #[test]
+    fn resolved_producer_contracts_are_carried_in_the_content_addressed_manifest() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("src")).unwrap();
+        fs::create_dir_all(repo.path().join("node_modules/@henosis/core")).unwrap();
+        fs::create_dir_all(repo.path().join("node_modules/@henosis/service-a")).unwrap();
+        fs::write(
+            repo.path().join("src/web.ts"),
+            "import { defineComponent } from '@henosis/core';\nimport producer from '@henosis/service-a';\nexport default defineComponent({ name: 'web', outputs: {}, build() { producer.outputs.api.value; return {}; } });",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("node_modules/@henosis/core/package.json"),
+            r#"{"name":"@henosis/core","type":"module","exports":"./index.js"}"#,
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("node_modules/@henosis/core/index.js"),
+            "export function defineComponent(spec) { return spec; } export function createBundle(component, files, inputs, dependencies) { return { protocolVersion: 1, component: { name: component.name, inputs: Object.fromEntries(Object.entries(inputs).map(([name, handle]) => [name, { component: handle.component, output: handle.output, optional: handle.optional }])), outputs: {}, compiledDependencies: dependencies.map(({ component, revision, consumedOutputs }) => ({ component: component.name, revision, consumedOutputs, outputs: Object.fromEntries(Object.entries(component.outputs).map(([name, handle]) => [name, { availability: 'static', optional: handle.optional, schema: handle.schema }])) })) }, evaluate() { return { protocolVersion: 1, status: 'complete', resources: [], outputs: {}, observedOutputs: {}, reads: [] }; } }; }",
+        )
+        .unwrap();
+        fs::write(
+            repo.path()
+                .join("node_modules/@henosis/service-a/package.json"),
+            r#"{"name":"@henosis/service-a","type":"module","exports":"./index.js"}"#,
+        )
+        .unwrap();
+        let producer_source = "const api = { component: 'producer', output: 'api', optional: false, schema: { kind: 'url' }, get value() { return 'https://example.test'; } }; export default { name: 'producer', outputs: { api } };";
+        fs::write(
+            repo.path().join("node_modules/@henosis/service-a/index.js"),
+            producer_source,
+        )
+        .unwrap();
+
+        let set = EsbuildBundler
+            .bundle(&BundleRequest {
+                repository: repo.path().to_path_buf(),
+                output: repo.path().join("bundles"),
+            })
+            .unwrap();
+        let manifest: BundleManifestV1 =
+            serde_json::from_slice(&fs::read(&set.bundles[0].manifest).unwrap()).unwrap();
+
+        assert_eq!(manifest.compiled_dependencies.len(), 1);
+        assert_eq!(manifest.compiled_dependencies[0].component, "producer");
+        assert_eq!(
+            manifest.compiled_dependencies[0].revision,
+            sha256(producer_source.as_bytes())
+        );
+        assert_eq!(manifest.compiled_dependencies[0].consumed_outputs, ["api"]);
+        assert_eq!(
+            manifest.compiled_dependencies[0].outputs["api"],
+            serde_json::json!({
+                "availability": "static",
+                "optional": false,
+                "schema": { "kind": "url" },
+            })
+        );
     }
 
     #[test]
