@@ -41,14 +41,21 @@ static CONFIG_FILE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("configuration file pattern is valid")
 });
-static ARTIFACTS_MANIFEST_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?s)\bartifacts\s*:\s*\[(.*?)\]"#).expect("artifacts manifest pattern is valid")
+static DEFAULT_IMPORT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?m)^\s*import\s+([A-Za-z][A-Za-z0-9]*)\s+from\s+["']([^"']+)["']\s*;?"#)
+        .expect("default import pattern is valid")
 });
-static ARTIFACT_BUILD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"artifact\.(buildWorker|buildAssets)\s*\(\s*["']([A-Za-z][A-Za-z0-9]{0,62})["']\s*,\s*["']([^"']+)["']\s*\)"#,
-    )
-    .expect("artifact build pattern is valid")
+static OUTPUT_REFERENCE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\b([A-Za-z][A-Za-z0-9]*)\.outputs\.([A-Za-z][A-Za-z0-9]{0,62})\b"#)
+        .expect("output reference pattern is valid")
+});
+static WORKER_SOURCE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?s)\bworker\.create\s*\([^,]+,\s*\{.*?\bsource\s*:\s*\{(.*?)\}"#)
+        .expect("worker source pattern is valid")
+});
+static WORKER_SOURCE_FIELD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\b(entry|assets)\s*:\s*["']([^"']+)["']"#)
+        .expect("worker source field pattern is valid")
 });
 
 #[derive(Debug, thiserror::Error)]
@@ -147,9 +154,9 @@ pub enum BundleError {
         column: usize,
     },
     #[error(
-        "error[HENOSIS_ARTIFACT_MANIFEST]: component `{component}` has a non-static artifacts manifest\n  --> {source_path}\n  = help: declare artifacts directly as artifact.buildWorker(input, path) or artifact.buildAssets(input, path) calls"
+        "error[HENOSIS_WORKER_SOURCE]: component `{component}` has a non-static Worker source\n  --> {source_path}\n  = help: write source: {{ entry: \"workers/name.ts\" }} with an optional static assets path"
     )]
-    InvalidArtifactManifest {
+    InvalidWorkerSource {
         component: String,
         source_path: PathBuf,
     },
@@ -263,6 +270,19 @@ struct ArtifactBuildDeclaration {
     source_path: PathBuf,
     line: usize,
     column: usize,
+}
+
+#[derive(Clone, Debug)]
+struct OutputInputDeclaration {
+    input: String,
+    specifier: String,
+    output: String,
+}
+
+#[derive(Clone, Debug)]
+enum DerivedInputDeclaration {
+    Output(OutputInputDeclaration),
+    Artifact(ArtifactBuildDeclaration),
 }
 
 #[derive(Clone, Debug)]
@@ -476,6 +496,7 @@ fn bundle_component(
     let import_path = format!("./{}", relative_entry.to_string_lossy().replace('\\', "/"));
     let declarations = read_config_file_declarations(component)?;
     let config_files = resolve_config_files(repository, component, &declarations)?;
+    let derived_inputs = discover_derived_inputs(component)?;
     let closure_wire = config_files
         .iter()
         .map(|file| {
@@ -485,11 +506,7 @@ fn bundle_component(
             })
         })
         .collect::<Vec<_>>();
-    let entry_source = format!(
-        "import componentDefinition from {};\nimport {{ createBundle }} from \"@henosis/core\";\nconst bundle = createBundle(componentDefinition, {});\nexport const protocolVersion = bundle.protocolVersion;\nexport const component = bundle.component;\nexport const evaluate = bundle.evaluate;\n",
-        serde_json::to_string(&import_path).expect("path string is JSON encodable"),
-        serde_json::to_string(&closure_wire).expect("closure manifest is JSON encodable")
-    );
+    let entry_source = generated_entry_source(&import_path, &closure_wire, &derived_inputs);
     let build_dir = tempfile::tempdir().map_err(BundleError::PrepareEsbuild)?;
     let module_path = build_dir.path().join("module.js");
     let metafile_path = build_dir.path().join("metafile.json");
@@ -737,25 +754,62 @@ fn discover_artifact_builds(
 ) -> Result<Vec<ArtifactBuildDeclaration>, BundleError> {
     let mut declarations = Vec::new();
     for component in discover_components(repository)? {
-        let source =
-            fs::read_to_string(&component.entry).map_err(|source| BundleError::ReadSource {
-                path: component.entry.clone(),
-                source,
-            })?;
-        let Some(manifest) = ARTIFACTS_MANIFEST_PATTERN.captures(&source) else {
+        declarations.extend(
+            discover_derived_inputs(&component)?
+                .into_iter()
+                .filter_map(|input| match input {
+                    DerivedInputDeclaration::Artifact(declaration) => Some(declaration),
+                    DerivedInputDeclaration::Output(_) => None,
+                }),
+        );
+    }
+    Ok(declarations)
+}
+
+fn discover_derived_inputs(
+    component: &ComponentSource,
+) -> Result<Vec<DerivedInputDeclaration>, BundleError> {
+    let source =
+        fs::read_to_string(&component.entry).map_err(|source| BundleError::ReadSource {
+            path: component.entry.clone(),
+            source,
+        })?;
+    let imports = DEFAULT_IMPORT_PATTERN
+        .captures_iter(&source)
+        .map(|captures| (captures[1].to_owned(), captures[2].to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    let mut used_names = BTreeMap::<String, usize>::new();
+    let mut outputs = BTreeMap::<(String, String), OutputInputDeclaration>::new();
+    for captures in OUTPUT_REFERENCE_PATTERN.captures_iter(&source) {
+        let alias = captures[1].to_owned();
+        let output = captures[2].to_owned();
+        let Some(specifier) = imports.get(&alias) else {
             continue;
         };
-        let contents = manifest.get(1).expect("artifacts capture exists");
-        let mut consumed = String::with_capacity(contents.as_str().len());
-        let mut cursor = 0;
-        for captures in ARTIFACT_BUILD_PATTERN.captures_iter(contents.as_str()) {
-            let full = captures.get(0).expect("artifact build capture exists");
-            consumed.push_str(&contents.as_str()[cursor..full.start()]);
-            consumed.push_str(&" ".repeat(full.len()));
-            cursor = full.end();
+        let key = (specifier.clone(), output.clone());
+        outputs
+            .entry(key)
+            .or_insert_with(|| OutputInputDeclaration {
+                input: unique_input_name(
+                    &format!("{alias}{}", capitalize(&output)),
+                    &mut used_names,
+                ),
+                specifier: specifier.clone(),
+                output,
+            });
+    }
+
+    let mut artifacts = Vec::new();
+    for worker_source in WORKER_SOURCE_PATTERN.captures_iter(&source) {
+        let contents = worker_source.get(1).expect("worker source capture exists");
+        let mut found = 0;
+        for captures in WORKER_SOURCE_FIELD_PATTERN.captures_iter(contents.as_str()) {
+            found += 1;
+            let field = &captures[1];
+            let path = captures[2].to_owned();
+            let full = captures.get(0).expect("worker source field capture exists");
             let offset = contents.start() + full.start();
             let (line, column) = line_column(&source, offset);
-            let path = captures[3].to_owned();
             if !valid_repository_path(&path) {
                 return Err(BundleError::InvalidNativePath {
                     component: component.name.clone(),
@@ -765,13 +819,20 @@ fn discover_artifact_builds(
                     column,
                 });
             }
-            declarations.push(ArtifactBuildDeclaration {
+            artifacts.push(ArtifactBuildDeclaration {
                 component: component.name.clone(),
-                input: captures[2].to_owned(),
-                kind: match &captures[1] {
-                    "buildWorker" => WorkloadArtifactKind::CloudflareWorker,
-                    "buildAssets" => WorkloadArtifactKind::StaticAssets,
-                    _ => unreachable!("regex limits artifact build kind"),
+                input: unique_input_name(
+                    if field == "entry" {
+                        "workerEntry"
+                    } else {
+                        "workerAssets"
+                    },
+                    &mut used_names,
+                ),
+                kind: if field == "entry" {
+                    WorkloadArtifactKind::CloudflareWorker
+                } else {
+                    WorkloadArtifactKind::StaticAssets
                 },
                 path,
                 source_path: component.entry.clone(),
@@ -779,18 +840,87 @@ fn discover_artifact_builds(
                 column,
             });
         }
-        consumed.push_str(&contents.as_str()[cursor..]);
-        if consumed
-            .chars()
-            .any(|character| !character.is_whitespace() && character != ',')
-        {
-            return Err(BundleError::InvalidArtifactManifest {
-                component: component.name,
-                source_path: component.entry,
+        if found == 0 {
+            return Err(BundleError::InvalidWorkerSource {
+                component: component.name.clone(),
+                source_path: component.entry.clone(),
             });
         }
     }
-    Ok(declarations)
+
+    let mut derived = outputs
+        .into_values()
+        .map(DerivedInputDeclaration::Output)
+        .chain(artifacts.into_iter().map(DerivedInputDeclaration::Artifact))
+        .collect::<Vec<_>>();
+    derived.sort_by(|left, right| derived_input_name(left).cmp(derived_input_name(right)));
+    Ok(derived)
+}
+
+fn generated_entry_source(
+    import_path: &str,
+    closure_wire: &[serde_json::Value],
+    derived_inputs: &[DerivedInputDeclaration],
+) -> String {
+    let mut imports = String::new();
+    let mut entries = Vec::with_capacity(derived_inputs.len());
+    for (index, input) in derived_inputs.iter().enumerate() {
+        match input {
+            DerivedInputDeclaration::Output(output) => {
+                let generated = format!("__henosis_input_{index}");
+                imports.push_str(&format!(
+                    "import {generated} from {};\n",
+                    serde_json::to_string(&output.specifier)
+                        .expect("module specifier is JSON encodable")
+                ));
+                entries.push(format!(
+                    "{}: {generated}.outputs.{}",
+                    serde_json::to_string(&output.input).expect("input name is JSON encodable"),
+                    output.output,
+                ));
+            }
+            DerivedInputDeclaration::Artifact(artifact) => {
+                entries.push(format!(
+                    "{}: {{ source: \"artifact\", kind: {}, path: {} }}",
+                    serde_json::to_string(&artifact.input).expect("input name is JSON encodable"),
+                    serde_json::to_string(artifact.kind.as_str())
+                        .expect("artifact kind is JSON encodable"),
+                    serde_json::to_string(&artifact.path).expect("artifact path is JSON encodable"),
+                ));
+            }
+        }
+    }
+    format!(
+        "import componentDefinition from {};\n{imports}import {{ createBundle }} from \"@henosis/core\";\nconst bundle = createBundle(componentDefinition, {}, {{ {} }});\nexport const protocolVersion = bundle.protocolVersion;\nexport const component = bundle.component;\nexport const evaluate = bundle.evaluate;\n",
+        serde_json::to_string(import_path).expect("path string is JSON encodable"),
+        serde_json::to_string(closure_wire).expect("closure manifest is JSON encodable"),
+        entries.join(", "),
+    )
+}
+
+fn derived_input_name(input: &DerivedInputDeclaration) -> &str {
+    match input {
+        DerivedInputDeclaration::Output(output) => &output.input,
+        DerivedInputDeclaration::Artifact(artifact) => &artifact.input,
+    }
+}
+
+fn unique_input_name(base: &str, used: &mut BTreeMap<String, usize>) -> String {
+    let count = used.entry(base.to_owned()).or_default();
+    *count += 1;
+    if *count == 1 {
+        base.to_owned()
+    } else {
+        format!("{base}{count}")
+    }
+}
+
+fn capitalize(value: &str) -> String {
+    let mut characters = value.chars();
+    match characters.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + characters.as_str(),
+        None => String::new(),
+    }
 }
 
 fn build_worker_artifact(
@@ -1237,14 +1367,49 @@ mod tests {
     }
 
     #[test]
+    fn imported_outputs_and_worker_sources_become_hidden_bundle_inputs() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("src")).unwrap();
+        let entry = repo.path().join("src/web.ts");
+        fs::write(
+            &entry,
+            "import a from '@henosis/service-a'; import { worker } from '@henosis/platform-cloudflare'; export default defineComponent({ name: 'web', outputs: {}, build(ctx) { ctx.emit(worker.create('web', { source: { entry: 'workers/web.ts', assets: 'public' }, vars: { BACKEND_URL: a.outputs.api.value } })); return {}; } });",
+        )
+        .unwrap();
+        let component = ComponentSource {
+            name: "web".to_owned(),
+            entry,
+        };
+
+        let inputs = discover_derived_inputs(&component).unwrap();
+        assert_eq!(
+            inputs.iter().map(derived_input_name).collect::<Vec<_>>(),
+            vec!["aApi", "workerAssets", "workerEntry"]
+        );
+        let entry_source = generated_entry_source("./src/web.ts", &[], &inputs);
+        assert!(entry_source.contains("\"aApi\": __henosis_input_0.outputs.api"));
+        assert!(entry_source.contains(
+            "\"workerEntry\": { source: \"artifact\", kind: \"cloudflare-worker\", path: \"workers/web.ts\" }"
+        ));
+        assert!(entry_source.contains(
+            "\"workerAssets\": { source: \"artifact\", kind: \"static-assets\", path: \"public\" }"
+        ));
+    }
+
+    #[test]
     fn worker_rebuild_changes_binding_without_changing_config_bundle_identity() {
         let repo = tempfile::tempdir().unwrap();
         fs::create_dir_all(repo.path().join("src")).unwrap();
         fs::create_dir_all(repo.path().join("workers")).unwrap();
         fs::create_dir_all(repo.path().join("node_modules/@henosis/core")).unwrap();
+        fs::create_dir_all(
+            repo.path()
+                .join("node_modules/@henosis/platform-cloudflare"),
+        )
+        .unwrap();
         fs::write(
             repo.path().join("src/web.ts"),
-            "import { artifact, defineComponent } from '@henosis/core'; export default defineComponent({ name: 'web', artifacts: [artifact.buildWorker('workerArtifact', 'workers/web.ts')], inputs: {}, outputs: {}, build() { return {}; } });",
+            "import { defineComponent } from '@henosis/core'; import { worker } from '@henosis/platform-cloudflare'; export default defineComponent({ name: 'web', outputs: {}, build(ctx) { ctx.emit(worker.create('web', { source: { entry: 'workers/web.ts' } })); return {}; } });",
         )
         .unwrap();
         fs::write(
@@ -1254,7 +1419,18 @@ mod tests {
         .unwrap();
         fs::write(
             repo.path().join("node_modules/@henosis/core/index.js"),
-            "export const artifact = { buildWorker(input, path) { return { input, path }; } }; export function defineComponent(spec) { return spec; } export function createBundle(component) { return { protocolVersion: 1, component: { name: component.name, inputs: {}, outputs: {} }, evaluate() { return { protocolVersion: 1, status: 'complete', resources: [], outputs: {}, observedOutputs: {}, reads: [] }; } }; }",
+            "export function defineComponent(spec) { return spec; } export function createBundle(component) { return { protocolVersion: 1, component: { name: component.name, inputs: {}, outputs: {} }, evaluate() { return { protocolVersion: 1, status: 'complete', resources: [], outputs: {}, observedOutputs: {}, reads: [] }; } }; }",
+        )
+        .unwrap();
+        fs::write(
+            repo.path()
+                .join("node_modules/@henosis/platform-cloudflare/package.json"),
+            r#"{"name":"@henosis/platform-cloudflare","type":"module","exports":"./index.js"}"#,
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("node_modules/@henosis/platform-cloudflare/index.js"),
+            "export const worker = { create(name, body) { return { kind: 'cloudflare/worker@1', name, body, outputs: {}, configFiles: [] }; } };",
         )
         .unwrap();
         fs::write(
@@ -1290,6 +1466,6 @@ mod tests {
             second_bundle.bundles[0].bundle_id
         );
         assert_ne!(first_artifact[0].digest, second_artifact[0].digest);
-        assert_eq!(first_artifact[0].input, "workerArtifact");
+        assert_eq!(first_artifact[0].input, "workerEntry");
     }
 }
