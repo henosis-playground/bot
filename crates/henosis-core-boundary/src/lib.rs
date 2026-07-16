@@ -147,7 +147,7 @@ impl GraphStatus {
 pub enum CoreBoundaryError {
     #[error("graph `{0}` does not exist")]
     GraphNotFound(String),
-    #[error("core boundary rejected graph intent: {0}")]
+    #[error("{0}")]
     Rejected(String),
     #[error("cannot reach core GraphService: {0}")]
     Transport(String),
