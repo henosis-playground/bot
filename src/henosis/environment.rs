@@ -1710,14 +1710,22 @@ mod tests {
                 3,
                 "service-a",
                 "pr/3",
-                if revision.is_multiple_of(2) { "a-pr" } else { "a-pr-2" },
+                if revision.is_multiple_of(2) {
+                    "a-pr"
+                } else {
+                    "a-pr-2"
+                },
             ),
             _ => PreviewPullRequest::new(
                 "henosis-playground/service-b",
                 7,
                 "service-b",
                 "pr/7",
-                if revision.is_multiple_of(2) { "b-pr" } else { "b-pr-2" },
+                if revision.is_multiple_of(2) {
+                    "b-pr"
+                } else {
+                    "b-pr-2"
+                },
             ),
         }
     }
