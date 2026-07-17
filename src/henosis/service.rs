@@ -404,11 +404,7 @@ async fn install_checkout_dependencies(checkout: &Path) -> anyhow::Result<()> {
         if target.exists() {
             continue;
         }
-        let reference = if dependency == "platform" {
-            "d26-sdk"
-        } else {
-            "main"
-        };
+        let reference = "main";
         checkout_repository_into(
             &format!("henosis-playground/{dependency}"),
             reference,
