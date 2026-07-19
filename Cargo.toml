@@ -52,7 +52,8 @@ http = "1"
 askama = "0.16"
 
 # Henosis boundaries
-henosis-app = { path = "../core/crates/henosis-app" }
+henosis-app = { git = "https://github.com/henosis-playground/core.git", rev = "b3d918621e6b7757814c4ae76e4abfa659e5ed74" }
+henosis-types = { git = "https://github.com/henosis-playground/core.git", rev = "b3d918621e6b7757814c4ae76e4abfa659e5ed74" }
 henosis-artifacts = { path = "crates/henosis-artifacts" }
 henosis-core-boundary = { path = "crates/henosis-core-boundary" }
 newtype-uuid = { git = "https://github.com/henosis-playground/newtype-uuid.git", features = ["v4", "v7"] }

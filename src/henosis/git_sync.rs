@@ -7,6 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::{Arc, LazyLock};
 
+use henosis_types::{
+    BundleRef, ComponentName, ContentDigest, Generation, GraphId, InputName, NativeValue,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
@@ -261,26 +264,29 @@ where
                 continue;
             }
             let bundles = pins_from_file(intent)?;
+            let graph = parse_graph_id(&intent.graph)?;
             let status = if intent.generation == 0 {
                 self.core
                     .apply(GraphIntent::Create {
-                        graph: intent.graph.clone(),
+                        graph,
                         bundles,
                         source_policy: GraphSourcePolicy::AcceptLocal,
                     })
                     .await?
             } else {
-                match self.core.status(&intent.graph).await {
+                match self.core.status(graph).await {
                     Ok(status)
-                        if status.generation == intent.generation && status.bundles == bundles =>
+                        if status.generation.ordinal() == intent.generation
+                            && status.bundles == bundles =>
                     {
                         continue;
                     }
                     Ok(_) => {
                         self.core
                             .apply(GraphIntent::Update {
-                                graph: intent.graph.clone(),
-                                expected_generation: intent.generation,
+                                graph,
+                                expected_generation: Generation::new(intent.generation)
+                                    .map_err(|error| GitSyncError::Decode(error.to_string()))?,
                                 bundles,
                             })
                             .await?
@@ -288,7 +294,7 @@ where
                     Err(CoreBoundaryError::GraphNotFound(_)) => {
                         self.core
                             .apply(GraphIntent::Create {
-                                graph: intent.graph.clone(),
+                                graph,
                                 bundles,
                                 source_policy: GraphSourcePolicy::AcceptLocal,
                             })
@@ -314,7 +320,7 @@ where
             .list(false)
             .await?
             .into_iter()
-            .map(|summary| summary.graph)
+            .map(|summary| summary.graph.to_string())
             .collect::<BTreeSet<_>>();
         let orphaned = self
             .owned_graphs
@@ -323,7 +329,11 @@ where
             .cloned()
             .collect::<Vec<_>>();
         for graph in orphaned {
-            self.core.apply(GraphIntent::Retire { graph }).await?;
+            self.core
+                .apply(GraphIntent::Retire {
+                    graph: parse_graph_id(&graph)?,
+                })
+                .await?;
             changes += 1;
         }
 
@@ -391,6 +401,12 @@ async fn find_graph<R: GraphFileRepository>(
     Ok(None)
 }
 
+fn parse_graph_id(value: &str) -> Result<GraphId, GitSyncError> {
+    value
+        .parse()
+        .map_err(|error| GitSyncError::Decode(format!("invalid graph identity {value:?}: {error}")))
+}
+
 pub fn graph_path(graph: &str) -> String {
     format!("{GRAPH_DIRECTORY}/{graph}.toml")
 }
@@ -403,35 +419,23 @@ fn graph_from_path(path: &str) -> Option<String> {
 }
 
 fn acknowledge(intent: &mut GraphIntentFile, status: &GraphStatus) -> Result<(), GitSyncError> {
-    if status.graph != intent.graph {
+    if status.graph.to_string() != intent.graph {
         return Err(GitSyncError::Core(format!(
             "core returned status for {}, expected {}",
             status.graph, intent.graph
         )));
     }
-    if status.generation == 0 {
-        return Err(GitSyncError::Core(format!(
-            "core returned generation zero for {}",
-            intent.graph
-        )));
-    }
-    intent.generation = status.generation;
+    intent.generation = status.generation.ordinal();
     intent.components = components_from_pins(&status.bundles)?;
     Ok(())
 }
 
 fn file_from_status(name: String, status: &GraphStatus) -> Result<GraphIntentFile, GitSyncError> {
-    if status.generation == 0 {
-        return Err(GitSyncError::Core(format!(
-            "cannot publish unaccepted graph {}",
-            status.graph
-        )));
-    }
     Ok(GraphIntentFile {
         schema: 1,
-        graph: status.graph.clone(),
+        graph: status.graph.to_string(),
         name,
-        generation: status.generation,
+        generation: status.generation.ordinal(),
         components: components_from_pins(&status.bundles)?,
     })
 }
@@ -457,12 +461,31 @@ fn pins_from_file(intent: &GraphIntentFile) -> Result<Vec<BundlePin>, GitSyncErr
                             intent.graph, component.name, binding.name
                         ))
                     })?;
-                    Ok((binding.name.clone(), value))
+                    Ok((
+                        InputName::new(binding.name.clone())
+                            .map_err(|error| GitSyncError::Decode(error.to_string()))?,
+                        NativeValue::new(value)
+                            .map_err(|error| GitSyncError::Decode(error.to_string()))?,
+                    ))
                 })
                 .collect::<Result<_, GitSyncError>>()?;
+            let digest: [u8; 32] =
+                component
+                    .bundle_digest
+                    .clone()
+                    .try_into()
+                    .map_err(|bytes: Vec<u8>| {
+                        GitSyncError::Decode(format!(
+                            "graph {} component {} bundleDigest must contain 32 bytes, got {}",
+                            intent.graph,
+                            component.name,
+                            bytes.len()
+                        ))
+                    })?;
             Ok(BundlePin {
-                component: component.name.clone(),
-                bundle_id: hex::encode(&component.bundle_digest),
+                component: ComponentName::new(component.name.clone())
+                    .map_err(|error| GitSyncError::Decode(error.to_string()))?,
+                bundle: BundleRef::new(ContentDigest::from_bytes(digest)),
                 input_bindings,
                 source: component.source.clone().map(SourceProvenance::from),
             })
@@ -473,26 +496,21 @@ fn pins_from_file(intent: &GraphIntentFile) -> Result<Vec<BundlePin>, GitSyncErr
 fn components_from_pins(pins: &[BundlePin]) -> Result<Vec<GraphComponentFile>, GitSyncError> {
     pins.iter()
         .map(|pin| {
-            let bundle_digest = hex::decode(&pin.bundle_id).map_err(|error| {
-                GitSyncError::Core(format!(
-                    "bundle {} has invalid hexadecimal identity: {error}",
-                    pin.bundle_id
-                ))
-            })?;
+            let bundle_digest = pin.bundle.digest().as_bytes().to_vec();
             let input_bindings = pin
                 .input_bindings
                 .iter()
                 .map(|(name, value)| {
-                    serde_json::to_vec(value)
+                    serde_json::to_vec(value.as_json())
                         .map(|value_json| InputBindingFile {
-                            name: name.clone(),
+                            name: name.as_str().to_owned(),
                             value_json,
                         })
                         .map_err(|error| GitSyncError::Core(error.to_string()))
                 })
                 .collect::<Result<_, _>>()?;
             Ok(GraphComponentFile {
-                name: pin.component.clone(),
+                name: pin.component.to_string(),
                 bundle_digest,
                 input_bindings,
                 source: pin.source.clone().map(SourceFile::from),
@@ -734,13 +752,14 @@ mod tests {
         assert_eq!(frontend.sync_from_main().await.unwrap(), 0);
 
         let mut edited = frontend.repository.read(graph);
-        edited.components[0].bundle_digest = vec![2];
+        edited.components[0].bundle_digest = vec![2; 32];
         frontend.repository.edit(graph, Some(&edited));
         assert_eq!(frontend.sync_from_main().await.unwrap(), 1);
         assert!(matches!(
             core.intents().await.last(),
-            Some(GraphIntent::Update { expected_generation: 1, bundles, .. })
-                if bundles[0].bundle_id == "02"
+            Some(GraphIntent::Update { expected_generation, bundles, .. })
+                if *expected_generation == Generation::new(1).unwrap()
+                    && bundles[0].bundle.digest() == ContentDigest::from_bytes([2; 32])
         ));
 
         frontend.repository.edit(graph, None);
@@ -749,7 +768,7 @@ mod tests {
         assert_eq!(restarted_frontend.sync_from_main().await.unwrap(), 1);
         assert!(matches!(
             core.intents().await.last(),
-            Some(GraphIntent::Retire { graph: retired }) if retired == graph
+            Some(GraphIntent::Retire { graph: retired }) if retired.to_string() == graph
         ));
     }
 
@@ -758,16 +777,19 @@ mod tests {
         let repository = BareRepository::new();
         let core = FakeCoreBoundary::default();
         let mut frontend = GitSyncFrontend::new(repository, core);
-        let mut status = GraphStatus::planning("graph_01k00000000000000000000001", 4);
+        let mut status = GraphStatus::planning(
+            graph_id("graph_01k00000000000000000000001"),
+            Generation::new(4).unwrap(),
+        );
         status.phase = GraphPhase::Ready;
         status.bundles = vec![pin(7)];
 
         frontend.publish_graph("dev", &status).await.unwrap();
 
-        let file = frontend.repository.read(&status.graph);
+        let file = frontend.repository.read(&status.graph.to_string());
         assert_eq!(file.name, "dev");
         assert_eq!(file.generation, 4);
-        assert_eq!(file.components[0].bundle_digest, vec![7]);
+        assert_eq!(file.components[0].bundle_digest, vec![7; 32]);
     }
 
     #[tokio::test]
@@ -779,10 +801,10 @@ mod tests {
         let mut frontend = GitSyncFrontend::new(repository, core.clone());
         frontend.sync_from_main().await.unwrap();
 
-        let status = core.status(graph).await.unwrap();
+        let status = core.status(graph_id(graph)).await.unwrap();
         let advanced = core
             .apply(GraphIntent::Update {
-                graph: graph.to_string(),
+                graph: graph_id(graph),
                 expected_generation: status.generation,
                 bundles: vec![pin(9)],
             })
@@ -793,7 +815,7 @@ mod tests {
         assert_eq!(frontend.repository.read(graph).generation, 2);
         assert_eq!(
             frontend.repository.read(graph).components[0].bundle_digest,
-            vec![9]
+            vec![9; 32]
         );
     }
 
@@ -861,10 +883,10 @@ mod tests {
                             expected_pin = Some(digest);
                         }
                         GitFrontendTransition::CoreStatus(digest) if expected_pin.is_some() && !retired => {
-                            let status = core.status(graph).await.unwrap();
+                            let status = core.status(graph_id(graph)).await.unwrap();
                             let status = core
                                 .apply(GraphIntent::Update {
-                                    graph: graph.to_string(),
+                                    graph: graph_id(graph),
                                     expected_generation: status.generation,
                                     bundles: vec![pin(digest)],
                                 })
@@ -894,15 +916,18 @@ mod tests {
                         .await
                         .unwrap()
                         .into_iter()
-                        .map(|summary| summary.graph)
+                        .map(|summary| summary.graph.to_string())
                         .collect::<BTreeSet<_>>();
                     prop_assert_eq!(live.contains(graph), expected_pin.is_some());
                     match expected_pin {
                         Some(digest) => {
                             let file = frontend.repository.read(graph);
-                            prop_assert_eq!(file.components[0].bundle_digest.clone(), vec![digest]);
-                            let status = core.status(graph).await.unwrap();
-                            prop_assert_eq!(status.bundles[0].bundle_id.clone(), format!("{digest:02x}"));
+                            prop_assert_eq!(file.components[0].bundle_digest.clone(), vec![digest; 32]);
+                            let status = core.status(graph_id(graph)).await.unwrap();
+                            prop_assert_eq!(
+                                status.bundles[0].bundle.digest(),
+                                ContentDigest::from_bytes([digest; 32])
+                            );
                         }
                         None => {
                             prop_assert!(!frontend
@@ -927,7 +952,7 @@ mod tests {
             generation,
             components: vec![GraphComponentFile {
                 name: "api".to_string(),
-                bundle_digest: vec![digest],
+                bundle_digest: vec![digest; 32],
                 input_bindings: Vec::new(),
                 source: None,
             }],
@@ -936,11 +961,15 @@ mod tests {
 
     fn pin(digest: u8) -> BundlePin {
         BundlePin {
-            component: "api".to_string(),
-            bundle_id: format!("{digest:02x}"),
+            component: ComponentName::new("api").unwrap(),
+            bundle: BundleRef::new(ContentDigest::from_bytes([digest; 32])),
             input_bindings: BTreeMap::new(),
             source: None,
         }
+    }
+
+    fn graph_id(value: &str) -> GraphId {
+        value.parse().unwrap()
     }
 
     fn configure(path: &Path) {

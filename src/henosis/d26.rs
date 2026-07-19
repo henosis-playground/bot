@@ -4,6 +4,7 @@ use henosis_app::{
     ApplyGraph, ArtifactService, Bundler, CheckoutService, GraphOperation, GraphSourcePolicy,
     GraphStatus, SourceRequest,
 };
+use henosis_types::GraphId;
 
 use crate::henosis::core_client::{CoreBoundary, CoreBoundaryError, GraphPhase};
 use crate::henosis::status::{STATUS_END, STATUS_START};
@@ -55,7 +56,12 @@ where
         Ok(self
             .operation
             .apply(ApplyGraph {
-                graph: request.environment.clone(),
+                graph: request.environment.parse::<GraphId>().map_err(|error| {
+                    CoreBoundaryError::Rejected(format!(
+                        "invalid preview graph {:?}: {error}",
+                        request.environment
+                    ))
+                })?,
                 sources: vec![SourceRequest {
                     repository: request.repository.clone(),
                     revision: Some(request.revision.clone()),
@@ -71,7 +77,10 @@ where
     }
 
     pub async fn p_minus(&self, environment: &str) -> Result<GraphStatus, PreviewError> {
-        self.operation.retire(environment).await.map_err(Into::into)
+        let graph = environment.parse::<GraphId>().map_err(|error| {
+            CoreBoundaryError::Rejected(format!("invalid preview graph {environment:?}: {error}"))
+        })?;
+        self.operation.retire(graph).await.map_err(Into::into)
     }
 
     pub async fn status_section(
@@ -79,6 +88,9 @@ where
         environment_name: &str,
         graph: &str,
     ) -> Result<String, PreviewError> {
+        let graph = graph.parse::<GraphId>().map_err(|error| {
+            CoreBoundaryError::Rejected(format!("invalid preview graph {graph:?}: {error}"))
+        })?;
         let status = CoreBoundary::status(&self.core, graph).await?;
         Ok(render_core_status(environment_name, &status))
     }
@@ -199,18 +211,23 @@ mod tests {
             checkout: Path::new("/checkout/web").to_path_buf(),
             revision: "deadbeef".to_string(),
             reference: Some("refs/pull/42/head".to_string()),
-            environment: "preview_01k00000000000000000000000".to_string(),
+            environment: "graph_01k00000000000000000000000".to_string(),
         };
 
         let accepted = workflow.p_plus(&request).await.unwrap();
-        assert_eq!(accepted.generation, 1);
+        assert_eq!(
+            accepted.generation,
+            henosis_types::Generation::new(1).unwrap()
+        );
         assert_eq!(
             core.intents().await,
             vec![GraphIntent::Create {
-                graph: request.environment.clone(),
+                graph: request.environment.parse().unwrap(),
                 bundles: vec![henosis_app::BundlePin {
-                    component: "web".to_string(),
-                    bundle_id: "a".repeat(64),
+                    component: henosis_types::ComponentName::new("web").unwrap(),
+                    bundle: henosis_types::BundleRef::new(
+                        henosis_types::ContentDigest::from_bytes([0xaa; 32]),
+                    ),
                     input_bindings: std::collections::BTreeMap::new(),
                     source: Some(SourceProvenance::Vcs {
                         repository: request.repository.clone(),
@@ -232,7 +249,7 @@ mod tests {
 
 | | |
 |---|---|
-| Environment | **shared-demo** (`preview_01k00000000000000000000000`) |
+| Environment | **shared-demo** (`graph_01k00000000000000000000000`) |
 | Plan | generation 1 · 0 resource(s) |
 | Blocked on | none |
 | Observed ready | 0 |

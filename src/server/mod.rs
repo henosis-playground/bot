@@ -189,7 +189,7 @@ async fn graph_generation_handler(
     State(ServerStateRef(state)): State<ServerStateRef>,
 ) -> Response {
     match current_graph_status(&state, &environment_id).await {
-        Ok(status) if status.generation == generation => {
+        Ok(status) if status.generation.ordinal() == generation => {
             let name = current_environment_name(&state, &environment_id)
                 .await
                 .unwrap_or_else(|| "unnamed".to_string());
@@ -205,7 +205,7 @@ async fn graph_generation_json_handler(
     State(ServerStateRef(state)): State<ServerStateRef>,
 ) -> Response {
     match current_graph_status(&state, &environment_id).await {
-        Ok(status) if status.generation == generation => Json(status).into_response(),
+        Ok(status) if status.generation.ordinal() == generation => Json(status).into_response(),
         Ok(_) | Err(StatusCode::NOT_FOUND) => StatusCode::NOT_FOUND.into_response(),
         Err(status) => status.into_response(),
     }
@@ -223,8 +223,11 @@ async fn current_graph_status(
     else {
         return Err(StatusCode::NOT_FOUND);
     };
+    let graph = environment_id
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     let core = crate::henosis::core_client::ConnectCoreBoundary::new(&core_api.endpoint);
-    match crate::henosis::core_client::CoreBoundary::status(&core, environment_id).await {
+    match crate::henosis::core_client::CoreBoundary::status(&core, graph).await {
         Ok(status) => Ok(status),
         Err(crate::henosis::core_client::CoreBoundaryError::GraphNotFound(_)) => {
             Err(StatusCode::NOT_FOUND)
@@ -256,9 +259,9 @@ fn render_d26_graph_page(
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Henosis environment {} ({})</title></head><body><h1>Henosis environment {} (<code>{}</code>)</h1><pre>{}</pre></body></html>",
         escape_html(environment_name),
-        escape_html(&status.graph),
+        escape_html(&status.graph.to_string()),
         escape_html(environment_name),
-        escape_html(&status.graph),
+        escape_html(&status.graph.to_string()),
         escape_html(&json),
     )
 }

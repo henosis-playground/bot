@@ -8,8 +8,9 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 buffa = "0.8.1"
 connectrpc = { version = "0.8.1", features = ["client"] }
-henosis-app = { path = "../../../core/crates/henosis-app" }
-henosis-proto = { path = "../../../core/crates/proto" }
+henosis-app = { git = "https://github.com/henosis-playground/core.git", rev = "b3d918621e6b7757814c4ae76e4abfa659e5ed74" }
+henosis-proto = { git = "https://github.com/henosis-playground/core.git", rev = "b3d918621e6b7757814c4ae76e4abfa659e5ed74" }
+henosis-types = { git = "https://github.com/henosis-playground/core.git", rev = "b3d918621e6b7757814c4ae76e4abfa659e5ed74" }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

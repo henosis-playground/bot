@@ -426,6 +426,7 @@ dependencies = [
  "henosis-app",
  "henosis-artifacts",
  "henosis-core-boundary",
+ "henosis-types",
  "hex",
  "hmac 0.13.0",
  "http",
@@ -1459,6 +1460,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 [[package]]
 name = "henosis-app"
 version = "0.0.0"
+source = "git+https://github.com/henosis-playground/core.git?rev=b3d918621e6b7757814c4ae76e4abfa659e5ed74#b3d918621e6b7757814c4ae76e4abfa659e5ed74"
 dependencies = [
  "futures",
  "henosis-types",
@@ -1478,6 +1480,7 @@ name = "henosis-artifacts"
 version = "0.1.0"
 dependencies = [
  "henosis-app",
+ "henosis-types",
  "hex",
  "serde_json",
  "sha2 0.11.0",
@@ -1494,6 +1497,7 @@ dependencies = [
  "henosis-app",
  "henosis-artifacts",
  "henosis-core-boundary",
+ "henosis-types",
  "insta",
  "serde",
  "serde_json",
@@ -1511,6 +1515,7 @@ dependencies = [
  "connectrpc",
  "henosis-app",
  "henosis-proto",
+ "henosis-types",
  "hex",
  "serde",
  "serde_json",
@@ -1521,6 +1526,7 @@ dependencies = [
 [[package]]
 name = "henosis-proto"
 version = "0.0.0"
+source = "git+https://github.com/henosis-playground/core.git?rev=b3d918621e6b7757814c4ae76e4abfa659e5ed74#b3d918621e6b7757814c4ae76e4abfa659e5ed74"
 dependencies = [
  "buffa",
  "connectrpc",
@@ -1531,6 +1537,7 @@ dependencies = [
 [[package]]
 name = "henosis-types"
 version = "0.0.0"
+source = "git+https://github.com/henosis-playground/core.git?rev=b3d918621e6b7757814c4ae76e4abfa659e5ed74#b3d918621e6b7757814c4ae76e4abfa659e5ed74"
 dependencies = [
  "blake3",
  "futures",
@@ -4799,6 +4806,7 @@ dependencies = [
 [[package]]
 name = "workspace-hack"
 version = "0.0.0"
+source = "git+https://github.com/henosis-playground/core.git?rev=b3d918621e6b7757814c4ae76e4abfa659e5ed74#b3d918621e6b7757814c4ae76e4abfa659e5ed74"
 dependencies = [
  "allocator-api2",
  "bitflags",

@@ -1,3 +1,5 @@
+use henosis_types::{ComponentName, GraphId};
+
 use crate::BorsContext;
 use crate::bors::Comment;
 use crate::bors::event::{PushToBranch, WorkflowRunCompleted};
@@ -132,7 +134,7 @@ impl DeployRepoWriter for D26PreviewWriter {
                 reference: (entry.repo == self.request.key.repo
                     && entry.r#ref == self.request.head_sha)
                     .then(|| format!("refs/heads/{}", self.request.head_branch)),
-                component: Some(component),
+                component: Some(ComponentName::new(component)?),
             });
         }
         let operation = GraphOperation::new(
@@ -146,7 +148,7 @@ impl DeployRepoWriter for D26PreviewWriter {
         );
         let status = operation
             .apply(ApplyGraph {
-                graph: environment.to_string(),
+                graph: parse_graph_id(environment)?,
                 sources,
                 create: true,
                 source_policy: GraphSourcePolicy::AcceptLocal,
@@ -247,7 +249,7 @@ impl DevManifestReader for D26DevManifestReader {
         let dev = crate::henosis::git_sync::named_graph(&repository, "dev")
             .await?
             .context("The deploy repository has no `dev` graph")?;
-        let status = self.core.status(&dev.graph).await?;
+        let status = self.core.status(parse_graph_id(&dev.graph)?).await?;
         let components = status
             .bundles
             .into_iter()
@@ -267,11 +269,11 @@ impl DevManifestReader for D26DevManifestReader {
                     );
                 };
                 Ok((
-                    bundle.component,
+                    bundle.component.to_string(),
                     crate::henosis::manifest::pinned(
                         repository,
                         revision,
-                        format!("sha256:{}", bundle.bundle_id),
+                        format!("sha256:{}", bundle.bundle),
                     ),
                 ))
             })
@@ -1011,12 +1013,12 @@ pub async fn reconcile_dev_pin_after_component_push(
     );
     let status = operation
         .apply(ApplyGraph {
-            graph: graph.clone(),
+            graph: parse_graph_id(&graph)?,
             sources: vec![SourceRequest {
                 repository: component.repo.clone(),
                 revision: Some(payload.sha.clone()),
                 reference: Some(format!("refs/heads/{}", payload.branch)),
-                component: Some(component.name.clone()),
+                component: Some(ComponentName::new(component.name.clone())?),
             }],
             create,
             source_policy: GraphSourcePolicy::AcceptLocal,
@@ -1025,7 +1027,7 @@ pub async fn reconcile_dev_pin_after_component_push(
         .await?
         .status;
     anyhow::ensure!(
-        status.graph == graph,
+        status.graph.to_string() == graph,
         "core acknowledged the wrong dev graph"
     );
     let mut frontend = crate::henosis::git_sync::GitSyncFrontend::new(repository, core);
@@ -1128,7 +1130,7 @@ async fn reconcile_environment_status(
     let members = environment_store.active_members(environment_id).await?;
     let core_status = if let Some(core_api) = config.core_api.as_ref() {
         let core = ConnectCoreBoundary::new(&core_api.endpoint);
-        match core.status(environment_id).await {
+        match core.status(parse_graph_id(environment_id)?).await {
             Ok(status) => Some(status),
             Err(crate::henosis::core_client::CoreBoundaryError::GraphNotFound(_)) => None,
             Err(error) => return Err(error.into()),
@@ -1138,7 +1140,8 @@ async fn reconcile_environment_status(
     };
     if let (Some(core_api), Some(status)) = (config.core_api.as_ref(), core_status.as_ref())
         && graph_file.as_ref().is_none_or(|file| {
-            file.name != presentation_name(&environment) || file.generation != status.generation
+            file.name != presentation_name(&environment)
+                || file.generation != status.generation.ordinal()
         })
     {
         let mut frontend = crate::henosis::git_sync::GitSyncFrontend::new(
@@ -1231,7 +1234,7 @@ pub async fn reconcile_core_graphs(ctx: &BorsContext) -> anyhow::Result<usize> {
     let store = PgEnvironmentStore::new(ctx.db.pool().clone());
     let environments = store.active_preview_environments().await?;
     for environment in &environments {
-        let status = match core.status(&environment.id).await {
+        let status = match core.status(parse_graph_id(&environment.id)?).await {
             Ok(status) => status,
             Err(crate::henosis::core_client::CoreBoundaryError::GraphNotFound(_))
                 if environment
@@ -1276,12 +1279,12 @@ fn outcome_from_core_status(
         })
     });
     RenderOutcome {
-        environment_id: status.graph.clone(),
+        environment_id: status.graph.to_string(),
         commit_sha: format!("generation:{}", status.generation),
         status: render_status,
         run_url: generation_url(core_api, &status.graph, status.generation),
         excerpt,
-        generation: Some(status.generation),
+        generation: Some(status.generation.ordinal()),
         publication: None,
     }
 }
@@ -1291,15 +1294,11 @@ fn ui_links_from_status(status: &GraphStatus) -> Vec<UiLink> {
         .outputs
         .iter()
         .filter_map(|output| {
-            let url = output.value.as_str()?;
+            let url = output.value.as_json().as_str()?;
             url::Url::parse(url)
                 .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
                 .then(|| UiLink {
-                    label: if output.reference.starts_with("database.outputs.") {
-                        format!("{} (fake/local)", output.reference)
-                    } else {
-                        output.reference.clone()
-                    },
+                    label: output.reference.to_string(),
                     url: url.to_string(),
                 })
         })
@@ -1316,14 +1315,23 @@ fn presentation_endpoint(core_api: &crate::henosis::config::CoreApiConfig) -> &s
         .trim_end_matches('/')
 }
 
-fn graph_url(core_api: &crate::henosis::config::CoreApiConfig, graph: &str) -> String {
+fn parse_graph_id(value: &str) -> anyhow::Result<GraphId> {
+    value
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid core graph identity {value:?}: {error}"))
+}
+
+fn graph_url(
+    core_api: &crate::henosis::config::CoreApiConfig,
+    graph: &impl std::fmt::Display,
+) -> String {
     format!("{}/graphs/{graph}", presentation_endpoint(core_api))
 }
 
 fn generation_url(
     core_api: &crate::henosis::config::CoreApiConfig,
-    graph: &str,
-    generation: u64,
+    graph: &impl std::fmt::Display,
+    generation: impl std::fmt::Display,
 ) -> String {
     format!(
         "{}/graphs/{graph}/generations/{generation}",

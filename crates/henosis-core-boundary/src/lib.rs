@@ -5,6 +5,18 @@ use std::sync::Arc;
 use connectrpc::client::{ClientConfig, HttpClient};
 use henosis_proto::connect::henosis::v1::GraphServiceClient;
 use henosis_proto::proto::henosis::v1 as proto;
+use henosis_types::BundleRef;
+use henosis_types::ComponentName;
+use henosis_types::ContentDigest;
+use henosis_types::Generation;
+use henosis_types::GraphId;
+use henosis_types::InputName;
+use henosis_types::NativeValue;
+use henosis_types::OutputName;
+use henosis_types::OutputRef;
+use henosis_types::OutputSource;
+use henosis_types::ResourceDispositionKind;
+use henosis_types::ResourceId;
 use tokio::sync::{Mutex, watch};
 
 // This module is the only core-facing contract in the bot workspace.
@@ -33,7 +45,7 @@ pub trait CoreBoundary: Send + Sync {
     ) -> impl Future<Output = Result<GraphStatus, CoreBoundaryError>> + Send;
     fn status(
         &self,
-        graph: &str,
+        graph: GraphId,
     ) -> impl Future<Output = Result<GraphStatus, CoreBoundaryError>> + Send;
     fn list(
         &self,
@@ -41,7 +53,7 @@ pub trait CoreBoundary: Send + Sync {
     ) -> impl Future<Output = Result<Vec<GraphSummary>, CoreBoundaryError>> + Send;
     fn watch(
         &self,
-        graph: &str,
+        graph: GraphId,
     ) -> impl Future<Output = Result<watch::Receiver<GraphStatus>, CoreBoundaryError>> + Send;
 }
 
@@ -69,19 +81,14 @@ impl ConnectCoreBoundary {
     }
 
     fn component(pin: BundlePin) -> Result<proto::ComponentIntent, CoreBoundaryError> {
-        let digest = hex::decode(&pin.bundle_id).map_err(|error| {
-            CoreBoundaryError::Rejected(format!(
-                "bundle {} has invalid hexadecimal identity: {error}",
-                pin.bundle_id
-            ))
-        })?;
+        let digest = pin.bundle.digest().as_bytes().to_vec();
         let input_bindings = pin
             .input_bindings
             .into_iter()
             .map(|(name, value)| {
-                serde_json::to_vec(&value)
+                serde_json::to_vec(value.as_json())
                     .map(|value_json| proto::InputBinding {
-                        name: Some(name),
+                        name: Some(name.into()),
                         value_json: Some(value_json),
                         ..Default::default()
                     })
@@ -89,7 +96,7 @@ impl ConnectCoreBoundary {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(proto::ComponentIntent {
-            name: Some(pin.component),
+            name: Some(pin.component.into()),
             bundle_digest: Some(digest),
             source: pin.source.map(source_to_proto).into(),
             input_bindings,
@@ -140,7 +147,7 @@ impl CoreBoundary for ConnectCoreBoundary {
             } => {
                 let response = client
                     .create_graph(proto::CreateGraphRequest {
-                        graph_id: Some(graph),
+                        graph_id: Some(graph.to_string()),
                         components: bundles
                             .into_iter()
                             .map(Self::component)
@@ -170,8 +177,8 @@ impl CoreBoundary for ConnectCoreBoundary {
             } => {
                 let response = client
                     .update_graph(proto::UpdateGraphRequest {
-                        graph_id: Some(graph),
-                        expected_generation: Some(expected_generation),
+                        graph_id: Some(graph.to_string()),
+                        expected_generation: Some(expected_generation.ordinal()),
                         components: bundles
                             .into_iter()
                             .map(Self::component)
@@ -184,11 +191,11 @@ impl CoreBoundary for ConnectCoreBoundary {
                 status_from_response(response.status.into_option())
             }
             GraphIntent::Retire { graph } => {
-                let current = self.status(&graph).await?;
+                let current = self.status(graph).await?;
                 let response = client
                     .retire_graph(proto::RetireGraphRequest {
-                        graph_id: Some(graph),
-                        expected_generation: Some(current.generation),
+                        graph_id: Some(graph.to_string()),
+                        expected_generation: Some(current.generation.ordinal()),
                         ..Default::default()
                     })
                     .await
@@ -199,7 +206,7 @@ impl CoreBoundary for ConnectCoreBoundary {
         }
     }
 
-    async fn status(&self, graph: &str) -> Result<GraphStatus, CoreBoundaryError> {
+    async fn status(&self, graph: GraphId) -> Result<GraphStatus, CoreBoundaryError> {
         let response = self
             .client()?
             .get_graph(proto::GetGraphRequest {
@@ -232,16 +239,14 @@ impl CoreBoundary for ConnectCoreBoundary {
             .graphs
             .into_iter()
             .map(|summary| {
-                let graph = required_nonempty(summary.graph_id, "GraphSummary.graph_id")?;
-                let generation = required(
+                let graph = parse_graph_id(required_nonempty(
+                    summary.graph_id,
+                    "GraphSummary.graph_id",
+                )?)?;
+                let generation = parse_generation(required(
                     summary.current_generation,
                     "GraphSummary.current_generation",
-                )?;
-                if generation == 0 {
-                    return Err(protocol(
-                        "GraphSummary.current_generation must be greater than zero",
-                    ));
-                }
+                )?)?;
                 Ok(GraphSummary {
                     graph,
                     generation,
@@ -253,7 +258,10 @@ impl CoreBoundary for ConnectCoreBoundary {
             .collect()
     }
 
-    async fn watch(&self, graph: &str) -> Result<watch::Receiver<GraphStatus>, CoreBoundaryError> {
+    async fn watch(
+        &self,
+        graph: GraphId,
+    ) -> Result<watch::Receiver<GraphStatus>, CoreBoundaryError> {
         let mut stream = self
             .client()?
             .watch_graph(proto::WatchGraphRequest {
@@ -292,7 +300,7 @@ impl CoreBoundary for ConnectCoreBoundary {
 impl henosis_app::CoreClient for ConnectCoreBoundary {
     type Error = CoreBoundaryError;
 
-    async fn status(&self, graph: &str) -> Result<Option<GraphStatus>, Self::Error> {
+    async fn status(&self, graph: GraphId) -> Result<Option<GraphStatus>, Self::Error> {
         match CoreBoundary::status(self, graph).await {
             Ok(status) => Ok(Some(status)),
             Err(CoreBoundaryError::GraphNotFound(_)) => Ok(None),
@@ -332,11 +340,8 @@ fn status_from_response(
     status: Option<proto::GraphStatus>,
 ) -> Result<GraphStatus, CoreBoundaryError> {
     let status = required(status, "GraphService response status")?;
-    let graph = required_nonempty(status.graph_id, "GraphStatus.graph_id")?;
-    let generation = required(status.generation, "GraphStatus.generation")?;
-    if generation == 0 {
-        return Err(protocol("GraphStatus.generation must be greater than zero"));
-    }
+    let graph = parse_graph_id(required_nonempty(status.graph_id, "GraphStatus.graph_id")?)?;
+    let generation = parse_generation(required(status.generation, "GraphStatus.generation")?)?;
 
     let mut input_sources = BTreeMap::new();
     for component in &status.components {
@@ -370,10 +375,18 @@ fn status_from_response(
                 }
                 let source = input_sources.get(&(component.clone(), input.clone()));
                 blocked_on.push(BlockedOn {
-                    component: component.clone(),
-                    input: input.clone(),
-                    producer: source.map(|(producer, _)| producer.clone()),
-                    output: source.map(|(_, output)| output.clone()),
+                    component: ComponentName::new(component.clone())
+                        .map_err(|error| protocol(error.to_string()))?,
+                    input: InputName::new(input.clone())
+                        .map_err(|error| protocol(error.to_string()))?,
+                    producer: source
+                        .map(|(producer, _)| ComponentName::new(producer.clone()))
+                        .transpose()
+                        .map_err(|error| protocol(error.to_string()))?,
+                    output: source
+                        .map(|(_, output)| OutputName::new(output.clone()))
+                        .transpose()
+                        .map_err(|error| protocol(error.to_string()))?,
                 });
             }
         }
@@ -384,19 +397,36 @@ fn status_from_response(
         .dispositions
         .into_iter()
         .map(|disposition| {
+            let state = required_nonempty(disposition.state, "ResourceDisposition.state")?;
+            let message = nonempty(disposition.message);
+            let kind = match state.as_str() {
+                "ready" => ResourceDispositionKind::Ready,
+                "reconciling" => ResourceDispositionKind::Reconciling {
+                    message: message.unwrap_or_default(),
+                },
+                "failed" => ResourceDispositionKind::Failed {
+                    message: message.unwrap_or_default(),
+                },
+                _ => return Err(protocol(format!("unknown resource disposition {state:?}"))),
+            };
             Ok(ResourceDisposition {
                 resource: required_nonempty(
                     disposition.resource_id,
                     "ResourceDisposition.resource_id",
-                )?,
-                state: required_nonempty(disposition.state, "ResourceDisposition.state")?,
-                message: nonempty(disposition.message),
+                )?
+                .parse::<ResourceId>()
+                .map_err(|error| protocol(error.to_string()))?,
+                kind,
             })
         })
         .collect::<Result<Vec<_>, CoreBoundaryError>>()?;
-    let failed = dispositions.iter().any(|item| item.state == "failed");
+    let failed = dispositions
+        .iter()
+        .any(|item| matches!(item.kind, ResourceDispositionKind::Failed { .. }));
     let all_ready = dispositions.len() >= planned_resources
-        && dispositions.iter().all(|item| item.state == "ready");
+        && dispositions
+            .iter()
+            .all(|item| item.kind == ResourceDispositionKind::Ready);
 
     let outputs = status
         .outputs
@@ -413,9 +443,12 @@ fn status_from_response(
                 ))
             })?;
             Ok(GraphOutput {
-                reference,
-                value,
-                source: required_nonempty(output.source, "GraphOutput.source")?,
+                reference: parse_output_ref(&reference)?,
+                value: NativeValue::new(value).map_err(|error| protocol(error.to_string()))?,
+                source: parse_output_source(&required_nonempty(
+                    output.source,
+                    "GraphOutput.source",
+                )?)?,
             })
         })
         .collect::<Result<Vec<_>, CoreBoundaryError>>()?;
@@ -453,19 +486,33 @@ fn status_from_response(
                 .input_bindings
                 .into_iter()
                 .map(|binding| {
-                    let name = required_nonempty(binding.name, "InputBinding.name")?;
+                    let name = InputName::new(required_nonempty(
+                        binding.name,
+                        "InputBinding.name",
+                    )?)
+                    .map_err(|error| protocol(error.to_string()))?;
                     let bytes = required(binding.value_json, "InputBinding.value_json")?;
                     let value = serde_json::from_slice(&bytes).map_err(|error| {
                         protocol(format!(
                             "InputBinding {component_name}.{name} contains invalid JSON: {error}"
                         ))
                     })?;
-                    Ok((name, value))
+                    Ok((
+                        name,
+                        NativeValue::new(value).map_err(|error| protocol(error.to_string()))?,
+                    ))
                 })
                 .collect::<Result<BTreeMap<_, _>, CoreBoundaryError>>()?;
+            let digest: [u8; 32] = digest
+                .try_into()
+                .map_err(|bytes: Vec<u8>| protocol(format!(
+                    "ComponentStatus {component_name} bundle_digest must contain exactly 32 bytes, got {}",
+                    bytes.len()
+                )))?;
             Ok(BundlePin {
-                component: component_name,
-                bundle_id: hex::encode(digest),
+                component: ComponentName::new(component_name)
+                    .map_err(|error| protocol(error.to_string()))?,
+                bundle: BundleRef::new(ContentDigest::from_bytes(digest)),
                 input_bindings,
                 source: source_from_proto(component.source.into_option())?,
             })
@@ -518,6 +565,46 @@ fn nonempty(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
 }
 
+fn parse_graph_id(value: String) -> Result<GraphId, CoreBoundaryError> {
+    value
+        .parse()
+        .map_err(|error: henosis_types::ParseDomainIdError| protocol(error.to_string()))
+}
+
+fn parse_generation(value: u64) -> Result<Generation, CoreBoundaryError> {
+    Generation::new(value).map_err(|error| protocol(error.to_string()))
+}
+
+fn parse_output_ref(value: &str) -> Result<OutputRef, CoreBoundaryError> {
+    let Some((component, output)) = value.split_once(".outputs.") else {
+        return Err(protocol(format!("invalid output reference {value:?}")));
+    };
+    Ok(OutputRef::new(
+        ComponentName::new(component).map_err(|error| protocol(error.to_string()))?,
+        OutputName::new(output).map_err(|error| protocol(error.to_string()))?,
+    ))
+}
+
+fn parse_output_source(value: &str) -> Result<OutputSource, CoreBoundaryError> {
+    if value == "static" {
+        return Ok(OutputSource::Static);
+    }
+    let Some(observed) = value.strip_prefix("observed:") else {
+        return Err(protocol(format!("invalid output source {value:?}")));
+    };
+    let Some((resource, output)) = observed.rsplit_once('.') else {
+        return Err(protocol(format!(
+            "invalid observed output source {value:?}"
+        )));
+    };
+    Ok(OutputSource::Observed {
+        resource_id: resource
+            .parse()
+            .map_err(|error: henosis_types::ParseDomainIdError| protocol(error.to_string()))?,
+        resource_output: OutputName::new(output).map_err(|error| protocol(error.to_string()))?,
+    })
+}
+
 fn protocol(message: impl Into<String>) -> CoreBoundaryError {
     CoreBoundaryError::Rejected(format!("core protocol error: {}", message.into()))
 }
@@ -548,7 +635,7 @@ fn transport(error: connectrpc::ConnectError) -> CoreBoundaryError {
 
 #[derive(Debug, Default)]
 struct FakeState {
-    statuses: BTreeMap<String, watch::Sender<GraphStatus>>,
+    statuses: BTreeMap<GraphId, watch::Sender<GraphStatus>>,
     intents: Vec<GraphIntent>,
 }
 
@@ -568,21 +655,21 @@ impl FakeCoreBoundary {
             sender.send_replace(status);
         } else {
             let (sender, _) = watch::channel(status.clone());
-            state.statuses.insert(status.graph.clone(), sender);
+            state.statuses.insert(status.graph, sender);
         }
     }
 }
 
 impl CoreBoundary for FakeCoreBoundary {
     async fn apply(&self, intent: GraphIntent) -> Result<GraphStatus, CoreBoundaryError> {
-        let graph = intent.graph().to_string();
+        let graph = intent.graph();
         let mut state = self.state.lock().await;
         let generation = state
             .statuses
             .get(&graph)
-            .map(|sender| sender.borrow().generation + 1)
-            .unwrap_or(1);
-        let mut status = GraphStatus::planning(graph.clone(), generation);
+            .map(|sender| sender.borrow().generation.next())
+            .unwrap_or_else(|| Generation::new(1).unwrap());
+        let mut status = GraphStatus::planning(graph, generation);
         match &intent {
             GraphIntent::Create {
                 bundles,
@@ -607,12 +694,12 @@ impl CoreBoundary for FakeCoreBoundary {
         Ok(status)
     }
 
-    async fn status(&self, graph: &str) -> Result<GraphStatus, CoreBoundaryError> {
+    async fn status(&self, graph: GraphId) -> Result<GraphStatus, CoreBoundaryError> {
         self.state
             .lock()
             .await
             .statuses
-            .get(graph)
+            .get(&graph)
             .map(|sender| sender.borrow().clone())
             .ok_or_else(|| CoreBoundaryError::GraphNotFound(graph.to_string()))
     }
@@ -636,12 +723,15 @@ impl CoreBoundary for FakeCoreBoundary {
             .collect())
     }
 
-    async fn watch(&self, graph: &str) -> Result<watch::Receiver<GraphStatus>, CoreBoundaryError> {
+    async fn watch(
+        &self,
+        graph: GraphId,
+    ) -> Result<watch::Receiver<GraphStatus>, CoreBoundaryError> {
         self.state
             .lock()
             .await
             .statuses
-            .get(graph)
+            .get(&graph)
             .map(watch::Sender::subscribe)
             .ok_or_else(|| CoreBoundaryError::GraphNotFound(graph.to_string()))
     }
@@ -650,7 +740,7 @@ impl CoreBoundary for FakeCoreBoundary {
 impl henosis_app::CoreClient for FakeCoreBoundary {
     type Error = CoreBoundaryError;
 
-    async fn status(&self, graph: &str) -> Result<Option<GraphStatus>, Self::Error> {
+    async fn status(&self, graph: GraphId) -> Result<Option<GraphStatus>, Self::Error> {
         match CoreBoundary::status(self, graph).await {
             Ok(status) => Ok(Some(status)),
             Err(CoreBoundaryError::GraphNotFound(_)) => Ok(None),
@@ -679,12 +769,13 @@ mod tests {
     #[tokio::test]
     async fn fake_records_intent_and_publishes_status() {
         let core = FakeCoreBoundary::default();
+        let graph = GraphId::from_bytes([1; 16]);
         let status = core
             .apply(GraphIntent::Create {
-                graph: "preview_test".to_string(),
+                graph,
                 bundles: vec![BundlePin {
-                    component: "web".to_string(),
-                    bundle_id: "abc".to_string(),
+                    component: ComponentName::new("web").unwrap(),
+                    bundle: BundleRef::new(ContentDigest::from_bytes([2; 32])),
                     input_bindings: BTreeMap::new(),
                     source: None,
                 }],
@@ -692,8 +783,8 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(status.generation, 1);
+        assert_eq!(status.generation, Generation::new(1).unwrap());
         assert_eq!(core.intents().await.len(), 1);
-        assert_eq!(core.status("preview_test").await.unwrap(), status);
+        assert_eq!(core.status(graph).await.unwrap(), status);
     }
 }

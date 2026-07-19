@@ -15,6 +15,7 @@ use henosis_core_boundary::{
     ConnectCoreBoundary, CoreBoundary, CoreBoundaryError, GraphIntent, GraphPhase,
     GraphSourcePolicy, GraphStatus, GraphSummary, SourceProvenance,
 };
+use henosis_types::{Generation, GraphId, ResourceDispositionKind};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_CORE: &str = "http://127.0.0.1:4481";
@@ -151,7 +152,7 @@ pub enum CliError {
     #[error("graph `{graph}` does not exist at {core}")]
     GraphMissing { graph: String, core: String },
     #[error("deployment generation {generation} failed")]
-    DeploymentFailed { generation: u64 },
+    DeploymentFailed { generation: Generation },
 }
 
 impl CliError {
@@ -307,7 +308,7 @@ struct LocalContext {
 
 #[derive(Debug, Clone)]
 struct SelectedTarget {
-    graph: String,
+    graph: GraphId,
     name: Option<String>,
     core: String,
     current: Option<GraphStatus>,
@@ -319,7 +320,7 @@ struct SelectedTarget {
 struct CycleResult {
     output: String,
     dependencies: Vec<PathBuf>,
-    generation: u64,
+    generation: Generation,
 }
 
 pub async fn run(cli: Cli) -> Result<String, CliError> {
@@ -403,10 +404,7 @@ async fn dev(args: PipelineArgs) -> Result<String, CliError> {
     )
     .await?;
     let mut dependencies = fallback_watch_set(&args.repository)?;
-    let mut active_generation = target
-        .current
-        .as_ref()
-        .map_or(0, |status| status.generation);
+    let mut active_generation = target.current.as_ref().map(|status| status.generation);
     let mut transient_attempt = 0;
 
     loop {
@@ -415,14 +413,18 @@ async fn dev(args: PipelineArgs) -> Result<String, CliError> {
                 print!("{}", cycle.output);
                 std::io::stdout().flush().ok();
                 dependencies = cycle.dependencies;
-                active_generation = cycle.generation;
+                active_generation = Some(cycle.generation);
                 transient_attempt = 0;
                 target = select_target(&args.repository, &None, &None, &None, false, false).await?;
             }
             Err(error) => match error.classify() {
                 ErrorClass::FixSource => {
                     eprintln!("{}", error.rendered_diagnostic());
-                    eprintln!("generation {active_generation} remains active");
+                    if let Some(generation) = active_generation {
+                        eprintln!("generation {generation} remains active");
+                    } else {
+                        eprintln!("no generation has been accepted yet");
+                    }
                     transient_attempt = 0;
                 }
                 ErrorClass::Transient if transient_attempt < TRANSIENT_RETRIES => {
@@ -435,9 +437,11 @@ async fn dev(args: PipelineArgs) -> Result<String, CliError> {
                 }
                 ErrorClass::Transient => {
                     eprintln!("{}", error.rendered_diagnostic());
-                    eprintln!(
-                        "generation {active_generation} remains active; waiting before retry"
-                    );
+                    if let Some(generation) = active_generation {
+                        eprintln!("generation {generation} remains active; waiting before retry");
+                    } else {
+                        eprintln!("no generation has been accepted; waiting before retry");
+                    }
                     transient_attempt = 0;
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
@@ -499,7 +503,7 @@ async fn run_cycle(args: &PipelineArgs, target: SelectedTarget) -> Result<CycleR
     );
     let outcome = operation
         .apply(ApplyGraph {
-            graph: target.graph.clone(),
+            graph: target.graph,
             sources: vec![SourceRequest {
                 repository: repository.display().to_string(),
                 revision: None,
@@ -517,7 +521,12 @@ async fn run_cycle(args: &PipelineArgs, target: SelectedTarget) -> Result<CycleR
         if outcome.changed_components.is_empty() {
             "none".to_string()
         } else {
-            outcome.changed_components.join(", ")
+            outcome
+                .changed_components
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     ));
 
@@ -539,7 +548,7 @@ async fn run_cycle(args: &PipelineArgs, target: SelectedTarget) -> Result<CycleR
     write_context(
         &repository,
         &LocalContext {
-            graph: target.graph.clone(),
+            graph: target.graph.to_string(),
             name: target.name.clone(),
             core: target.core.clone(),
         },
@@ -548,7 +557,7 @@ async fn run_cycle(args: &PipelineArgs, target: SelectedTarget) -> Result<CycleR
     let terminal = stream_generation(
         &core,
         target.name.as_deref(),
-        &target.graph,
+        target.graph,
         accepted.generation,
         args.demo_targets,
     )
@@ -594,8 +603,14 @@ async fn select_target(
             Err(error) => return Err(error),
         },
     };
+    let graph_id = context.graph.parse::<GraphId>().map_err(|error| {
+        CoreBoundaryError::Rejected(format!(
+            "invalid graph identity {:?}: {error}",
+            context.graph
+        ))
+    })?;
     let boundary = ConnectCoreBoundary::new(&context.core);
-    let current = match boundary.status(&context.graph).await {
+    let current = match boundary.status(graph_id).await {
         Ok(status) => Some(status),
         Err(CoreBoundaryError::GraphNotFound(_)) if create && !from_file => None,
         Err(CoreBoundaryError::GraphNotFound(_)) if from_file => {
@@ -618,7 +633,7 @@ async fn select_target(
         write_context(&repository, &context)?;
     }
     Ok(SelectedTarget {
-        graph: context.graph,
+        graph: graph_id,
         name: context.name,
         core: context.core,
         current,
@@ -844,8 +859,8 @@ where
 async fn stream_generation(
     core: &ConnectCoreBoundary,
     name: Option<&str>,
-    graph: &str,
-    generation: u64,
+    graph: GraphId,
+    generation: Generation,
     demo_targets: bool,
 ) -> Result<GraphStatus, CliError> {
     let mut receiver = core.watch(graph).await?;
@@ -880,7 +895,7 @@ fn emit_stdout(text: &str) {
     std::io::stdout().flush().ok();
 }
 
-fn environment_identity(name: Option<&str>, graph: &str) -> String {
+fn environment_identity(name: Option<&str>, graph: &GraphId) -> String {
     format!("{} ({graph})", name.unwrap_or("unnamed"))
 }
 
@@ -976,9 +991,7 @@ fn render_status_event(name: Option<&str>, status: &GraphStatus, demo_targets: b
                 .blocked_on
                 .iter()
                 .map(|blocked| match (&blocked.producer, &blocked.output) {
-                    (Some(producer), Some(output))
-                        if !producer.is_empty() && !output.is_empty() =>
-                    {
+                    (Some(producer), Some(output)) => {
                         format!("{} waits for {}.{}", blocked.component, producer, output)
                     }
                     _ => format!("{} waits for input {}", blocked.component, blocked.input),
@@ -991,12 +1004,13 @@ fn render_status_event(name: Option<&str>, status: &GraphStatus, demo_targets: b
             let detail = status
                 .dispositions
                 .iter()
-                .filter(|item| item.state != "ready")
-                .map(|item| {
-                    item.message
-                        .as_ref()
-                        .map(|message| format!("{}: {message}", item.resource))
-                        .unwrap_or_else(|| item.resource.clone())
+                .filter(|item| item.kind != ResourceDispositionKind::Ready)
+                .map(|item| match &item.kind {
+                    ResourceDispositionKind::Ready => item.resource.to_string(),
+                    ResourceDispositionKind::Reconciling { message }
+                    | ResourceDispositionKind::Failed { message } => {
+                        format!("{}: {message}", item.resource)
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -1022,12 +1036,12 @@ fn render_status_event(name: Option<&str>, status: &GraphStatus, demo_targets: b
             let failures = status
                 .dispositions
                 .iter()
-                .filter(|item| item.state == "failed")
-                .map(|item| {
-                    item.message
-                        .as_ref()
-                        .map(|message| format!("{}: {message}", item.resource))
-                        .unwrap_or_else(|| item.resource.clone())
+                .filter_map(|item| match &item.kind {
+                    ResourceDispositionKind::Failed { message } => {
+                        Some(format!("{}: {message}", item.resource))
+                    }
+                    ResourceDispositionKind::Ready
+                    | ResourceDispositionKind::Reconciling { .. } => None,
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -1044,8 +1058,9 @@ fn render_status_event(name: Option<&str>, status: &GraphStatus, demo_targets: b
         for output in &status.outputs {
             let value = output
                 .value
+                .as_json()
                 .as_str()
-                .map_or_else(|| output.value.to_string(), str::to_owned);
+                .map_or_else(|| output.value.canonical().to_owned(), str::to_owned);
             rendered.push_str(&format!("  output {} = {value}\n", output.reference));
         }
     }
@@ -1160,8 +1175,8 @@ mod tests {
                 graph: "graph_070w3ge1r70w3ge1r70w3ge1r7".to_string(),
                 core: "http://127.0.0.1:4481".to_string(),
                 graphs: vec![GraphSummary {
-                    graph: "graph_01k00000000000000000000000".to_string(),
-                    generation: 3,
+                    graph: "graph_01k00000000000000000000000".parse().unwrap(),
+                    generation: Generation::new(3).unwrap(),
                     phase: GraphPhase::Ready,
                     created: true,
                     retired: false,

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use henosis_app::{ArtifactBinding, ArtifactRequirement, ArtifactService, WorkloadArtifactKind};
+use henosis_types::{ArtifactDigest, ComponentName, InputName};
 use sha2::{Digest as _, Sha256};
 use tempfile::{Builder, TempPath};
 use walkdir::WalkDir;
@@ -43,6 +44,8 @@ pub enum ArtifactError {
     },
     #[error("cannot build workload artifact for component `{component}`\n{stderr}")]
     Build { component: String, stderr: String },
+    #[error("artifact requirement has an invalid domain value: {0}")]
+    InvalidRequirement(String),
     #[error("cannot encode static assets: {0}")]
     Encode(serde_json::Error),
 }
@@ -102,8 +105,10 @@ pub fn build_requirements(
         };
         let (digest, stored) = store(output, &bytes)?;
         built.push(ArtifactBinding {
-            component: requirement.component.clone(),
-            input: requirement.input.clone(),
+            component: ComponentName::new(requirement.component.clone())
+                .map_err(|error| ArtifactError::InvalidRequirement(error.to_string()))?,
+            input: InputName::new(requirement.input.clone())
+                .map_err(|error| ArtifactError::InvalidRequirement(error.to_string()))?,
             kind: requirement.kind,
             digest,
             source,
@@ -182,9 +187,9 @@ fn build_assets(source: &Path) -> Result<Vec<u8>, ArtifactError> {
     .map_err(ArtifactError::Encode)
 }
 
-fn store(root: &Path, bytes: &[u8]) -> Result<(String, PathBuf), ArtifactError> {
-    let hexadecimal = sha256(bytes);
-    let digest = format!("sha256:{hexadecimal}");
+fn store(root: &Path, bytes: &[u8]) -> Result<(ArtifactDigest, PathBuf), ArtifactError> {
+    let digest = ArtifactDigest::from_bytes(Sha256::digest(bytes).into());
+    let hexadecimal = hex::encode(digest.as_bytes());
     let path = root.join("sha256").join(hexadecimal);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| ArtifactError::Inspect {
