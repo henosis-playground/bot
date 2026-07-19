@@ -122,18 +122,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrayref"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
-
-[[package]]
-name = "arrayvec"
-version = "0.7.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
-
-[[package]]
 name = "askama"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -378,20 +366,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blake3"
-version = "1.8.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
-dependencies = [
- "arrayref",
- "arrayvec",
- "cc",
- "cfg-if",
- "constant_time_eq",
- "cpufeatures 0.3.0",
-]
-
-[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -423,9 +397,9 @@ dependencies = [
  "clap",
  "futures",
  "graphql-parser",
- "henosis-bundle",
+ "henosis-app",
+ "henosis-artifacts",
  "henosis-core-boundary",
- "henosis-proto 0.0.0 (git+https://github.com/henosis-playground/core.git?branch=fix%2Fverification-loop-1)",
  "hex",
  "hmac 0.13.0",
  "http",
@@ -434,7 +408,7 @@ dependencies = [
  "insta",
  "itertools",
  "jsonwebtoken",
- "newtype-uuid 1.3.2 (git+https://github.com/henosis-playground/newtype-uuid.git)",
+ "newtype-uuid",
  "octocrab",
  "parking_lot",
  "proptest",
@@ -497,26 +471,13 @@ checksum = "33f29a40702df4b86ccd84211bfde8cee0bce6d0811450ade4a86a7d0958a23a"
 dependencies = [
  "base64",
  "bytes",
- "foldhash 0.1.5",
+ "foldhash",
  "hashbrown 0.15.5",
  "once_cell",
  "rustversion",
  "serde",
  "serde_json",
  "smoothutf8",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "buffa-types"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22cb54bcbf6946c58e550eeaf6209047146363dbc7cbdc87e49e67089ed2ff5f"
-dependencies = [
- "buffa",
- "bytes",
- "serde",
- "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -795,12 +756,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
-name = "constant_time_eq"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
-
-[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -951,41 +906,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "darling"
-version = "0.21.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cdf337090841a411e2a7f3deb9187445851f91b309c0c0a29e05f74a00a48c0"
-dependencies = [
- "darling_core",
- "darling_macro",
-]
-
-[[package]]
-name = "darling_core"
-version = "0.21.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1247195ecd7e3c85f83c8d2a366e4210d588e802133e1e355180a9870b517ea4"
-dependencies = [
- "fnv",
- "ident_case",
- "proc-macro2",
- "quote",
- "strsim",
- "syn",
-]
-
-[[package]]
-name = "darling_macro"
-version = "0.21.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d38308df82d1080de0afee5d069fa14b0326a88c14f15c5ccda35b4a6c414c81"
-dependencies = [
- "darling_core",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "deadpool"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1021,43 +941,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "powerfmt",
-]
-
-[[package]]
-name = "diesel"
-version = "2.3.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e54d1f576cd3a3460f212a4615fd12ce1b6303c095b79a44449ffbe627753dc1"
-dependencies = [
- "bitflags",
- "byteorder",
- "diesel_derives",
- "downcast-rs",
- "itoa",
- "pq-sys",
- "uuid",
-]
-
-[[package]]
-name = "diesel_derives"
-version = "2.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1817b7f4279b947fc4cafddec12b0e5f8727141706561ce3ac94a60bddd1cf5"
-dependencies = [
- "diesel_table_macro_syntax",
- "dsl_auto_type",
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "diesel_table_macro_syntax"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe2444076b48641147115697648dc743c2c00b61adade0f01ce67133c7babe8c"
-dependencies = [
- "syn",
 ]
 
 [[package]]
@@ -1100,26 +983,6 @@ name = "dotenvy"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
-
-[[package]]
-name = "downcast-rs"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
-
-[[package]]
-name = "dsl_auto_type"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd122633e4bef06db27737f21d3738fb89c8f6d5360d6d9d7635dda142a7757e"
-dependencies = [
- "darling",
- "either",
- "heck",
- "proc-macro2",
- "quote",
- "syn",
-]
 
 [[package]]
 name = "ecdsa"
@@ -1294,12 +1157,6 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
-
-[[package]]
-name = "foldhash"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
@@ -1524,17 +1381,8 @@ checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.1.5",
+ "foldhash",
  "serde",
-]
-
-[[package]]
-name = "hashbrown"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
-dependencies = [
- "allocator-api2",
 ]
 
 [[package]]
@@ -1562,14 +1410,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "henosis-bundle"
-version = "0.1.0"
+name = "henosis-app"
+version = "0.0.0"
 dependencies = [
- "base64",
  "hex",
  "minicbor",
  "regex",
  "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "walkdir",
+]
+
+[[package]]
+name = "henosis-artifacts"
+version = "0.1.0"
+dependencies = [
+ "henosis-app",
+ "hex",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
@@ -1582,7 +1442,8 @@ name = "henosis-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "henosis-bundle",
+ "henosis-app",
+ "henosis-artifacts",
  "henosis-core-boundary",
  "insta",
  "serde",
@@ -1599,7 +1460,8 @@ version = "0.1.0"
 dependencies = [
  "buffa",
  "connectrpc",
- "henosis-proto 0.0.0 (git+https://github.com/henosis-playground/core.git?branch=d26-core)",
+ "henosis-app",
+ "henosis-proto",
  "hex",
  "serde",
  "serde_json",
@@ -1610,42 +1472,11 @@ dependencies = [
 [[package]]
 name = "henosis-proto"
 version = "0.0.0"
-source = "git+https://github.com/henosis-playground/core.git?branch=d26-core#a393bbe8df45a4570d6a4402037b3d4a980e3f08"
 dependencies = [
  "buffa",
  "connectrpc",
  "serde",
- "workspace-hack 0.0.0 (git+https://github.com/henosis-playground/core.git?branch=d26-core)",
-]
-
-[[package]]
-name = "henosis-proto"
-version = "0.0.0"
-source = "git+https://github.com/henosis-playground/core.git?branch=fix%2Fverification-loop-1#4a3203e655d1b9be356b8cd3ac13a1b6dfc146cf"
-dependencies = [
- "blake3",
- "buffa",
- "buffa-types",
- "connectrpc",
- "futures",
- "henosis-types",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "workspace-hack 0.0.0 (git+https://github.com/henosis-playground/core.git?branch=fix%2Fverification-loop-1)",
-]
-
-[[package]]
-name = "henosis-types"
-version = "0.0.0"
-source = "git+https://github.com/henosis-playground/core.git?branch=fix%2Fverification-loop-1#4a3203e655d1b9be356b8cd3ac13a1b6dfc146cf"
-dependencies = [
- "iddqd",
- "newtype-uuid 1.3.2 (git+https://github.com/henosis-playground/newtype-uuid.git?rev=f20e0aff365e59de7eadd29e769cf0c93990c587)",
- "serde",
- "thiserror 2.0.18",
- "uuid",
- "workspace-hack 0.0.0 (git+https://github.com/henosis-playground/core.git?branch=fix%2Fverification-loop-1)",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -1944,24 +1775,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
-name = "iddqd"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7cf7e72dd082126bd727c1f8bd2d5229c2780258c0b3c7bc33eaf0f4ea5f0fa"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.2.0",
- "hashbrown 0.16.1",
-]
-
-[[package]]
-name = "ident_case"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
-
-[[package]]
 name = "idna"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2243,15 +2056,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "newtype-uuid"
-version = "1.3.2"
-source = "git+https://github.com/henosis-playground/newtype-uuid.git?rev=f20e0aff365e59de7eadd29e769cf0c93990c587#f20e0aff365e59de7eadd29e769cf0c93990c587"
-dependencies = [
- "serde",
- "uuid",
 ]
 
 [[package]]
@@ -2617,17 +2421,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
-]
-
-[[package]]
-name = "pq-sys"
-version = "0.7.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "574ddd6a267294433f140b02a726b0640c43cf7c6f717084684aaa3b285aba61"
-dependencies = [
- "libc",
- "pkg-config",
- "vcpkg",
 ]
 
 [[package]]
@@ -4912,7 +4705,6 @@ dependencies = [
 [[package]]
 name = "workspace-hack"
 version = "0.0.0"
-source = "git+https://github.com/henosis-playground/core.git?branch=d26-core#a393bbe8df45a4570d6a4402037b3d4a980e3f08"
 dependencies = [
  "allocator-api2",
  "bitflags",
@@ -4972,36 +4764,6 @@ dependencies = [
  "zerofrom",
  "zerotrie",
  "zerovec",
-]
-
-[[package]]
-name = "workspace-hack"
-version = "0.0.0"
-source = "git+https://github.com/henosis-playground/core.git?branch=fix%2Fverification-loop-1#4a3203e655d1b9be356b8cd3ac13a1b6dfc146cf"
-dependencies = [
- "bitflags",
- "bytes",
- "darling",
- "darling_core",
- "diesel",
- "either",
- "futures-channel",
- "futures-task",
- "futures-util",
- "getrandom 0.4.2",
- "libc",
- "log",
- "serde",
- "serde_core",
- "serde_json",
- "slab",
- "smallvec",
- "syn",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-core",
- "uuid",
 ]
 
 [[package]]

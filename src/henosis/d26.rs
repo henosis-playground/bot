@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
-use henosis_bundle::{BundleError, BundleRequest, Bundler};
-
-use crate::henosis::core_client::{
-    BundlePin, CoreBoundary, CoreBoundaryError, GraphIntent, GraphPhase, GraphStatus,
+use henosis_app::{
+    ApplyGraph, ArtifactService, Bundler, CheckoutService, GraphOperation, GraphSourcePolicy,
+    GraphStatus, SourceRequest,
 };
+
+use crate::henosis::core_client::{CoreBoundary, CoreBoundaryError, GraphPhase};
 use crate::henosis::status::{STATUS_END, STATUS_START};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,91 +21,57 @@ pub struct PreviewRequest {
 #[derive(Debug, thiserror::Error)]
 pub enum PreviewError {
     #[error(transparent)]
-    Bundle(#[from] BundleError),
+    Operation(#[from] henosis_app::OperationError),
     #[error(transparent)]
     Core(#[from] CoreBoundaryError),
 }
 
-pub struct PreviewWorkflow<C, B> {
+pub struct PreviewWorkflow<C, B, A, K> {
     core: C,
-    bundler: B,
-    bundle_root: PathBuf,
-    artifact_root: PathBuf,
+    operation: GraphOperation<C, B, A, K>,
 }
 
-impl<C, B> PreviewWorkflow<C, B>
+impl<C, B, A, K> PreviewWorkflow<C, B, A, K>
 where
-    C: CoreBoundary,
+    C: CoreBoundary + henosis_app::CoreClient + Clone,
     B: Bundler,
+    A: ArtifactService,
+    K: CheckoutService,
 {
     pub fn new(
         core: C,
         bundler: B,
+        artifacts: A,
+        checkouts: K,
         bundle_root: impl Into<PathBuf>,
-        artifact_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
-            core,
-            bundler,
-            bundle_root: bundle_root.into(),
-            artifact_root: artifact_root.into(),
+            core: core.clone(),
+            operation: GraphOperation::new(core, bundler, artifacts, checkouts, bundle_root),
         }
     }
 
     pub async fn p_plus(&self, request: &PreviewRequest) -> Result<GraphStatus, PreviewError> {
-        let bundles = self.bundler.bundle(&BundleRequest {
-            repository: request.checkout.clone(),
-            output: self.bundle_root.clone(),
-        })?;
-        let artifacts = self
-            .bundler
-            .build_artifacts(&request.checkout, &self.artifact_root)?;
-        let pins = bundles
-            .bundles
-            .into_iter()
-            .map(|bundle| BundlePin {
-                component: bundle.component.clone(),
-                bundle_id: bundle.bundle_id,
-                input_bindings: artifacts
-                    .iter()
-                    .filter(|artifact| artifact.component == bundle.component)
-                    .map(|artifact| {
-                        (
-                            artifact.input.clone(),
-                            serde_json::Value::String(artifact.digest.clone()),
-                        )
-                    })
-                    .collect(),
-                source: Some(crate::henosis::core_client::SourceProvenance::Vcs {
+        Ok(self
+            .operation
+            .apply(ApplyGraph {
+                graph: request.environment.clone(),
+                sources: vec![SourceRequest {
                     repository: request.repository.clone(),
-                    revision: request.revision.clone(),
+                    revision: Some(request.revision.clone()),
                     reference: request.reference.clone(),
-                }),
+                    component: None,
+                }],
+                create: true,
+                source_policy: GraphSourcePolicy::AcceptLocal,
+                preserve_unmentioned: false,
             })
-            .collect();
-        let intent = match self.core.status(&request.environment).await {
-            Ok(current) => GraphIntent::Update {
-                graph: request.environment.clone(),
-                expected_generation: current.generation,
-                bundles: pins,
-            },
-            Err(CoreBoundaryError::GraphNotFound(_)) => GraphIntent::Create {
-                graph: request.environment.clone(),
-                bundles: pins,
-                source_policy: henosis_core_boundary::GraphSourcePolicy::AcceptLocal,
-            },
-            Err(error) => return Err(error.into()),
-        };
-        self.core.apply(intent).await.map_err(Into::into)
+            .await?
+            .status)
     }
 
     pub async fn p_minus(&self, environment: &str) -> Result<GraphStatus, PreviewError> {
-        self.core
-            .apply(GraphIntent::Retire {
-                graph: environment.to_string(),
-            })
-            .await
-            .map_err(Into::into)
+        self.operation.retire(environment).await.map_err(Into::into)
     }
 
     pub async fn status_section(
@@ -112,7 +79,7 @@ where
         environment_name: &str,
         graph: &str,
     ) -> Result<String, PreviewError> {
-        let status = self.core.status(graph).await?;
+        let status = CoreBoundary::status(&self.core, graph).await?;
         Ok(render_core_status(environment_name, &status))
     }
 }
@@ -153,7 +120,10 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use henosis_bundle::{BundleArtifact, BundleSetManifest};
+    use henosis_app::{
+        ArtifactBinding, ArtifactRequirement, BundleArtifact, BundleError, BundleRequest,
+        BundleSetManifest, PreparedSource, SourceProvenance,
+    };
 
     use super::*;
     use crate::henosis::core_client::{FakeCoreBoundary, GraphIntent};
@@ -171,17 +141,44 @@ mod tests {
                     module: request.output.join("module.js"),
                     manifest: request.output.join("bundle.json"),
                     executable_sha256: "b".repeat(64),
+                    artifact_requirements: Vec::new(),
                     dependencies: Vec::new(),
                 }],
             })
         }
+    }
 
-        fn build_artifacts(
+    struct NoArtifacts;
+
+    impl ArtifactService for NoArtifacts {
+        type Error = std::convert::Infallible;
+
+        fn build(
             &self,
             _repository: &Path,
-            _output: &Path,
-        ) -> Result<Vec<henosis_bundle::BuiltArtifact>, BundleError> {
+            _requirements: &[ArtifactRequirement],
+        ) -> Result<Vec<ArtifactBinding>, Self::Error> {
             Ok(Vec::new())
+        }
+    }
+
+    #[derive(Clone)]
+    struct PreparedCheckout;
+
+    impl CheckoutService for PreparedCheckout {
+        type Error = std::convert::Infallible;
+
+        async fn checkout(&self, request: &SourceRequest) -> Result<PreparedSource, Self::Error> {
+            Ok(PreparedSource {
+                repository: Path::new("/checkout/web").to_path_buf(),
+                provenance: SourceProvenance::Vcs {
+                    repository: request.repository.clone(),
+                    revision: request.revision.clone().unwrap(),
+                    reference: request.reference.clone(),
+                },
+                component: request.component.clone(),
+                lease: None,
+            })
         }
     }
 
@@ -192,8 +189,9 @@ mod tests {
         let workflow = PreviewWorkflow::new(
             core.clone(),
             FakeBundler,
+            NoArtifacts,
+            PreparedCheckout,
             root.path().join("bundles"),
-            root.path().join("artifacts"),
         );
         let request = PreviewRequest {
             repository: "henosis-playground/web".to_string(),
@@ -210,17 +208,17 @@ mod tests {
             core.intents().await,
             vec![GraphIntent::Create {
                 graph: request.environment.clone(),
-                bundles: vec![BundlePin {
+                bundles: vec![henosis_app::BundlePin {
                     component: "web".to_string(),
                     bundle_id: "a".repeat(64),
                     input_bindings: std::collections::BTreeMap::new(),
-                    source: Some(crate::henosis::core_client::SourceProvenance::Vcs {
+                    source: Some(SourceProvenance::Vcs {
                         repository: request.repository.clone(),
                         revision: request.revision.clone(),
                         reference: request.reference.clone(),
                     }),
                 }],
-                source_policy: henosis_core_boundary::GraphSourcePolicy::AcceptLocal,
+                source_policy: GraphSourcePolicy::AcceptLocal,
             }]
         );
 

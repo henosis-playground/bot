@@ -5,143 +5,16 @@ use std::sync::Arc;
 use connectrpc::client::{ClientConfig, HttpClient};
 use henosis_proto::connect::henosis::v1::GraphServiceClient;
 use henosis_proto::proto::henosis::v1 as proto;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
 
 // This module is the only core-facing contract in the bot workspace.
 // TODO(d26-proto): replace the transport adapter, not these domain messages, once
 // the d26-core ConnectRPC schema settles.
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BundlePin {
-    pub component: String,
-    pub bundle_id: String,
-    #[serde(default)]
-    pub input_bindings: BTreeMap<String, serde_json::Value>,
-    pub source: Option<SourceProvenance>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SourceProvenance {
-    Local {
-        repository: Option<String>,
-        base_revision: Option<String>,
-        dirty: bool,
-    },
-    Vcs {
-        repository: String,
-        revision: String,
-        reference: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GraphSourcePolicy {
-    #[default]
-    AcceptLocal,
-    RequireVcs,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GraphIntent {
-    Create {
-        graph: String,
-        bundles: Vec<BundlePin>,
-        source_policy: GraphSourcePolicy,
-    },
-    Update {
-        graph: String,
-        expected_generation: u64,
-        bundles: Vec<BundlePin>,
-    },
-    Retire {
-        graph: String,
-    },
-}
-
-impl GraphIntent {
-    pub fn graph(&self) -> &str {
-        match self {
-            Self::Create { graph, .. } | Self::Update { graph, .. } | Self::Retire { graph } => {
-                graph
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GraphPhase {
-    Planning,
-    Blocked,
-    Reconciling,
-    Ready,
-    Failed,
-    Retired,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GraphSummary {
-    pub graph: String,
-    pub generation: u64,
-    pub phase: GraphPhase,
-    pub created: bool,
-    pub retired: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlockedOn {
-    pub component: String,
-    pub input: String,
-    pub producer: Option<String>,
-    pub output: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceDisposition {
-    pub resource: String,
-    pub state: String,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GraphOutput {
-    pub reference: String,
-    pub value: serde_json::Value,
-    pub source: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GraphStatus {
-    pub graph: String,
-    pub generation: u64,
-    pub phase: GraphPhase,
-    pub blocked_on: Vec<BlockedOn>,
-    pub outputs: Vec<GraphOutput>,
-    pub observed_ready: usize,
-    pub planned_resources: usize,
-    pub diagnostic: Option<String>,
-    pub bundles: Vec<BundlePin>,
-    pub source_policy: GraphSourcePolicy,
-    pub dispositions: Vec<ResourceDisposition>,
-}
-
-impl GraphStatus {
-    pub fn planning(graph: impl Into<String>, generation: u64) -> Self {
-        Self {
-            graph: graph.into(),
-            generation,
-            phase: GraphPhase::Planning,
-            blocked_on: Vec::new(),
-            outputs: Vec::new(),
-            observed_ready: 0,
-            planned_resources: 0,
-            diagnostic: None,
-            bundles: Vec::new(),
-            source_policy: GraphSourcePolicy::AcceptLocal,
-            dispositions: Vec::new(),
-        }
-    }
-}
+pub use henosis_app::{
+    BlockedOn, BundlePin, GraphIntent, GraphOutput, GraphPhase, GraphSourcePolicy, GraphStatus,
+    GraphSummary, ResourceDisposition, SourceProvenance,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreBoundaryError {
@@ -359,12 +232,22 @@ impl CoreBoundary for ConnectCoreBoundary {
             .graphs
             .into_iter()
             .map(|summary| {
+                let graph = required_nonempty(summary.graph_id, "GraphSummary.graph_id")?;
+                let generation = required(
+                    summary.current_generation,
+                    "GraphSummary.current_generation",
+                )?;
+                if generation == 0 {
+                    return Err(protocol(
+                        "GraphSummary.current_generation must be greater than zero",
+                    ));
+                }
                 Ok(GraphSummary {
-                    graph: summary.graph_id.unwrap_or_default(),
-                    generation: summary.current_generation.unwrap_or_default(),
+                    graph,
+                    generation,
                     phase: graph_phase_from_proto(summary.phase.as_ref())?,
-                    created: summary.created.unwrap_or_default(),
-                    retired: summary.retired.unwrap_or_default(),
+                    created: required(summary.created, "GraphSummary.created")?,
+                    retired: required(summary.retired, "GraphSummary.retired")?,
                 })
             })
             .collect()
@@ -406,104 +289,142 @@ impl CoreBoundary for ConnectCoreBoundary {
     }
 }
 
-fn source_from_proto(source: Option<proto::SourceProvenance>) -> Option<SourceProvenance> {
+impl henosis_app::CoreClient for ConnectCoreBoundary {
+    type Error = CoreBoundaryError;
+
+    async fn status(&self, graph: &str) -> Result<Option<GraphStatus>, Self::Error> {
+        match CoreBoundary::status(self, graph).await {
+            Ok(status) => Ok(Some(status)),
+            Err(CoreBoundaryError::GraphNotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn apply(&self, intent: GraphIntent) -> Result<GraphStatus, Self::Error> {
+        CoreBoundary::apply(self, intent).await
+    }
+}
+
+fn source_from_proto(
+    source: Option<proto::SourceProvenance>,
+) -> Result<Option<SourceProvenance>, CoreBoundaryError> {
     use proto::__buffa::oneof::source_provenance::Source;
 
-    match source?.source? {
-        Source::Local(local) => Some(SourceProvenance::Local {
-            repository: local.repository.filter(|value| !value.is_empty()),
-            base_revision: local.base_revision.filter(|value| !value.is_empty()),
-            dirty: local.dirty.unwrap_or(false),
-        }),
-        Source::Vcs(vcs) => Some(SourceProvenance::Vcs {
-            repository: vcs.repository.unwrap_or_default(),
-            revision: vcs.revision.unwrap_or_default(),
-            reference: vcs.reference.filter(|value| !value.is_empty()),
-        }),
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    match source.source {
+        Some(Source::Local(local)) => Ok(Some(SourceProvenance::Local {
+            repository: nonempty(local.repository),
+            base_revision: nonempty(local.base_revision),
+            dirty: required(local.dirty, "LocalSource.dirty")?,
+        })),
+        Some(Source::Vcs(vcs)) => Ok(Some(SourceProvenance::Vcs {
+            repository: required_nonempty(vcs.repository, "VcsSource.repository")?,
+            revision: required_nonempty(vcs.revision, "VcsSource.revision")?,
+            reference: nonempty(vcs.reference),
+        })),
+        None => Err(protocol("SourceProvenance omitted its source value")),
     }
 }
 
 fn status_from_response(
     status: Option<proto::GraphStatus>,
 ) -> Result<GraphStatus, CoreBoundaryError> {
-    let status = status.ok_or_else(|| {
-        CoreBoundaryError::Rejected("GraphService response omitted status".into())
-    })?;
-    let graph = status.graph_id.ok_or_else(|| {
-        CoreBoundaryError::Rejected("GraphService status omitted graph_id".into())
-    })?;
-    let generation = status.generation.unwrap_or_default();
-    let input_sources = status
-        .components
-        .iter()
-        .flat_map(|component| {
-            let consumer = component.name.clone().unwrap_or_default();
-            component.inputs.iter().map(move |input| {
-                (
-                    (consumer.clone(), input.name.clone().unwrap_or_default()),
-                    (
-                        input.source_component.clone().unwrap_or_default(),
-                        input.source_output.clone().unwrap_or_default(),
-                    ),
-                )
-            })
-        })
-        .collect::<BTreeMap<_, _>>();
+    let status = required(status, "GraphService response status")?;
+    let graph = required_nonempty(status.graph_id, "GraphStatus.graph_id")?;
+    let generation = required(status.generation, "GraphStatus.generation")?;
+    if generation == 0 {
+        return Err(protocol("GraphStatus.generation must be greater than zero"));
+    }
+
+    let mut input_sources = BTreeMap::new();
+    for component in &status.components {
+        let consumer = required_nonempty(component.name.clone(), "ComponentStatus.name")?;
+        for input in &component.inputs {
+            let name = required_nonempty(input.name.clone(), "ComponentInputStatus.name")?;
+            match (&input.source_component, &input.source_output) {
+                (Some(producer), Some(output)) if !producer.is_empty() && !output.is_empty() => {
+                    input_sources
+                        .insert((consumer.clone(), name), (producer.clone(), output.clone()));
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(protocol(format!(
+                        "ComponentInputStatus {consumer}.{name} has an incomplete output source"
+                    )));
+                }
+            }
+        }
+    }
+
     let plan = status.plan.into_option();
-    let blocked_on = plan
-        .as_ref()
-        .into_iter()
-        .flat_map(|plan| &plan.blocked)
-        .flat_map(|blocked| {
-            blocked.inputs.iter().map(|input| {
-                let component = blocked.component.clone().unwrap_or_default();
+    let mut blocked_on = Vec::new();
+    if let Some(plan) = &plan {
+        for blocked in &plan.blocked {
+            let component =
+                required_nonempty(blocked.component.clone(), "BlockedComponent.component")?;
+            for input in &blocked.inputs {
+                if input.is_empty() {
+                    return Err(protocol("BlockedComponent input name is empty"));
+                }
                 let source = input_sources.get(&(component.clone(), input.clone()));
-                BlockedOn {
-                    component,
+                blocked_on.push(BlockedOn {
+                    component: component.clone(),
                     input: input.clone(),
                     producer: source.map(|(producer, _)| producer.clone()),
                     output: source.map(|(_, output)| output.clone()),
-                }
-            })
-        })
-        .collect::<Vec<_>>();
+                });
+            }
+        }
+    }
     let planned_resources = plan.as_ref().map_or(0, |plan| plan.resources.len());
+
     let dispositions = status
         .dispositions
         .into_iter()
-        .map(|disposition| ResourceDisposition {
-            resource: disposition.resource_id.unwrap_or_default(),
-            state: disposition.state.unwrap_or_default(),
-            message: disposition.message,
+        .map(|disposition| {
+            Ok(ResourceDisposition {
+                resource: required_nonempty(
+                    disposition.resource_id,
+                    "ResourceDisposition.resource_id",
+                )?,
+                state: required_nonempty(disposition.state, "ResourceDisposition.state")?,
+                message: nonempty(disposition.message),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, CoreBoundaryError>>()?;
     let failed = dispositions.iter().any(|item| item.state == "failed");
     let all_ready = dispositions.len() >= planned_resources
         && dispositions.iter().all(|item| item.state == "ready");
+
     let outputs = status
         .outputs
         .into_iter()
         .map(|output| {
-            let reference = output.reference.unwrap_or_default();
-            let value =
-                serde_json::from_slice(output.canonical_value_json.as_deref().unwrap_or_default())
-                    .map_err(|error| {
-                        CoreBoundaryError::Rejected(format!(
-                            "GraphService output {reference:?} contains invalid JSON: {error}"
-                        ))
-                    })?;
+            let reference = required_nonempty(output.reference, "GraphOutput.reference")?;
+            let bytes = required(
+                output.canonical_value_json,
+                "GraphOutput.canonical_value_json",
+            )?;
+            let value = serde_json::from_slice(&bytes).map_err(|error| {
+                protocol(format!(
+                    "GraphService output {reference:?} contains invalid JSON: {error}"
+                ))
+            })?;
             Ok(GraphOutput {
                 reference,
                 value,
-                source: output.source.unwrap_or_default(),
+                source: required_nonempty(output.source, "GraphOutput.source")?,
             })
         })
         .collect::<Result<Vec<_>, CoreBoundaryError>>()?;
-    let diagnostic = status.diagnostic.or_else(|| {
+    let diagnostic = nonempty(status.diagnostic).or_else(|| {
         (!status.stall_cycle.is_empty())
             .then(|| format!("stall: {}", status.stall_cycle.join(" -> ")))
     });
-    let phase = if status.retired.unwrap_or(false) {
+    let retired = required(status.retired, "GraphStatus.retired")?;
+    let phase = if retired {
         GraphPhase::Retired
     } else if failed || diagnostic.is_some() {
         GraphPhase::Failed
@@ -516,31 +437,52 @@ fn status_from_response(
     } else {
         GraphPhase::Reconciling
     };
+
     let bundles = status
         .components
         .into_iter()
-        .map(|component| BundlePin {
-            component: component.name.unwrap_or_default(),
-            bundle_id: hex::encode(component.bundle_digest.unwrap_or_default()),
-            input_bindings: component
+        .map(|component| {
+            let component_name = required_nonempty(component.name, "ComponentStatus.name")?;
+            let digest = required(component.bundle_digest, "ComponentStatus.bundle_digest")?;
+            if digest.len() != 32 {
+                return Err(protocol(format!(
+                    "ComponentStatus {component_name} bundle_digest must contain exactly 32 bytes"
+                )));
+            }
+            let input_bindings = component
                 .input_bindings
                 .into_iter()
-                .filter_map(|binding| {
-                    let name = binding.name?;
-                    let value = serde_json::from_slice(binding.value_json.as_deref()?).ok()?;
-                    Some((name, value))
+                .map(|binding| {
+                    let name = required_nonempty(binding.name, "InputBinding.name")?;
+                    let bytes = required(binding.value_json, "InputBinding.value_json")?;
+                    let value = serde_json::from_slice(&bytes).map_err(|error| {
+                        protocol(format!(
+                            "InputBinding {component_name}.{name} contains invalid JSON: {error}"
+                        ))
+                    })?;
+                    Ok((name, value))
                 })
-                .collect(),
-            source: source_from_proto(component.source.into_option()),
+                .collect::<Result<BTreeMap<_, _>, CoreBoundaryError>>()?;
+            Ok(BundlePin {
+                component: component_name,
+                bundle_id: hex::encode(digest),
+                input_bindings,
+                source: source_from_proto(component.source.into_option())?,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, CoreBoundaryError>>()?;
     let source_policy = match status
         .source_policy
         .as_ref()
         .and_then(buffa::EnumValue::as_known)
     {
+        Some(proto::GraphSourcePolicy::AcceptLocal) => GraphSourcePolicy::AcceptLocal,
         Some(proto::GraphSourcePolicy::RequireVcs) => GraphSourcePolicy::RequireVcs,
-        _ => GraphSourcePolicy::AcceptLocal,
+        other => {
+            return Err(protocol(format!(
+                "GraphStatus has unknown source policy {other:?}"
+            )));
+        }
     };
     Ok(GraphStatus {
         graph,
@@ -555,6 +497,29 @@ fn status_from_response(
         source_policy,
         dispositions,
     })
+}
+
+fn required<T>(value: Option<T>, field: &str) -> Result<T, CoreBoundaryError> {
+    value.ok_or_else(|| protocol(format!("GraphService omitted required {field}")))
+}
+
+fn required_nonempty(value: Option<String>, field: &str) -> Result<String, CoreBoundaryError> {
+    let value = required(value, field)?;
+    if value.is_empty() {
+        Err(protocol(format!(
+            "GraphService returned empty required {field}"
+        )))
+    } else {
+        Ok(value)
+    }
+}
+
+fn nonempty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
+}
+
+fn protocol(message: impl Into<String>) -> CoreBoundaryError {
+    CoreBoundaryError::Rejected(format!("core protocol error: {}", message.into()))
 }
 
 fn graph_phase_from_proto(
@@ -679,6 +644,22 @@ impl CoreBoundary for FakeCoreBoundary {
             .get(graph)
             .map(watch::Sender::subscribe)
             .ok_or_else(|| CoreBoundaryError::GraphNotFound(graph.to_string()))
+    }
+}
+
+impl henosis_app::CoreClient for FakeCoreBoundary {
+    type Error = CoreBoundaryError;
+
+    async fn status(&self, graph: &str) -> Result<Option<GraphStatus>, Self::Error> {
+        match CoreBoundary::status(self, graph).await {
+            Ok(status) => Ok(Some(status)),
+            Err(CoreBoundaryError::GraphNotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn apply(&self, intent: GraphIntent) -> Result<GraphStatus, Self::Error> {
+        CoreBoundary::apply(self, intent).await
     }
 }
 

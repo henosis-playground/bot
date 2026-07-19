@@ -4,8 +4,8 @@ use crate::bors::event::{PushToBranch, WorkflowRunCompleted};
 use crate::github::{GithubRepoName, PullRequest, PullRequestNumber};
 use crate::henosis::config::{HenosisConfig, PreviewMode};
 use crate::henosis::core_client::{
-    BundlePin, ConnectCoreBoundary, CoreBoundary, CoreEnvironmentIdGenerator,
-    CoreFailurePresentation, GraphIntent, GraphPhase, GraphStatus, SourceProvenance, UiLink,
+    ConnectCoreBoundary, CoreBoundary, CoreEnvironmentIdGenerator, CoreFailurePresentation,
+    GraphPhase, GraphStatus, SourceProvenance, UiLink,
 };
 use crate::henosis::d26::PreviewWorkflow;
 use crate::henosis::db::{PgEnvironmentStore, PgQueueStore};
@@ -32,7 +32,10 @@ use crate::henosis::status::{
 };
 use anyhow::Context;
 use base64::Engine as _;
-use henosis_bundle::{BundleRequest, Bundler, EsbuildBundler};
+use henosis_app::{
+    ApplyGraph, CheckoutService, EsbuildBundler, GraphOperation, PreparedSource, SourceRequest,
+};
+use henosis_artifacts::DirectoryArtifactService;
 use henosis_core_boundary::GraphSourcePolicy;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -45,6 +48,52 @@ static CORE_STATUS_WAKE: LazyLock<Notify> = LazyLock::new(Notify::new);
 
 pub async fn wait_for_core_status_wake() {
     CORE_STATUS_WAKE.notified().await;
+}
+
+#[derive(Clone)]
+struct RepositoryCheckoutService {
+    checkout_subdir: Option<PathBuf>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct RepositoryCheckoutError(String);
+
+impl CheckoutService for RepositoryCheckoutService {
+    type Error = RepositoryCheckoutError;
+
+    async fn checkout(&self, request: &SourceRequest) -> Result<PreparedSource, Self::Error> {
+        let revision = request.revision.as_deref().ok_or_else(|| {
+            RepositoryCheckoutError("repository checkout requires a revision".into())
+        })?;
+        let checkout = checkout_repository(&request.repository, revision)
+            .await
+            .map_err(|error| RepositoryCheckoutError(error.to_string()))?;
+        install_checkout_dependencies(checkout.path())
+            .await
+            .map_err(|error| RepositoryCheckoutError(error.to_string()))?;
+        let checkout = Arc::new(checkout);
+        let repository = self.checkout_subdir.as_ref().map_or_else(
+            || checkout.path().to_path_buf(),
+            |subdir| checkout.path().join(subdir),
+        );
+        if !repository.is_dir() {
+            return Err(RepositoryCheckoutError(format!(
+                "component root {} does not exist",
+                repository.display()
+            )));
+        }
+        Ok(PreparedSource {
+            repository,
+            provenance: SourceProvenance::Vcs {
+                repository: request.repository.clone(),
+                revision: revision.to_string(),
+                reference: request.reference.clone(),
+            },
+            component: request.component.clone(),
+            lease: Some(checkout),
+        })
+    }
 }
 
 struct D26PreviewWriter {
@@ -72,73 +121,39 @@ impl DeployRepoWriter for D26PreviewWriter {
             manifest.environment.id
         );
 
-        let bundler = EsbuildBundler;
-        let mut pins = Vec::with_capacity(manifest.components.len());
+        let mut sources = Vec::with_capacity(manifest.components.len());
         for (component, entry) in manifest.components {
             let crate::henosis::manifest::ComponentEntry::Pinned(entry) = entry else {
                 anyhow::bail!("D26 preview component `{component}` must be pinned");
             };
-            let checkout = checkout_repository(&entry.repo, &entry.r#ref).await?;
-            install_checkout_dependencies(checkout.path()).await?;
-            let component_root = self.checkout_subdir.as_ref().map_or_else(
-                || checkout.path().to_path_buf(),
-                |subdir| checkout.path().join(subdir),
-            );
-            anyhow::ensure!(
-                component_root.is_dir(),
-                "D26 preview component root {} does not exist",
-                component_root.display()
-            );
-            let bundles = bundler.bundle(&BundleRequest {
-                repository: component_root.clone(),
-                output: self.bundle_root.clone(),
-            })?;
-            let artifacts = bundler.build_artifacts(&component_root, &self.artifact_root)?;
-            let bundle = bundles
-                .bundles
-                .into_iter()
-                .find(|bundle| bundle.component == component)
-                .with_context(|| {
-                    format!(
-                        "Repository `{}` did not bundle preview component `{component}`",
-                        entry.repo
-                    )
-                })?;
-            pins.push(BundlePin {
-                component,
-                bundle_id: bundle.bundle_id,
-                input_bindings: artifacts
-                    .into_iter()
-                    .filter(|artifact| artifact.component == bundle.component)
-                    .map(|artifact| (artifact.input, serde_json::Value::String(artifact.digest)))
-                    .collect(),
-                source: Some(SourceProvenance::Vcs {
-                    repository: entry.repo.clone(),
-                    revision: entry.r#ref.clone(),
-                    reference: (entry.repo == self.request.key.repo
-                        && entry.r#ref == self.request.head_sha)
-                        .then(|| format!("refs/heads/{}", self.request.head_branch)),
-                }),
+            sources.push(SourceRequest {
+                repository: entry.repo.clone(),
+                revision: Some(entry.r#ref.clone()),
+                reference: (entry.repo == self.request.key.repo
+                    && entry.r#ref == self.request.head_sha)
+                    .then(|| format!("refs/heads/{}", self.request.head_branch)),
+                component: Some(component),
             });
         }
-        pins.sort_by(|left, right| left.component.cmp(&right.component));
-
-        let intent = match self.core.status(environment).await {
-            Ok(current) => GraphIntent::Update {
-                graph: environment.to_string(),
-                expected_generation: current.generation,
-                bundles: pins,
+        let operation = GraphOperation::new(
+            self.core.clone(),
+            EsbuildBundler,
+            DirectoryArtifactService::new(&self.artifact_root),
+            RepositoryCheckoutService {
+                checkout_subdir: self.checkout_subdir.clone(),
             },
-            Err(crate::henosis::core_client::CoreBoundaryError::GraphNotFound(_)) => {
-                GraphIntent::Create {
-                    graph: environment.to_string(),
-                    bundles: pins,
-                    source_policy: GraphSourcePolicy::AcceptLocal,
-                }
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let status = self.core.apply(intent).await?;
+            &self.bundle_root,
+        );
+        let status = operation
+            .apply(ApplyGraph {
+                graph: environment.to_string(),
+                sources,
+                create: true,
+                source_policy: GraphSourcePolicy::AcceptLocal,
+                preserve_unmentioned: false,
+            })
+            .await?
+            .status;
         Ok(DeployWriteResult {
             commit_sha: format!("generation:{}", status.generation),
         })
@@ -149,8 +164,11 @@ impl DeployRepoWriter for D26PreviewWriter {
         PreviewWorkflow::new(
             self.core.clone(),
             EsbuildBundler,
+            DirectoryArtifactService::new(&self.artifact_root),
+            RepositoryCheckoutService {
+                checkout_subdir: self.checkout_subdir.clone(),
+            },
             &self.bundle_root,
-            &self.artifact_root,
         )
         .p_minus(environment)
         .await?;
@@ -966,45 +984,6 @@ pub async fn reconcile_dev_pin_after_component_push(
         return Ok(false);
     }
 
-    let checkout = checkout_repository(&component.repo, &payload.sha).await?;
-    install_checkout_dependencies(checkout.path()).await?;
-    let component_root = core_api.preview_checkout_subdir.as_ref().map_or_else(
-        || checkout.path().to_path_buf(),
-        |subdir| checkout.path().join(subdir),
-    );
-    let bundler = EsbuildBundler;
-    let bundles = bundler.bundle(&BundleRequest {
-        repository: component_root.clone(),
-        output: d26_store_root("HENOSIS_BUNDLE_ROOT", "bundles"),
-    })?;
-    let artifacts = bundler.build_artifacts(
-        &component_root,
-        &d26_store_root("HENOSIS_ARTIFACT_ROOT", "artifacts"),
-    )?;
-    let advanced = bundles
-        .bundles
-        .into_iter()
-        .map(|bundle| BundlePin {
-            component: bundle.component.clone(),
-            bundle_id: bundle.bundle_id,
-            input_bindings: artifacts
-                .iter()
-                .filter(|artifact| artifact.component == bundle.component)
-                .map(|artifact| {
-                    (
-                        artifact.input.clone(),
-                        serde_json::Value::String(artifact.digest.clone()),
-                    )
-                })
-                .collect(),
-            source: Some(SourceProvenance::Vcs {
-                repository: component.repo.clone(),
-                revision: payload.sha.clone(),
-                reference: Some(format!("refs/heads/{}", payload.branch)),
-            }),
-        })
-        .collect::<Vec<_>>();
-
     let deploy_repo = deploy_repo(ctx, config)?;
     let repository = crate::henosis::git_sync::GithubGraphFileRepository::new(
         deploy_repo,
@@ -1012,36 +991,39 @@ pub async fn reconcile_dev_pin_after_component_push(
     );
     let core = ConnectCoreBoundary::new(&core_api.endpoint);
     let existing = crate::henosis::git_sync::named_graph(&repository, "dev").await?;
-    let (graph, intent) = if let Some(file) = existing {
-        let current = core.status(&file.graph).await?;
-        let advanced_names = advanced
-            .iter()
-            .map(|pin| pin.component.as_str())
-            .collect::<BTreeSet<_>>();
-        let mut pins = current
-            .bundles
-            .into_iter()
-            .filter(|pin| !advanced_names.contains(pin.component.as_str()))
-            .collect::<Vec<_>>();
-        pins.extend(advanced);
-        pins.sort_by(|left, right| left.component.cmp(&right.component));
-        let graph = file.graph;
-        let intent = GraphIntent::Update {
+    let (graph, create) = existing.map_or_else(
+        || {
+            (
+                CoreEnvironmentIdGenerator.new_preview_environment_id(),
+                true,
+            )
+        },
+        |file| (file.graph, false),
+    );
+    let operation = GraphOperation::new(
+        core.clone(),
+        EsbuildBundler,
+        DirectoryArtifactService::new(d26_store_root("HENOSIS_ARTIFACT_ROOT", "artifacts")),
+        RepositoryCheckoutService {
+            checkout_subdir: core_api.preview_checkout_subdir.as_ref().map(PathBuf::from),
+        },
+        d26_store_root("HENOSIS_BUNDLE_ROOT", "bundles"),
+    );
+    let status = operation
+        .apply(ApplyGraph {
             graph: graph.clone(),
-            expected_generation: current.generation,
-            bundles: pins,
-        };
-        (graph, intent)
-    } else {
-        let graph = CoreEnvironmentIdGenerator.new_preview_environment_id();
-        let intent = GraphIntent::Create {
-            graph: graph.clone(),
-            bundles: advanced,
+            sources: vec![SourceRequest {
+                repository: component.repo.clone(),
+                revision: Some(payload.sha.clone()),
+                reference: Some(format!("refs/heads/{}", payload.branch)),
+                component: Some(component.name.clone()),
+            }],
+            create,
             source_policy: GraphSourcePolicy::AcceptLocal,
-        };
-        (graph, intent)
-    };
-    let status = core.apply(intent).await?;
+            preserve_unmentioned: true,
+        })
+        .await?
+        .status;
     anyhow::ensure!(
         status.graph == graph,
         "core acknowledged the wrong dev graph"

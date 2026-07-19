@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -6,12 +8,15 @@ use std::process::Command as ProcessCommand;
 use std::time::{Duration, SystemTime};
 
 use clap::{Args, CommandFactory as _, Parser, Subcommand};
-use henosis_bundle::{
-    BuiltArtifact, BundleError, BundleRequest, BundleSetManifest, Bundler, EsbuildBundler,
-    build_workload_artifacts,
+use henosis_app::{
+    ApplyGraph, ArtifactBinding, BundleError, BundleRequest, BundleSetManifest, Bundler,
+    CheckoutService, EsbuildBundler, GraphOperation, PreparedSource, SourceRequest,
 };
+use henosis_artifacts::DirectoryArtifactService;
+#[cfg(test)]
+use henosis_core_boundary::BundlePin;
 use henosis_core_boundary::{
-    BundlePin, ConnectCoreBoundary, CoreBoundary, CoreBoundaryError, GraphIntent, GraphPhase,
+    ConnectCoreBoundary, CoreBoundary, CoreBoundaryError, GraphIntent, GraphPhase,
     GraphSourcePolicy, GraphStatus, GraphSummary, SourceProvenance,
 };
 use serde::{Deserialize, Serialize};
@@ -113,6 +118,8 @@ pub enum ErrorClass {
 pub enum CliError {
     #[error(transparent)]
     Bundle(#[from] BundleError),
+    #[error(transparent)]
+    Operation(#[from] henosis_app::OperationError),
     #[error("TypeScript typecheck failed\n\n{0}")]
     Typecheck(String),
     #[error("cannot run TypeScript typecheck: {0}")]
@@ -159,9 +166,18 @@ impl CliError {
             | Self::Bundle(BundleError::NoComponents(_))
             | Self::Bundle(BundleError::Esbuild { .. })
             | Self::Bundle(BundleError::ExternalImport { .. })
-            | Self::Bundle(BundleError::ReadSource { .. }) => ErrorClass::FixSource,
-            Self::Core(CoreBoundaryError::Transport(_)) => ErrorClass::Transient,
+            | Self::Bundle(BundleError::ReadSource { .. })
+            | Self::Operation(henosis_app::OperationError::Bundle(
+                BundleError::NoComponents(_)
+                | BundleError::Esbuild { .. }
+                | BundleError::ExternalImport { .. }
+                | BundleError::ReadSource { .. },
+            ))
+            | Self::Operation(henosis_app::OperationError::Artifact(_)) => ErrorClass::FixSource,
+            Self::Core(CoreBoundaryError::Transport(_))
+            | Self::Operation(henosis_app::OperationError::Core(_)) => ErrorClass::Transient,
             Self::Bundle(_)
+            | Self::Operation(_)
             | Self::TypecheckSetup(_)
             | Self::Read { .. }
             | Self::Write { .. }
@@ -175,7 +191,10 @@ impl CliError {
 
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Typecheck(_) | Self::Bundle(_) => 2,
+            Self::Typecheck(_)
+            | Self::Bundle(_)
+            | Self::Operation(henosis_app::OperationError::Bundle(_))
+            | Self::Operation(henosis_app::OperationError::Artifact(_)) => 2,
             Self::DeploymentFailed { .. } => 1,
             _ => 3,
         }
@@ -441,10 +460,20 @@ async fn dev(args: PipelineArgs) -> Result<String, CliError> {
     }
 }
 
-async fn run_cycle(
-    args: &PipelineArgs,
-    mut target: SelectedTarget,
-) -> Result<CycleResult, CliError> {
+#[derive(Clone)]
+struct LocalCheckout {
+    source: PreparedSource,
+}
+
+impl CheckoutService for LocalCheckout {
+    type Error = std::convert::Infallible;
+
+    async fn checkout(&self, _request: &SourceRequest) -> Result<PreparedSource, Self::Error> {
+        Ok(self.source.clone())
+    }
+}
+
+async fn run_cycle(args: &PipelineArgs, target: SelectedTarget) -> Result<CycleResult, CliError> {
     let repository = args
         .repository
         .canonicalize()
@@ -456,30 +485,50 @@ async fn run_cycle(
     emit_stdout(&render_target_banner(&target, &initial_source));
 
     run_typecheck(&repository).await?;
-    let bundle_output = repository.join(BUNDLE_PATH);
-    let bundles = EsbuildBundler.bundle(&BundleRequest {
-        repository: repository.clone(),
-        output: bundle_output,
-    })?;
-    let artifacts = build_workload_artifacts(&repository, &repository.join(ARTIFACT_PATH))?;
-    emit_stdout(&render_artifact_result(&artifacts));
-    let pins = bundle_pins(&repository, &bundles, &artifacts);
-    let changed = changed_components(target.current.as_ref(), &pins);
+    let checkout = LocalCheckout {
+        source: PreparedSource {
+            repository: repository.clone(),
+            provenance: repository_provenance(&repository, &fallback_watch_set(&repository)?),
+            component: None,
+            lease: None,
+        },
+    };
+    let core = ConnectCoreBoundary::new(&target.core);
+    let operation = GraphOperation::new(
+        core.clone(),
+        EsbuildBundler,
+        DirectoryArtifactService::new(repository.join(ARTIFACT_PATH)),
+        checkout,
+        repository.join(BUNDLE_PATH),
+    );
+    let outcome = operation
+        .apply(ApplyGraph {
+            graph: target.graph.clone(),
+            sources: vec![SourceRequest {
+                repository: repository.display().to_string(),
+                revision: None,
+                reference: None,
+                component: None,
+            }],
+            create: target.create,
+            source_policy: target.source_policy,
+            preserve_unmentioned: false,
+        })
+        .await?;
+    emit_stdout(&render_artifact_result(&outcome.artifacts));
     emit_stdout(&format!(
         "changed components: {}\n",
-        if changed.is_empty() {
+        if outcome.changed_components.is_empty() {
             "none".to_string()
         } else {
-            changed.join(", ")
+            outcome.changed_components.join(", ")
         }
     ));
 
-    let dependencies = observed_dependencies(&repository, &bundles, &artifacts);
-    if changed.is_empty() {
-        let generation = target
-            .current
-            .as_ref()
-            .map_or(0, |status| status.generation);
+    let dependencies =
+        observed_dependencies(&repository, &outcome.dependencies, &outcome.artifacts);
+    if !outcome.changed {
+        let generation = outcome.status.generation;
         emit_stdout(&format!(
             "no deployable changes — generation {generation} remains active\n"
         ));
@@ -490,26 +539,7 @@ async fn run_cycle(
         });
     }
 
-    let core = ConnectCoreBoundary::new(&target.core);
-    let intent = match target.current.take() {
-        Some(current) => GraphIntent::Update {
-            graph: target.graph.clone(),
-            expected_generation: current.generation,
-            bundles: pins,
-        },
-        None if target.create => GraphIntent::Create {
-            graph: target.graph.clone(),
-            bundles: pins,
-            source_policy: target.source_policy,
-        },
-        None => {
-            return Err(CliError::GraphMissing {
-                graph: target.graph,
-                core: target.core,
-            });
-        }
-    };
-    let accepted = core.apply(intent).await?;
+    let accepted = outcome.status;
     write_context(
         &repository,
         &LocalContext {
@@ -663,41 +693,14 @@ async fn run_typecheck(repository: &Path) -> Result<(), CliError> {
     }))
 }
 
-fn bundle_pins(
-    repository: &Path,
-    bundles: &BundleSetManifest,
-    artifacts: &[BuiltArtifact],
-) -> Vec<BundlePin> {
-    bundles
-        .bundles
-        .iter()
-        .map(|bundle| BundlePin {
-            component: bundle.component.clone(),
-            bundle_id: bundle.bundle_id.clone(),
-            input_bindings: artifacts
-                .iter()
-                .filter(|artifact| artifact.component == bundle.component)
-                .map(|artifact| {
-                    (
-                        artifact.input.clone(),
-                        serde_json::Value::String(artifact.digest.clone()),
-                    )
-                })
-                .collect(),
-            source: Some(repository_provenance(repository, &bundle.dependencies)),
-        })
-        .collect()
-}
-
 fn observed_dependencies(
     repository: &Path,
-    bundles: &BundleSetManifest,
-    artifacts: &[BuiltArtifact],
+    bundle_dependencies: &[PathBuf],
+    artifacts: &[ArtifactBinding],
 ) -> Vec<PathBuf> {
-    let mut dependencies = bundles
-        .bundles
+    let mut dependencies = bundle_dependencies
         .iter()
-        .flat_map(|bundle| bundle.dependencies.iter().cloned())
+        .cloned()
         .chain(artifacts.iter().map(|artifact| artifact.source.clone()))
         .collect::<Vec<_>>();
     for name in [
@@ -842,6 +845,7 @@ where
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+#[cfg(test)]
 fn changed_components(current: Option<&GraphStatus>, pins: &[BundlePin]) -> Vec<String> {
     let desired = pins
         .iter()
@@ -983,7 +987,7 @@ fn render_bundle_result(bundles: &BundleSetManifest) -> String {
     rendered
 }
 
-fn render_artifact_result(artifacts: &[BuiltArtifact]) -> String {
+fn render_artifact_result(artifacts: &[ArtifactBinding]) -> String {
     if artifacts.is_empty() {
         return "built 0 workload artifacts\n".to_owned();
     }
@@ -1320,17 +1324,5 @@ mod tests {
             source: None,
         }];
         assert_eq!(changed_components(Some(&current), &desired), ["web"]);
-    }
-
-    #[allow(dead_code)]
-    fn artifact(component: &str, dependency: PathBuf) -> henosis_bundle::BundleArtifact {
-        henosis_bundle::BundleArtifact {
-            component: component.to_string(),
-            bundle_id: "a".repeat(64),
-            module: PathBuf::new(),
-            manifest: PathBuf::new(),
-            executable_sha256: "b".repeat(64),
-            dependencies: vec![dependency],
-        }
     }
 }
