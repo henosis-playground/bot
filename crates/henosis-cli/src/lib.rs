@@ -1,6 +1,4 @@
 use std::collections::BTreeMap;
-#[cfg(test)]
-use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -13,8 +11,6 @@ use henosis_app::{
     CheckoutService, EsbuildBundler, GraphOperation, PreparedSource, SourceRequest,
 };
 use henosis_artifacts::DirectoryArtifactService;
-#[cfg(test)]
-use henosis_core_boundary::BundlePin;
 use henosis_core_boundary::{
     ConnectCoreBoundary, CoreBoundary, CoreBoundaryError, GraphIntent, GraphPhase,
     GraphSourcePolicy, GraphStatus, GraphSummary, SourceProvenance,
@@ -845,38 +841,6 @@ where
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-#[cfg(test)]
-fn changed_components(current: Option<&GraphStatus>, pins: &[BundlePin]) -> Vec<String> {
-    let desired = pins
-        .iter()
-        .map(|pin| {
-            (
-                pin.component.as_str(),
-                (pin.bundle_id.as_str(), &pin.input_bindings),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let existing = current
-        .into_iter()
-        .flat_map(|status| status.bundles.iter())
-        .map(|pin| {
-            (
-                pin.component.as_str(),
-                (pin.bundle_id.as_str(), &pin.input_bindings),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    desired
-        .keys()
-        .chain(existing.keys())
-        .copied()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter(|component| desired.get(component) != existing.get(component))
-        .map(str::to_string)
-        .collect()
-}
-
 async fn stream_generation(
     core: &ConnectCoreBoundary,
     name: Option<&str>,
@@ -1217,39 +1181,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_no_deployable_changes() {
-        let current = GraphStatus {
-            graph: "graph_demo".to_string(),
-            generation: 7,
-            phase: GraphPhase::Ready,
-            blocked_on: Vec::new(),
-            outputs: Vec::new(),
-            observed_ready: 0,
-            planned_resources: 0,
-            diagnostic: None,
-            bundles: vec![BundlePin {
-                component: "web".to_string(),
-                bundle_id: "a".repeat(64),
-                input_bindings: BTreeMap::new(),
-                source: None,
-            }],
-            source_policy: GraphSourcePolicy::AcceptLocal,
-            dispositions: Vec::new(),
-        };
-        let pins = current.bundles.clone();
-        let changed = changed_components(Some(&current), &pins);
-        insta::assert_snapshot!(format!(
-            "changed components: {}\nno deployable changes — generation {} remains active\n",
-            if changed.is_empty() {
-                "none"
-            } else {
-                "unexpected"
-            },
-            current.generation,
-        ));
-    }
-
-    #[test]
     fn classifies_dev_loop_errors() {
         assert_eq!(
             CliError::Typecheck("broken".to_string()).classify(),
@@ -1267,62 +1198,5 @@ mod tests {
             .classify(),
             ErrorClass::FatalSetup
         );
-    }
-
-    #[test]
-    fn component_changes_ignore_provenance_only_changes() {
-        let status = GraphStatus {
-            graph: "graph_demo".to_string(),
-            generation: 1,
-            phase: GraphPhase::Ready,
-            blocked_on: Vec::new(),
-            outputs: Vec::new(),
-            observed_ready: 0,
-            planned_resources: 0,
-            diagnostic: None,
-            bundles: vec![BundlePin {
-                component: "web".to_string(),
-                bundle_id: "a".repeat(64),
-                input_bindings: BTreeMap::new(),
-                source: None,
-            }],
-            source_policy: GraphSourcePolicy::AcceptLocal,
-            dispositions: Vec::new(),
-        };
-        let desired = vec![BundlePin {
-            component: "web".to_string(),
-            bundle_id: "a".repeat(64),
-            input_bindings: BTreeMap::new(),
-            source: Some(SourceProvenance::Local {
-                repository: None,
-                base_revision: None,
-                dirty: true,
-            }),
-        }];
-        assert!(changed_components(Some(&status), &desired).is_empty());
-    }
-
-    #[test]
-    fn artifact_binding_change_is_deployable_without_bundle_change() {
-        let mut current = GraphStatus::planning("graph_demo", 1);
-        current.bundles = vec![BundlePin {
-            component: "web".to_owned(),
-            bundle_id: "a".repeat(64),
-            input_bindings: BTreeMap::from([(
-                "workerArtifact".to_owned(),
-                serde_json::json!(format!("sha256:{}", "11".repeat(32))),
-            )]),
-            source: None,
-        }];
-        let desired = vec![BundlePin {
-            component: "web".to_owned(),
-            bundle_id: "a".repeat(64),
-            input_bindings: BTreeMap::from([(
-                "workerArtifact".to_owned(),
-                serde_json::json!(format!("sha256:{}", "22".repeat(32))),
-            )]),
-            source: None,
-        }];
-        assert_eq!(changed_components(Some(&current), &desired), ["web"]);
     }
 }
